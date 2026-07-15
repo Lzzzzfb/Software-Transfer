@@ -22,3 +22,18 @@ def test_calibration_keeps_reverse_wire_order_and_applies_only_after_ack():
     manager._on_response(0, CmdCode.SET_CALIB_COEFF, b"\x60")
     calibration = manager.devices[0].wavelength_calib
     assert (calibration.c1, calibration.c2, calibration.c3, calibration.c4) == (1.0, 2.0, 3.0, 4.0)
+
+
+def test_real_firmware_init_ack_with_cmd_01_is_recognized_as_compatibility_response():
+    manager = DeviceManager()
+    manager.devices[0] = SpectrometerDevice(0, "COM_TEST")
+    diagnostics = []
+    errors = []
+    manager.diagnostic_event.connect(diagnostics.append)
+    manager.error_occurred.connect(lambda device_id, message: errors.append((device_id, message)))
+
+    manager._on_response(0, CmdCode.GET_VERSION, b"\x61")
+
+    assert diagnostics and "Cmd=0x01" in diagnostics[-1]
+    assert errors == []
+    assert not manager.devices[0].initialized

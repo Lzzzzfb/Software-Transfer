@@ -62,7 +62,7 @@ class SpectrometerDevice:
 
         # 采集参数
         self.integration_time_us: int = 10000   # 积分时间(us), 默认10ms
-        self.trigger_mode: int = 0              # 触发模式: 0=软件, 1=外部, 2=软件主机
+        self.trigger_mode: int = 0              # 触发模式: 0=软件, 1=软件主机, 2=外部
         self.interval_us: int = 0               # 采集间隔(us)
         self.avg_count: int = 1                 # 平均次数
         self.dark_current_enabled: bool = False # 暗电流去除

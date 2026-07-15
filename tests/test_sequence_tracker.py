@@ -25,3 +25,14 @@ def test_tracker_accepts_24_bit_wrap_without_false_gap():
     assert wrapped.wrapped
     assert wrapped.missing == 0
     assert tracker.wraps == 1
+
+
+def test_tracker_accepts_real_firmware_16_bit_wrap_without_false_gap():
+    tracker = SequenceTracker(16)
+    tracker.observe(0xFFFE)
+    tracker.observe(0xFFFF)
+    wrapped = tracker.observe(0)
+
+    assert wrapped.wrapped
+    assert wrapped.missing == 0
+    assert tracker.wraps == 1

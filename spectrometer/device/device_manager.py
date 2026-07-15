@@ -23,6 +23,8 @@ class DeviceManager(QtCore.QObject):
     frame_arrived = Signal(object)
     error_occurred = Signal(int, str)
     diagnostic_event = Signal(str)
+    sync_started = Signal(object)
+    sync_configuration_failed = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -32,8 +34,11 @@ class DeviceManager(QtCore.QObject):
         self._next_id = 0
         self._latest_frames: Dict[int, SpectrumFrame] = {}
         self._pending_updates: Dict[tuple, callable] = {}
+        self._acquisition_requested = set()
         self._reconnect_attempts: Dict[int, int] = {}
         self._removing = set()
+        self._sync_generation = 0
+        self._sync_setup = None
 
         self._process_timer = QtCore.QTimer(self)
         self._process_timer.timeout.connect(self._on_process_tick)
@@ -127,6 +132,7 @@ class DeviceManager(QtCore.QObject):
         self._workers.pop(device_id, None)
         self._threads.pop(device_id, None)
         self._latest_frames.pop(device_id, None)
+        self._acquisition_requested.discard(device_id)
         self.devices.pop(device_id, None)
         self._reconnect_attempts.pop(device_id, None)
         for key in [key for key in self._pending_updates if key[0] == device_id]:
@@ -149,7 +155,20 @@ class DeviceManager(QtCore.QObject):
     def get_connected_devices(self) -> List[SpectrometerDevice]:
         return [device for device in self.devices.values() if device.connected]
 
+    @property
+    def acquisition_active(self) -> bool:
+        return bool(
+            self._sync_setup
+            or self._acquisition_requested
+            or any(device.acquiring for device in self.devices.values())
+        )
+
     def send_to_device(self, device_id: int, cmd: int, params: bytes = b"") -> bool:
+        device = self.devices.get(device_id)
+        if (device and (device.acquiring or device_id in self._acquisition_requested)
+                and int(cmd) != int(CmdCode.STOP_ACQUISITION)):
+            self.error_occurred.emit(device_id, "采集中不能发送参数或查询命令，请先停止采集")
+            return False
         worker = self._workers.get(device_id)
         if worker is None:
             # 模拟设备视为成功接收，便于全流程演示。
@@ -177,6 +196,8 @@ class DeviceManager(QtCore.QObject):
         if self.devices[device_id].port_name.startswith("SIM"):
             apply()
             self.device_updated.emit(device_id)
+            if int(cmd) == int(CmdCode.SET_TRIG_MODE):
+                self._complete_sync_trigger_mode(device_id, True)
         else:
             self._pending_updates[(device_id, int(cmd))] = apply
         return True
@@ -251,6 +272,8 @@ class DeviceManager(QtCore.QObject):
     def start_acquisition(self, device_id: int, continuous: bool = True):
         cmd = CmdCode.START_CONTINUOUS if continuous else CmdCode.START_SINGLE
         result = self.send_to_device(device_id, cmd)
+        if result:
+            self._acquisition_requested.add(device_id)
         if result and self.devices[device_id].port_name.startswith("SIM"):
             self.devices[device_id].acquiring = True
             self.device_updated.emit(device_id)
@@ -258,6 +281,7 @@ class DeviceManager(QtCore.QObject):
 
     def stop_acquisition(self, device_id: int):
         result = self.send_to_device(device_id, CmdCode.STOP_ACQUISITION)
+        self._acquisition_requested.discard(device_id)
         device = self.devices.get(device_id)
         if device:
             device.acquiring = False
@@ -271,7 +295,96 @@ class DeviceManager(QtCore.QObject):
         # 下位机自动输出同步脉冲，上位机只按顺序布防/启动，不发送 0x54。
         return [self.start_acquisition(item, continuous) for item in device_ids]
 
+    def prepare_sync_acquisition(self, continuous: bool = True) -> bool:
+        """配置硬同步触发模式，收到全部 ACK 后再按顺序启动。"""
+
+        device_ids = [item.device_id for item in self.get_connected_devices() if item.enabled]
+        if not device_ids:
+            return False
+        if not (self.global_sync_enabled and self.sync_mode == "hard"):
+            results = self.start_sync_acquisition(continuous)
+            if all(results):
+                self.sync_started.emit(device_ids)
+                return True
+            self.sync_configuration_failed.emit("启动命令未能发送到所有设备")
+            return False
+
+        internal = self.master_device_id in device_ids
+        desired_modes = {
+            device_id: (
+                TriggerMode.SOFT_MASTER
+                if internal and device_id == self.master_device_id
+                else TriggerMode.EXTERNAL
+            )
+            for device_id in device_ids
+        }
+        self._sync_generation += 1
+        generation = self._sync_generation
+        self._sync_setup = {
+            "generation": generation,
+            "pending": set(device_ids),
+            "failed": [],
+            "continuous": continuous,
+            "device_ids": device_ids,
+        }
+        for index, (device_id, mode) in enumerate(desired_modes.items()):
+            QtCore.QTimer.singleShot(
+                index * 120,
+                lambda did=device_id, value=int(mode), gen=generation:
+                    self._send_sync_trigger_mode(gen, did, value),
+            )
+        QtCore.QTimer.singleShot(
+            len(desired_modes) * 120 + 2000,
+            lambda: self._sync_setup_timeout(generation),
+        )
+        return True
+
+    def _send_sync_trigger_mode(self, generation: int, device_id: int, mode: int):
+        setup = self._sync_setup
+        if not setup or setup["generation"] != generation:
+            return
+        if not self.set_trigger_mode(device_id, mode):
+            self._complete_sync_trigger_mode(device_id, False)
+
+    def _complete_sync_trigger_mode(self, device_id: int, success: bool):
+        setup = self._sync_setup
+        if not setup or device_id not in setup["pending"]:
+            return
+        setup["pending"].discard(device_id)
+        if not success:
+            setup["failed"].append(device_id)
+        if setup["pending"]:
+            return
+        generation = setup["generation"]
+        if setup["failed"]:
+            failed = ", ".join(str(item) for item in setup["failed"])
+            self._sync_setup = None
+            self.sync_configuration_failed.emit(f"设备 {failed} 的同步触发模式配置失败")
+            return
+        QtCore.QTimer.singleShot(50, lambda: self._start_after_sync_setup(generation))
+
+    def _start_after_sync_setup(self, generation: int):
+        setup = self._sync_setup
+        if not setup or setup["generation"] != generation:
+            return
+        self._sync_setup = None
+        results = self.start_sync_acquisition(setup["continuous"])
+        if all(results):
+            self.sync_started.emit(setup["device_ids"])
+        else:
+            self.sync_configuration_failed.emit("同步模式已配置，但启动命令发送不完整")
+
+    def _sync_setup_timeout(self, generation: int):
+        setup = self._sync_setup
+        if not setup or setup["generation"] != generation:
+            return
+        pending = ", ".join(str(item) for item in sorted(setup["pending"]))
+        self._sync_setup = None
+        self.sync_configuration_failed.emit(f"同步配置 ACK 超时，未完成设备：{pending}")
+
     def stop_all(self):
+        self._sync_generation += 1
+        self._sync_setup = None
         for device_id in list(self.devices):
             self.stop_acquisition(device_id)
 
@@ -316,22 +429,44 @@ class DeviceManager(QtCore.QObject):
         device = self.devices.get(device_id)
         if not device:
             return
+        # Firmware 2.2/2.3 acknowledges DEVICE_INIT using response Cmd=0x01
+        # instead of the documented 0x10.  A one-byte 0x6x/0x7x payload cannot
+        # be a version response, so it is safe to recognize this deviation.
+        if (cmd == CmdCode.GET_VERSION and len(params) == 1
+                and (params[0] & 0xE0) == 0x60):
+            if check_status(params[0]):
+                self.error_occurred.emit(device_id, "设备初始化返回失败")
+            else:
+                self.diagnostic_event.emit(
+                    f"设备 {device_id} 已接收兼容型初始化 ACK（响应 Cmd=0x01）"
+                )
+            self.device_updated.emit(device_id)
+            return
         is_set = cmd == CmdCode.DEVICE_INIT or 0x20 <= cmd <= 0x2C or 0x50 <= cmd <= 0x54
         if is_set:
             if not params:
+                if cmd == CmdCode.SET_TRIG_MODE:
+                    self._complete_sync_trigger_mode(device_id, False)
                 self.error_occurred.emit(device_id, f"命令 0x{cmd:02X} 响应缺少状态")
                 return
             if check_status(params[0]):
+                if cmd == CmdCode.SET_TRIG_MODE:
+                    self._complete_sync_trigger_mode(device_id, False)
+                if cmd in (CmdCode.START_SINGLE, CmdCode.START_CONTINUOUS):
+                    self._acquisition_requested.discard(device_id)
                 self._pending_updates.pop((device_id, int(cmd)), None)
                 self.error_occurred.emit(device_id, f"命令 0x{cmd:02X} 返回失败")
                 return
             apply = self._pending_updates.pop((device_id, int(cmd)), None)
             if apply:
                 apply()
+            if cmd == CmdCode.SET_TRIG_MODE:
+                self._complete_sync_trigger_mode(device_id, True)
             params = params[1:]
             if cmd in (CmdCode.START_SINGLE, CmdCode.START_CONTINUOUS):
                 device.acquiring = True
             elif cmd == CmdCode.STOP_ACQUISITION:
+                self._acquisition_requested.discard(device_id)
                 device.acquiring = False
 
         if cmd == CmdCode.GET_VERSION and len(params) >= 32:
@@ -379,6 +514,7 @@ class DeviceManager(QtCore.QObject):
         self.error_occurred.emit(device_id, message)
 
     def _on_disconnect(self, device_id: int):
+        self._acquisition_requested.discard(device_id)
         device = self.devices.get(device_id)
         if device:
             device.connected = False

@@ -136,12 +136,15 @@ class SerialWorker(QtCore.QObject):
                     "frame_sequence": parsed["frame_sequence"],
                     "reserved": parsed["reserved"],
                     "source_pixel_count": parsed["source_pixel_count"],
+                    "packet_number_bits": parsed["packet_number_bits"],
+                    "protocol_variant": parsed["protocol_variant"],
                 }
                 self.frame_received.emit(
                     SpectrumFrame.create(
                         self.device_index,
-                        parsed["packet_number"],
+                        (parsed["frame_sequence"] << 8) | parsed["reserved"],
                         pixels,
+                        sequence_bits=parsed["packet_number_bits"] if parsed["packet_number_bits"] == 16 else 24,
                     )
                 )
                 # 逐帧信号供无丢帧存储链路使用；显示仍可读取 latest_pixels 节流。

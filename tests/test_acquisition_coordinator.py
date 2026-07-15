@@ -37,6 +37,16 @@ def test_diagnostics_follow_packet_sequence():
     assert diagnostics.missing == 2
 
 
+def test_new_session_reset_does_not_treat_packet_counter_restart_as_out_of_order():
+    coordinator = AcquisitionCoordinator()
+    coordinator.ingest(frame(100))
+    coordinator.reset([0])
+    observation = coordinator.ingest(frame(1))
+
+    assert not observation.out_of_order
+    assert coordinator.diagnostics(0).received == 1
+
+
 def test_internal_hard_sync_arms_slaves_before_master_without_pulse_command():
     assert acquisition_start_order([0, 1, 2], SyncMode.HARD_INTERNAL, 1) == [0, 2, 1]
     assert acquisition_start_order([0, 1], SyncMode.HARD_EXTERNAL) == [0, 1]

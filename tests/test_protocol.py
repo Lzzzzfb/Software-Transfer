@@ -47,6 +47,8 @@ def test_parse_data_frame_uses_u32le_packet_number_and_u16be_pixels():
         "packet_number": 0x01020304,
         "frame_sequence": 0x010203,
         "reserved": 0x04,
+        "packet_number_bits": 32,
+        "protocol_variant": "u32",
         "pixels": [0x1234, 0xABCD],
         "pixel_count": 2,
         "source_pixel_count": 2,
@@ -90,8 +92,8 @@ def test_data_frame_crops_after_decoding_full_pixel_area():
 
 
 def test_data_frame_rejects_invalid_length_and_pixel_count():
-    invalid_length = bytes.fromhex("24 07 00 80 00 00 00 00 12 00")
-    with pytest.raises(ValueError, match="像素区不是偶数字节"):
+    invalid_length = bytes.fromhex("24 04 00 80 00 00 00")
+    with pytest.raises(ValueError, match="长度非法"):
         parse_data_packet(invalid_length)
 
     with pytest.raises(ValueError, match="设备信息不一致"):
@@ -104,3 +106,21 @@ def test_parser_rejects_truncated_or_trailing_frame():
         parse_data_packet(frame[:-1])
     with pytest.raises(ValueError, match="帧长度不匹配"):
         parse_data_packet(frame + b"\x00")
+
+
+def test_parse_real_firmware_legacy_u16_data_frame():
+    pixels = (0x0CF8, 0x0CED, 0x0F7B)
+    pixel_bytes = b"".join(value.to_bytes(2, "big") for value in pixels)
+    length = 3 + len(pixel_bytes)
+    frame = (
+        b"\x24" + length.to_bytes(2, "little") + b"\x80"
+        + (1).to_bytes(2, "little") + pixel_bytes + b"\x59"
+    )
+    parsed = parse_data_packet(frame, n_pixel=3)
+    assert len(frame) == 4 + length
+    assert parsed["packet_number"] == 1
+    assert parsed["frame_sequence"] == 1
+    assert parsed["reserved"] == 0
+    assert parsed["packet_number_bits"] == 16
+    assert parsed["protocol_variant"] == "legacy_u16"
+    assert parsed["pixels"] == list(pixels)

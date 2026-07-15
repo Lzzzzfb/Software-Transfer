@@ -17,6 +17,7 @@ class SpectrumFrame:
     monotonic_ns: int
     timestamp_ns: int
     wavelengths: Tuple[float, ...] = ()
+    sequence_bits: int = 24
 
     def __post_init__(self):
         if self.device_id < 0:
@@ -27,6 +28,8 @@ class SpectrumFrame:
             raise ValueError("像素必须是 U16")
         if self.wavelengths and len(self.wavelengths) != len(self.pixels):
             raise ValueError("波长与像素数量必须相同")
+        if self.sequence_bits not in (16, 24):
+            raise ValueError("序号位宽只能是 16 或 24")
 
     @property
     def sequence(self) -> int:
@@ -50,6 +53,7 @@ class SpectrumFrame:
         *,
         monotonic_ns: Optional[int] = None,
         timestamp_ns: Optional[int] = None,
+        sequence_bits: int = 24,
     ) -> "SpectrumFrame":
         return cls(
             device_id=device_id,
@@ -58,6 +62,7 @@ class SpectrumFrame:
             wavelengths=tuple(float(value) for value in wavelengths),
             monotonic_ns=time.monotonic_ns() if monotonic_ns is None else monotonic_ns,
             timestamp_ns=time.time_ns() if timestamp_ns is None else timestamp_ns,
+            sequence_bits=sequence_bits,
         )
 
 

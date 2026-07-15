@@ -37,7 +37,12 @@ class AcquisitionCoordinator:
         self._last_display_ns = 0
 
     def ingest(self, frame: SpectrumFrame) -> SequenceObservation:
-        tracker = self._trackers.setdefault(frame.device_id, SequenceTracker())
+        tracker = self._trackers.get(frame.device_id)
+        if tracker is None:
+            tracker = SequenceTracker(frame.sequence_bits)
+            self._trackers[frame.device_id] = tracker
+        elif tracker.sequence_bits != frame.sequence_bits:
+            raise ValueError("同一设备的包序号位宽在采集中发生变化")
         observation = tracker.observe(frame.sequence)
 
         # 存储回调在显示合并前调用，任何帧都不会因界面节流而丢失。
@@ -66,6 +71,19 @@ class AcquisitionCoordinator:
             out_of_order=tracker.out_of_order,
             wraps=tracker.wraps,
         )
+
+    def reset(self, device_ids=None) -> None:
+        """为新采集会话清空序号诊断和待显示帧。"""
+
+        with self._lock:
+            if device_ids is None:
+                self._trackers.clear()
+                self._latest.clear()
+            else:
+                for device_id in device_ids:
+                    self._trackers.pop(device_id, None)
+                    self._latest.pop(device_id, None)
+            self._last_display_ns = 0
 
 
 def acquisition_start_order(

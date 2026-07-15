@@ -40,9 +40,11 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         auto_start_simulation: bool = True,
         settings_path=None,
+        port_allowlist=None,
     ):
         super().__init__()
         self.simulation = simulation
+        self.port_allowlist = {str(port).upper() for port in (port_allowlist or [])}
         self.setWindowTitle("ZGCAI 光谱仪采集与分析工作站")
         self.resize(1480, 900); self.setMinimumSize(1100, 680)
 
@@ -52,6 +54,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.processor = SpectrumProcessor()
         self.acquisition = AcquisitionCoordinator(self._store_frame, display_fps=30)
         self.storage: BatchStorageCoordinator = None
+        self._initializing_devices = set()
         self._latest_frames = {}
         self._sim_x = {}; self._sim_sequence = {}; self._sim_phase = 0.0
         self._sim_running = False
@@ -133,6 +136,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_manager.error_occurred.connect(lambda did, msg: self._log(f"设备 {did}: {msg}", "ERROR"))
         self.device_manager.device_connect_failed.connect(lambda did, msg: self._log(f"设备 {did} 连接失败: {msg}", "WARN"))
         self.device_manager.diagnostic_event.connect(self._log)
+        self.device_manager.sync_started.connect(self._sync_started)
+        self.device_manager.sync_configuration_failed.connect(self._sync_configuration_failed)
 
     def _apply_settings(self):
         self.sidebar.batch_size.setValue(self.settings["batch_size"])
@@ -149,9 +154,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.set_available_ports([port["port_name"] for port in ports])
         existing = {device.port_name for device in self.device_manager.devices.values()}
         for port in ports:
-            if port["port_name"] not in existing and DeviceFinder.is_likely_spectrometer(port):
+            allowed = not self.port_allowlist or port["port_name"].upper() in self.port_allowlist
+            if allowed and port["port_name"] not in existing and DeviceFinder.is_likely_spectrometer(port):
                 self.device_manager.add_and_connect(port["port_name"], 115200)
-        self.status_panel.state_label.setText("设备扫描完成")
 
     def _device_changed(self, device_id):
         device = self.device_manager.get_device(device_id)
@@ -162,18 +167,32 @@ class MainWindow(QtWidgets.QMainWindow):
         device = self.device_manager.get_device(device_id)
         if not device or device.port_name.startswith("SIM"):
             return
+        self._initializing_devices.add(device_id)
+        self.status_panel.state_label.setText("设备初始化中…")
         self.device_manager.init_device(device_id)
         QtCore.QTimer.singleShot(150, lambda: self.device_manager.query_version(device_id))
         QtCore.QTimer.singleShot(300, lambda: self.device_manager.query_calibration(device_id))
         QtCore.QTimer.singleShot(450, lambda: self.device_manager.query_serial_number(device_id))
-        query_commands = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x38, 0x39, 0x3A, 0x3B]
+        # 0x39/0x3A require a U32 requested length and may return multi-KB blobs;
+        # they are not runtime status queries and must not be sent with empty params.
+        query_commands = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x38, 0x3B]
         for index, command in enumerate(query_commands):
             QtCore.QTimer.singleShot(
                 600 + index * 80,
                 lambda value=command: self.device_manager.send_to_device(device_id, value),
             )
+        QtCore.QTimer.singleShot(1650, lambda: self._finish_device_initialization(device_id))
+
+    def _finish_device_initialization(self, device_id):
+        self._initializing_devices.discard(device_id)
+        if not self._initializing_devices and not any(
+            device.acquiring for device in self.device_manager.get_connected_devices()
+        ):
+            count = len(self.device_manager.get_connected_devices())
+            self.status_panel.state_label.setText(f"就绪（{count} 台设备）")
 
     def _device_removed(self, device_id):
+        self._initializing_devices.discard(device_id)
         self.sidebar.remove_device(device_id); self.plot_widget.remove_device_curve(device_id)
 
     def _device_enabled_changed(self, device_id, enabled):
@@ -194,14 +213,47 @@ class MainWindow(QtWidgets.QMainWindow):
         devices = [device for device in self.device_manager.get_connected_devices() if device.enabled]
         if not devices:
             self.status_panel.state_label.setText("没有可采集设备"); self._log("没有可采集设备", "WARN"); return
+        if self.device_manager.acquisition_active:
+            self._log("采集已在运行或正在启动", "WARN"); return
+        pending = [device.port_name for device in devices if device.device_id in self._initializing_devices]
+        if pending:
+            message = f"设备正在初始化：{', '.join(pending)}"
+            self.status_panel.state_label.setText(message); self._log(message, "WARN"); return
         if self.sidebar.auto_store.isChecked() and self.storage is None:
             try: self._start_storage(devices)
             except Exception as exc: self._log(f"无法启动批量存储: {exc}", "ERROR"); return
+        self.acquisition.reset(device.device_id for device in devices)
         continuous = self.sidebar.acquisition_mode.currentIndex() == 0
-        self.device_manager.start_sync_acquisition(continuous)
+        sync_mode = self.ribbon.sync_combo.currentData()
+        if sync_mode == "hard_internal":
+            self.device_manager.master_device_id = self.sidebar.selected_device_id
+            if self.device_manager.master_device_id not in [device.device_id for device in devices]:
+                self._log("内部硬同步需要选择一台已启用的主设备", "ERROR")
+                self._close_storage(); return
+        if not self.device_manager.prepare_sync_acquisition(continuous):
+            self._close_storage(); return
         self._sim_running = self.simulation
-        self.status_panel.state_label.setText("连续采集中" if continuous else "单次采集中")
-        self._log(f"开始{'连续' if continuous else '单次'}采集，共 {len(devices)} 台设备")
+        if sync_mode in ("hard_internal", "hard_external"):
+            self.status_panel.state_label.setText("正在配置硬同步触发模式…")
+
+    def _sync_started(self, device_ids):
+        sync_mode = self.ribbon.sync_combo.currentData()
+        continuous = self.sidebar.acquisition_mode.currentIndex() == 0
+        if sync_mode == "hard_external":
+            state = "等待外部触发"
+        elif sync_mode == "hard_internal":
+            state = "内部硬同步采集中"
+        else:
+            state = "连续采集中" if continuous else "单次采集中"
+        self.status_panel.state_label.setText(state)
+        self._log(f"开始{'连续' if continuous else '单次'}采集，共 {len(device_ids)} 台设备")
+
+    def _sync_configuration_failed(self, message):
+        self._log(message, "ERROR")
+        self._sim_running = False
+        self.device_manager.stop_all()
+        self._close_storage()
+        self.status_panel.state_label.setText("同步配置失败")
 
     def stop_acquisition(self):
         self._sim_running = False; self.device_manager.stop_all()

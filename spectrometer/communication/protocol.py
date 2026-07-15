@@ -4,14 +4,18 @@
 
     0x24 | nLength(U16LE) | Cmd | Params | Checksum
 
-采集数据帧（Cmd=0x80）是下位机协议中的特例：``nLength`` 包含校验码，
-物理总长度为 ``3 + nLength``::
+采集数据帧（Cmd=0x80）存在两个已确认版本。新版/函数表格式的
+``nLength`` 包含校验码，物理总长度为 ``3 + nLength``::
 
     0x24 | nLength(U16LE) | 0x80 | nPacketNumb(U32LE)
          | Pixels(U16BE...) | Checksum
 
 其中 ``nLength = 6 + 2 * pixel_count``。数据帧中的校验字节会被消费，
 但根据现有下位机约定不进行数值校验。
+
+2026-07-15 实机固件（2.2/2.3）实际返回兼容格式：U16LE 包号，校验码
+不计入 ``nLength``，即 ``nLength = 3 + 2 * pixel_count``、物理总长度
+``4 + nLength``。两种格式可由长度奇偶性无歧义识别并同时支持。
 """
 
 from enum import IntEnum
@@ -85,10 +89,14 @@ def frame_total_length(length: int, cmd: int) -> int:
     """根据长度字段和命令码返回帧的物理总字节数。"""
 
     if cmd == CmdCode.DATA_TRANSMIT:
+        if length % 2:
+            # 实机兼容格式: Cmd(1) + U16包号(2) + U16像素(N)，校验在长度外。
+            if length < 3:
+                raise ValueError(f"0x80 兼容数据帧长度非法: {length}，最小为 3")
+            return 4 + length
+        # 函数表/新版格式: Cmd(1) + U32包号(4) + U16像素(N) + 校验(1)。
         if length < DATA_FRAME_FIXED_LENGTH:
             raise ValueError(f"0x80 数据帧长度非法: {length}，最小为 6")
-        if (length - DATA_FRAME_FIXED_LENGTH) % 2:
-            raise ValueError(f"0x80 数据帧像素区不是偶数字节: nLength={length}")
         return 3 + length
 
     if length < 1:
@@ -176,20 +184,32 @@ def parse_data_packet(
 ) -> dict:
     """解析完整的 0x80 采集帧。
 
-    ``nPacketNumb`` 按 U32 小端读取，其中高 24 位是帧序号、低 8 位是
-    保留位。像素按 U16 大端读取。若设备已报告 ``n_pixel``，数据帧中的
-    原始像素数必须与之相同，以便尽早暴露串口错帧或设备配置不一致。
+    自动兼容 U32 新格式与当前实机 U16 格式。像素均按 U16 大端读取。
+    若设备已报告 ``n_pixel``，数据帧中的原始像素数必须与之相同，以便
+    尽早暴露串口错帧或设备配置不一致。
     """
 
     length, cmd, total_length = _require_complete_frame(data)
     if cmd != CmdCode.DATA_TRANSMIT:
         raise ValueError(f"非数据帧命令码: 0x{cmd:02X}")
 
-    packet_number = struct.unpack_from("<I", data, 4)[0]
-    pixel_view = memoryview(data)[8 : total_length - 1]
+    legacy_u16 = bool(length % 2)
+    if legacy_u16:
+        packet_number = struct.unpack_from("<H", data, 4)[0]
+        frame_sequence = packet_number
+        reserved = 0
+        pixel_view = memoryview(data)[6 : total_length - 1]
+        expected_from_length = (length - 3) // 2
+        protocol_variant = "legacy_u16"
+    else:
+        packet_number = struct.unpack_from("<I", data, 4)[0]
+        frame_sequence = (packet_number >> 8) & 0xFFFFFF
+        reserved = packet_number & 0xFF
+        pixel_view = memoryview(data)[8 : total_length - 1]
+        expected_from_length = (length - DATA_FRAME_FIXED_LENGTH) // 2
+        protocol_variant = "u32"
     source_pixel_count = len(pixel_view) // 2
 
-    expected_from_length = (length - DATA_FRAME_FIXED_LENGTH) // 2
     if source_pixel_count != expected_from_length:
         raise ValueError(
             f"像素数量与长度字段不匹配: {source_pixel_count} != {expected_from_length}"
@@ -215,8 +235,10 @@ def parse_data_packet(
 
     return {
         "packet_number": packet_number,
-        "frame_sequence": (packet_number >> 8) & 0xFFFFFF,
-        "reserved": packet_number & 0xFF,
+        "frame_sequence": frame_sequence,
+        "reserved": reserved,
+        "packet_number_bits": 16 if legacy_u16 else 32,
+        "protocol_variant": protocol_variant,
         "pixels": pixels,
         "pixel_count": len(pixels),
         "source_pixel_count": source_pixel_count,

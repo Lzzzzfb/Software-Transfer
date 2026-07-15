@@ -1,6 +1,8 @@
 """单设备完整参数与校准对话框。"""
 
-from ..qt import QtWidgets
+import math
+
+from ..qt import QtCore, QtWidgets
 
 
 class DeviceParametersDialog(QtWidgets.QDialog):
@@ -36,10 +38,28 @@ class DeviceParametersDialog(QtWidgets.QDialog):
 
     def apply(self):
         device_id = self.device.device_id
-        self.manager.set_integration_time(device_id, self.integration.value())
-        self.manager.set_trigger_mode(device_id, self.trigger.currentIndex())
-        self.manager.set_interval(device_id, self.interval.value())
-        self.manager.set_avg_count(device_id, self.average.value())
-        self.manager.set_gain(device_id, self.gain.value())
-        self.manager.set_delay(device_id, self.delay.value())
-        self.manager.set_calib_coeff(device_id, *(widget.value() for widget in self.calibration))
+        actions = []
+        values = (
+            (self.integration.value(), self.device.integration_time_us, self.manager.set_integration_time),
+            (self.trigger.currentIndex(), self.device.trigger_mode, self.manager.set_trigger_mode),
+            (self.interval.value(), self.device.interval_us, self.manager.set_interval),
+            (self.average.value(), self.device.avg_count, self.manager.set_avg_count),
+            (self.gain.value(), self.device.gain, self.manager.set_gain),
+            (self.delay.value(), self.device.delay_us, self.manager.set_delay),
+        )
+        for new_value, old_value, setter in values:
+            if new_value != old_value:
+                actions.append(lambda s=setter, value=new_value: s(device_id, value))
+
+        calibration = tuple(widget.value() for widget in self.calibration)
+        current = tuple(
+            getattr(self.device.wavelength_calib, name) for name in ("c1", "c2", "c3", "c4")
+        )
+        if any(not math.isclose(new, old, rel_tol=1e-12, abs_tol=1e-15)
+               for new, old in zip(calibration, current)):
+            actions.append(lambda values=calibration: self.manager.set_calib_coeff(device_id, *values))
+
+        # The real controller can drop back-to-back writes.  Pace only changed
+        # values so every command has time to return its ACK before the next one.
+        for index, action in enumerate(actions):
+            QtCore.QTimer.singleShot(index * 120, action)
