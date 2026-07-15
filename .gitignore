@@ -15,6 +15,7 @@ data/
 
 # Local design companion/session files
 .superpowers/
+/.claude/settings.local.json
 
 # Test and tool caches
 .pytest_cache/
