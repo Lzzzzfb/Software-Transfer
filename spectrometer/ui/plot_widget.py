@@ -1,375 +1,332 @@
-"""
-实时光谱可视化组件 — 基于pyqtgraph实现高性能绘图。
-支持缩放、平移、对比光谱叠加、多设备分色显示。
-"""
+"""无需第三方绘图库的高性能光谱绘图控件。"""
 
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 
-import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QPointF, pyqtSignal
-from PyQt5.QtGui import QColor, QPen
+from ..qt import QtCore, QtGui, QtWidgets, Signal
 
 
-# 预定义的颜色循环 (最多支持64种)
 COLOR_PALETTE = [
-    (0, 114, 189), (217, 83, 25), (237, 177, 32), (126, 47, 142),
-    (119, 172, 48), (77, 190, 238), (162, 20, 47), (76, 67, 27),
-    (0, 163, 136), (189, 126, 190), (255, 127, 14), (174, 199, 232),
-    (255, 187, 120), (44, 160, 44), (152, 223, 138), (196, 156, 148),
-    (140, 86, 75), (227, 119, 194), (127, 127, 127), (199, 199, 199),
-    (188, 189, 34), (23, 190, 207), (31, 119, 180), (255, 20, 147),
-    (0, 128, 128), (128, 0, 0), (128, 128, 0), (0, 0, 128),
-    (70, 130, 180), (255, 69, 0), (50, 205, 50), (138, 43, 226),
-    (0, 255, 127), (220, 20, 60), (0, 191, 255), (255, 215, 0),
-    (102, 205, 170), (233, 150, 122), (65, 105, 225), (218, 112, 214),
-    (135, 206, 235), (238, 130, 238), (144, 238, 144), (255, 182, 193),
-    (176, 196, 222), (240, 128, 128), (147, 112, 219), (0, 250, 154),
-    (255, 228, 181), (154, 205, 50), (186, 85, 211), (100, 149, 237),
-    (205, 92, 92), (222, 184, 135), (95, 158, 160), (210, 105, 30),
-    (139, 69, 19), (85, 107, 47), (189, 183, 107), (128, 128, 128),
-    (72, 61, 139), (143, 188, 143), (160, 82, 45), (123, 104, 238),
+    "#1367D1", "#E65100", "#18864B", "#9C27B0", "#D32F2F", "#00838F",
+    "#5D4037", "#3949AB", "#7CB342", "#F9A825", "#6D4C41", "#546E7A",
 ]
 
 
-class SpectrumPlotWidget(pg.GraphicsLayoutWidget):
-    """光谱实时绘图组件"""
+@dataclass
+class _Curve:
+    x: np.ndarray
+    y: np.ndarray
+    color: QtGui.QColor
+    label: str
+    visible: bool = True
 
-    curve_selected = pyqtSignal(int)  # curve_index
+
+def _event_position(event):
+    position = getattr(event, "position", None)
+    return position() if position else event.pos()
+
+
+class SpectrumPlotWidget(QtWidgets.QWidget):
+    user_zoomed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackground('#fafbfc')
+        self.setObjectName("spectrumPlot")
+        self.setMinimumSize(500, 360)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.device_curves: Dict[int, _Curve] = {}
+        self.reference_curves: Dict[str, _Curve] = {}
+        self.baseline_curves: Dict[int, _Curve] = {}
+        self.line_width = 1.4
+        self.x_label = "像素序号"
+        self.y_label = "强度 (counts)"
+        self.auto_range_enabled = True
+        self._view_range: Optional[Tuple[float, float, float, float]] = None
+        self._drag_origin = None
+        self._drag_range = None
+        self._cursor_pos = None
+        self._show_crosshair = True
 
-        # 主绘图区
-        self.plot = self.addPlot(row=0, col=0)
-
-        # 坐标轴标签
-        self.plot.setLabel('bottom', '像素序号', color='#555')
-        self.plot.setLabel('left', '强度', units='counts', color='#555')
-        self.plot.getAxis('left').enableAutoSIPrefix(False)
-
-        # 网格
-        self.plot.showGrid(x=True, y=True, alpha=0.25)
-        self.plot.getAxis('bottom').setPen(pg.mkPen(color='#c8d6e5', width=1))
-        self.plot.getAxis('left').setPen(pg.mkPen(color='#c8d6e5', width=1))
-
-        # 图例 (勾选控制曲线显隐)
-        self.legend = self.plot.addLegend(offset=(5, 5))
-
-        # 缩放交互
-        self.plot.setMouseEnabled(x=True, y=True)
-        self.plot.enableAutoRange()
-        self.set_rect_zoom_mode(False)
-
-        # 曲线管理
-        self.device_curves: Dict[int, pg.PlotDataItem] = {}
-        self.reference_curves: List[pg.PlotDataItem] = []
-        self.line_width = 1.0
-
-        # 图例项勾选框追踪
-        self._legend_checkable = False
-
-        # 右键菜单
-        self.plot.scene().contextMenu = None
-        self.plot.setMenuEnabled(False)
-
-        # 悬停提示 (X, Y)
-        self._hover_marker = pg.ScatterPlotItem(
-            size=8, pen=pg.mkPen(color='#222', width=1),
-            brush=pg.mkBrush(255, 230, 0, 200))
-        self._hover_marker.setZValue(10)
-        self._hover_marker.hide()
-        self.plot.addItem(self._hover_marker)
-        self._hover_label = pg.TextItem(color='#111', anchor=(0, 1),
-                                        fill=pg.mkBrush(255, 255, 255, 220))
-        self._hover_label.setZValue(10)
-        self._hover_label.hide()
-        self.plot.addItem(self._hover_label)
-        self._mouse_move_proxy = pg.SignalProxy(
-            self.plot.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved)
-
-    def set_rect_zoom_mode(self, enabled: bool):
-        """切换框选缩放模式"""
-        vb = self.plot.getViewBox()
-        if enabled:
-            vb.setMouseMode(vb.RectMode)
-        else:
-            vb.setMouseMode(vb.PanMode)
-
-    def _hide_hover(self):
-        self._hover_marker.hide()
-        self._hover_label.hide()
-
-    def _on_mouse_moved(self, evt):
-        pos = evt[0] if isinstance(evt, (tuple, list)) else evt
-        if not self.plot.sceneBoundingRect().contains(pos):
-            self._hide_hover()
-            return
-
-        curves = list(self.device_curves.values()) + list(self.reference_curves)
-        if not curves:
-            self._hide_hover()
-            return
-
-        vb = self.plot.getViewBox()
-        view_pos = vb.mapSceneToView(pos)
-        x = view_pos.x()
-
-        best = None
-        best_dist2 = None
-        for curve in curves:
-            xdata, ydata = curve.getData()
-            if xdata is None or ydata is None or len(xdata) == 0:
-                continue
-
-            if len(xdata) >= 2 and xdata[0] <= xdata[-1]:
-                idx = int(np.searchsorted(xdata, x))
-                candidates = []
-                if 0 <= idx < len(xdata):
-                    candidates.append(idx)
-                if idx - 1 >= 0:
-                    candidates.append(idx - 1)
-            else:
-                idx = int(np.argmin(np.abs(xdata - x)))
-                candidates = [idx]
-
-            for i in candidates:
-                px = float(xdata[i])
-                py = float(ydata[i])
-                pt_scene = vb.mapViewToScene(QPointF(px, py))
-                dx = pt_scene.x() - pos.x()
-                dy = pt_scene.y() - pos.y()
-                dist2 = dx * dx + dy * dy
-                if best_dist2 is None or dist2 < best_dist2:
-                    best_dist2 = dist2
-                    best = (px, py)
-
-        if best is None or best_dist2 is None or best_dist2 > 120:  # 约11px半径
-            self._hide_hover()
-            return
-
-        bx, by = best
-        self._hover_marker.setData([bx], [by])
-        self._hover_marker.show()
-        self._hover_label.setText(f'({bx:.4f}, {by:.4f})')
-        self._hover_label.setPos(bx, by)
-        self._hover_label.show()
-    def update_device_curve(self, device_id: int, wavelengths: np.ndarray,
-                            intensities: np.ndarray, label: str = ''):
-        """更新设备实时曲线 — label 变化时自动重建曲线和图例"""
+    def update_device_curve(self, device_id: int, x, y, label: str = ""):
+        x_array = np.asarray(x, dtype=np.float64)
+        y_array = np.asarray(y, dtype=np.float64)
+        if x_array.shape != y_array.shape or x_array.ndim != 1:
+            raise ValueError("绘图 x/y 必须是一维且长度相同")
+        color = QtGui.QColor(COLOR_PALETTE[device_id % len(COLOR_PALETTE)])
         existing = self.device_curves.get(device_id)
-        old_name = existing.opts.get('name', '') if existing else ''
+        self.device_curves[device_id] = _Curve(
+            x_array.copy(), y_array.copy(), existing.color if existing else color,
+            label or f"设备 {device_id}", existing.visible if existing else True,
+        )
+        if self.auto_range_enabled:
+            self._view_range = self._calculate_bounds()
+        self.update()
 
-        if label and old_name and label != old_name:
-            # 标签变化(例如序列号到达) → 重建曲线
-            self.legend.removeItem(old_name)
-            self.plot.removeItem(existing)
-            del self.device_curves[device_id]
-            existing = None
+    update_spectrum = update_device_curve
 
-        if existing is None:
-            color = COLOR_PALETTE[device_id % len(COLOR_PALETTE)]
-            pen = pg.mkPen(color=color, width=self.line_width)
-            curve = self.plot.plot(pen=pen, name=label or f'Ch{device_id}')
-            self.device_curves[device_id] = curve
-            self._make_legend_checkable()
-        else:
-            curve = existing
-        curve.setData(wavelengths, intensities)
+    def remove_device_curve(self, device_id: int):
+        self.device_curves.pop(device_id, None)
+        self.baseline_curves.pop(device_id, None)
+        self.update()
 
-    def _make_legend_checkable(self):
-        """确保所有图例项可勾选 — 显示复选框控制曲线显隐"""
-        if self._legend_checkable:
-            return
-        try:
-            for item in self.legend.items:
-                # pyqtgraph 0.14+: items 是 ItemSample 或 (curve, label) 元组
-                sample = item[0] if isinstance(item, (tuple, list)) else item
-                if hasattr(sample, 'setCheckable'):
-                    sample.setCheckable(True)
-                    sample.setCheckState(True)
-                elif hasattr(item, 'setCheckable'):
-                    item.setCheckable(True)
-                    item.setCheckState(True)
-            self._legend_checkable = True
-        except Exception:
-            self._legend_checkable = True  # 避免反复重试
+    def add_reference_curve(self, x, y, label: str = "对比光谱") -> bool:
+        if len(self.reference_curves) >= 64:
+            return False
+        key = f"reference_{len(self.reference_curves) + 1}"
+        color = QtGui.QColor(COLOR_PALETTE[(len(self.reference_curves) + 5) % len(COLOR_PALETTE)])
+        self.reference_curves[key] = _Curve(
+            np.asarray(x, dtype=np.float64).copy(),
+            np.asarray(y, dtype=np.float64).copy(),
+            color,
+            label,
+        )
+        self.update()
+        return True
 
-    def add_reference_curve(self, wavelengths: np.ndarray, intensities: np.ndarray,
-                            label: str, color: Optional[Tuple[int, int, int]] = None):
-        """添加对比光谱曲线"""
-        idx = len(self.reference_curves)
-        if idx >= 64:
-            return
-        if color is None:
-            color = COLOR_PALETTE[(idx + len(self.device_curves)) % len(COLOR_PALETTE)]
-        pen = pg.mkPen(color=color, width=self.line_width, style=Qt.DashLine)
-        curve = self.plot.plot(pen=pen, name=label)
-        curve.setData(wavelengths, intensities)
-        self.reference_curves.append(curve)
-        self._make_legend_checkable()
-        return idx
-
-    def remove_reference_curve(self, index: int):
-        """移除指定对比曲线"""
-        if 0 <= index < len(self.reference_curves):
-            curve = self.reference_curves[index]
-            self.legend.removeItem(curve.opts.get('name', ''))
-            self.plot.removeItem(curve)
-            self.reference_curves.pop(index)
+    def set_baseline_curve(self, device_id: int, x, y, visible: bool = True):
+        self.baseline_curves[device_id] = _Curve(
+            np.asarray(x, dtype=np.float64).copy(),
+            np.asarray(y, dtype=np.float64).copy(),
+            QtGui.QColor("#8894A4"),
+            f"设备 {device_id} 基线",
+            visible,
+        )
+        self.update()
 
     def clear_reference_curves(self):
-        """清除所有对比曲线"""
-        for curve in self.reference_curves:
-            self.legend.removeItem(curve.opts.get('name', ''))
-            self.plot.removeItem(curve)
         self.reference_curves.clear()
+        self.update()
 
     def clear_all(self):
-        """清除所有曲线"""
-        self.legend.clear()
-        for curve in self.device_curves.values():
-            self.plot.removeItem(curve)
         self.device_curves.clear()
-        self.clear_reference_curves()
-        self._legend_checkable = False
+        self.reference_curves.clear()
+        self.baseline_curves.clear()
+        self._view_range = None
+        self.update()
+
+    def set_axis_labels(self, x_label: str, y_label: str):
+        self.x_label, self.y_label = x_label, y_label
+        self.update()
 
     def set_line_width(self, width: float):
-        """设置曲线粗细"""
-        self.line_width = width
-        for curve in self.device_curves.values():
-            curve.setPen(pg.mkPen(color=curve.opts['pen'].color(), width=width))
+        self.line_width = max(0.5, float(width))
+        self.update()
 
-    def set_device_color(self, device_id: int, color: QColor):
-        """设置设备曲线颜色"""
+    def set_device_color(self, device_id: int, color):
         if device_id in self.device_curves:
-            self.device_curves[device_id].setPen(
-                pg.mkPen(color=color, width=self.line_width))
+            self.device_curves[device_id].color = QtGui.QColor(color)
+            self.update()
 
     def auto_range(self):
-        """自动缩放"""
-        self.plot.autoRange()
+        self.auto_range_enabled = True
+        self._view_range = self._calculate_bounds()
+        self.update()
 
-    def set_x_range(self, x_min: float, x_max: float):
-        self.plot.setXRange(x_min, x_max)
+    def enable_auto_range(self, enabled: bool):
+        self.auto_range_enabled = bool(enabled)
+        if enabled:
+            self.auto_range()
 
-    def set_y_range(self, y_min: float, y_max: float):
-        self.plot.setYRange(y_min, y_max)
+    def set_x_range(self, minimum: float, maximum: float):
+        current = self._effective_range()
+        self._view_range = (minimum, maximum, current[2], current[3])
+        self.auto_range_enabled = False
+        self.update()
 
-    def set_view_range(self, x_min: float, x_max: float, y_min: float, y_max: float):
-        self.plot.setRange(xRange=(x_min, x_max), yRange=(y_min, y_max))
+    def set_y_range(self, minimum: float, maximum: float):
+        current = self._effective_range()
+        self._view_range = (current[0], current[1], minimum, maximum)
+        self.auto_range_enabled = False
+        self.update()
+
+    def set_view_range(self, x_min, x_max, y_min, y_max):
+        self._view_range = (x_min, x_max, y_min, y_max)
+        self.auto_range_enabled = False
+        self.update()
+
+    def save_image(self, path: str) -> bool:
+        image = QtGui.QImage(self.size(), QtGui.QImage.Format_ARGB32)
+        image.fill(QtGui.QColor("white"))
+        painter = QtGui.QPainter(image)
+        self._paint(painter)
+        painter.end()
+        return image.save(path)
+
+    def _all_curves(self):
+        return list(self.device_curves.values()) + list(self.reference_curves.values()) + list(self.baseline_curves.values())
+
+    def _calculate_bounds(self):
+        visible = [curve for curve in self._all_curves() if curve.visible and curve.x.size]
+        if not visible:
+            return (0.0, 4095.0, 0.0, 65535.0)
+        x_min = min(float(np.nanmin(curve.x)) for curve in visible)
+        x_max = max(float(np.nanmax(curve.x)) for curve in visible)
+        y_min = min(float(np.nanmin(curve.y)) for curve in visible)
+        y_max = max(float(np.nanmax(curve.y)) for curve in visible)
+        if x_max <= x_min: x_max = x_min + 1
+        if y_max <= y_min: y_max = y_min + 1
+        x_pad = (x_max - x_min) * 0.02
+        y_pad = (y_max - y_min) * 0.08
+        return (x_min - x_pad, x_max + x_pad, y_min - y_pad, y_max + y_pad)
+
+    def _effective_range(self):
+        return self._view_range or self._calculate_bounds()
+
+    def _plot_rect(self):
+        return QtCore.QRectF(self.rect()).adjusted(68, 22, -24, -52)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        self._paint(painter)
+
+    def _paint(self, painter):
+        antialias = getattr(QtGui.QPainter, "Antialiasing", None)
+        if antialias is None:
+            antialias = QtGui.QPainter.RenderHint.Antialiasing
+        painter.setRenderHint(antialias, True)
+        painter.fillRect(self.rect(), QtGui.QColor("#FFFFFF"))
+        plot_rect = self._plot_rect()
+        painter.fillRect(plot_rect, QtGui.QColor("#FBFCFE"))
+        view = self._effective_range()
+        self._draw_grid(painter, plot_rect, view)
+        for curve in self._all_curves():
+            if curve.visible:
+                self._draw_curve(painter, plot_rect, view, curve)
+        self._draw_legend(painter, plot_rect)
+        self._draw_crosshair(painter, plot_rect, view)
+
+    def _draw_grid(self, painter, rect, view):
+        painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0"), 1))
+        font = painter.font(); font.setPointSize(8); painter.setFont(font)
+        for index in range(7):
+            ratio = index / 6
+            px = rect.left() + ratio * rect.width()
+            py = rect.bottom() - ratio * rect.height()
+            painter.drawLine(QtCore.QPointF(px, rect.top()), QtCore.QPointF(px, rect.bottom()))
+            painter.drawLine(QtCore.QPointF(rect.left(), py), QtCore.QPointF(rect.right(), py))
+            x_value = view[0] + ratio * (view[1] - view[0])
+            y_value = view[2] + ratio * (view[3] - view[2])
+            painter.setPen(QtGui.QColor("#667085"))
+            painter.drawText(QtCore.QRectF(px - 40, rect.bottom() + 6, 80, 18), QtCore.Qt.AlignCenter, f"{x_value:.3g}")
+            painter.drawText(QtCore.QRectF(3, py - 9, 58, 18), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{y_value:.3g}")
+            painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0"), 1))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#8492A6"), 1))
+        painter.drawRect(rect)
+        painter.setPen(QtGui.QColor("#344054"))
+        painter.drawText(QtCore.QRectF(rect.left(), rect.bottom() + 29, rect.width(), 18), QtCore.Qt.AlignCenter, self.x_label)
+        painter.save(); painter.translate(17, rect.center().y()); painter.rotate(-90)
+        painter.drawText(QtCore.QRectF(-rect.height() / 2, -10, rect.height(), 20), QtCore.Qt.AlignCenter, self.y_label)
+        painter.restore()
+
+    def _draw_curve(self, painter, rect, view, curve):
+        if curve.x.size < 2:
+            return
+        finite = np.isfinite(curve.x) & np.isfinite(curve.y)
+        x, y = curve.x[finite], curve.y[finite]
+        if x.size < 2:
+            return
+        max_points = max(400, int(rect.width() * 2))
+        if x.size > max_points:
+            indices = np.linspace(0, x.size - 1, max_points, dtype=int)
+            x, y = x[indices], y[indices]
+        px = rect.left() + (x - view[0]) / (view[1] - view[0]) * rect.width()
+        py = rect.bottom() - (y - view[2]) / (view[3] - view[2]) * rect.height()
+        path = QtGui.QPainterPath(QtCore.QPointF(float(px[0]), float(py[0])))
+        for x_point, y_point in zip(px[1:], py[1:]):
+            path.lineTo(float(x_point), float(y_point))
+        painter.save(); painter.setClipRect(rect)
+        painter.setPen(QtGui.QPen(curve.color, self.line_width))
+        painter.drawPath(path); painter.restore()
+
+    def _draw_legend(self, painter, rect):
+        items = [curve for curve in self._all_curves() if curve.visible][:12]
+        if not items:
+            return
+        box = QtCore.QRectF(rect.right() - 170, rect.top() + 10, 158, 8 + len(items) * 20)
+        painter.fillRect(box, QtGui.QColor(255, 255, 255, 225))
+        painter.setPen(QtGui.QColor("#D0D5DD")); painter.drawRect(box)
+        for index, curve in enumerate(items):
+            y = box.top() + 14 + index * 20
+            painter.setPen(QtGui.QPen(curve.color, 2)); painter.drawLine(box.left() + 8, y, box.left() + 30, y)
+            painter.setPen(QtGui.QColor("#344054")); painter.drawText(QtCore.QPointF(box.left() + 36, y + 4), curve.label[:18])
+
+    def _draw_crosshair(self, painter, rect, view):
+        if not self._show_crosshair or self._cursor_pos is None or not rect.contains(self._cursor_pos):
+            return
+        pos = self._cursor_pos
+        painter.setPen(QtGui.QPen(QtGui.QColor("#98A2B3"), 1, QtCore.Qt.DashLine))
+        painter.drawLine(QtCore.QPointF(pos.x(), rect.top()), QtCore.QPointF(pos.x(), rect.bottom()))
+        painter.drawLine(QtCore.QPointF(rect.left(), pos.y()), QtCore.QPointF(rect.right(), pos.y()))
+        x_value = view[0] + (pos.x() - rect.left()) / rect.width() * (view[1] - view[0])
+        y_value = view[3] - (pos.y() - rect.top()) / rect.height() * (view[3] - view[2])
+        text = f"X {x_value:.4f}   Y {y_value:.4f}"
+        box = QtCore.QRectF(pos.x() + 8, pos.y() - 27, 155, 22)
+        if box.right() > rect.right(): box.moveRight(pos.x() - 8)
+        painter.fillRect(box, QtGui.QColor(16, 24, 40, 220))
+        painter.setPen(QtGui.QColor("white")); painter.drawText(box, QtCore.Qt.AlignCenter, text)
+
+    def mouseMoveEvent(self, event):
+        position = _event_position(event)
+        self._cursor_pos = QtCore.QPointF(position)
+        if self._drag_origin is not None and self._drag_range is not None:
+            dx = position.x() - self._drag_origin.x(); dy = position.y() - self._drag_origin.y()
+            rect = self._plot_rect(); view = self._drag_range
+            x_shift = -dx / rect.width() * (view[1] - view[0])
+            y_shift = dy / rect.height() * (view[3] - view[2])
+            self._view_range = (view[0] + x_shift, view[1] + x_shift, view[2] + y_shift, view[3] + y_shift)
+            self.auto_range_enabled = False; self.user_zoomed.emit()
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton and self._plot_rect().contains(_event_position(event)):
+            self._drag_origin = QtCore.QPointF(_event_position(event)); self._drag_range = self._effective_range()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_origin = None; self._drag_range = None
+
+    def leaveEvent(self, event):
+        self._cursor_pos = None; self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        self.auto_range()
+
+    def wheelEvent(self, event):
+        position = _event_position(event)
+        rect = self._plot_rect()
+        if not rect.contains(position):
+            return
+        factor = 0.85 if event.angleDelta().y() > 0 else 1.18
+        x_min, x_max, y_min, y_max = self._effective_range()
+        x_ratio = (position.x() - rect.left()) / rect.width()
+        y_ratio = (rect.bottom() - position.y()) / rect.height()
+        x_anchor = x_min + x_ratio * (x_max - x_min)
+        y_anchor = y_min + y_ratio * (y_max - y_min)
+        self._view_range = (
+            x_anchor + (x_min - x_anchor) * factor,
+            x_anchor + (x_max - x_anchor) * factor,
+            y_anchor + (y_min - y_anchor) * factor,
+            y_anchor + (y_max - y_anchor) * factor,
+        )
+        self.auto_range_enabled = False; self.user_zoomed.emit(); self.update()
 
 
-class HistoryPlotWidget(pg.GraphicsLayoutWidget):
-    """历史数据查看组件 — 支持多标签页"""
-
+class HistoryPlotWidget(SpectrumPlotWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setBackground('#fafbfc')
+        self._history_index = 0
 
-        self.plot = self.addPlot(row=0, col=0)
-        self.plot.setLabel('bottom', '像素序号', color='#555')
-        self.plot.setLabel('left', '强度', units='counts', color='#555')
-        self.plot.getAxis('left').enableAutoSIPrefix(False)
-        self.plot.showGrid(x=True, y=True, alpha=0.25)
-        self.plot.getAxis('bottom').setPen(pg.mkPen(color='#c8d6e5', width=1))
-        self.plot.getAxis('left').setPen(pg.mkPen(color='#c8d6e5', width=1))
-        self.plot.setMouseEnabled(x=True, y=True)
-        self.plot.scene().contextMenu = None
-
-        self.curves: List[pg.PlotDataItem] = []
-        self._curve_count = 0
-
-        # 悬停提示 (X, Y)
-        self._hover_marker = pg.ScatterPlotItem(
-            size=8, pen=pg.mkPen(color='#222', width=1),
-            brush=pg.mkBrush(255, 230, 0, 200))
-        self._hover_marker.setZValue(10)
-        self._hover_marker.hide()
-        self.plot.addItem(self._hover_marker)
-        self._hover_label = pg.TextItem(color='#111', anchor=(0, 1),
-                                        fill=pg.mkBrush(255, 255, 255, 220))
-        self._hover_label.setZValue(10)
-        self._hover_label.hide()
-        self.plot.addItem(self._hover_label)
-        self._mouse_move_proxy = pg.SignalProxy(
-            self.plot.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved)
-
-    def _hide_hover(self):
-        self._hover_marker.hide()
-        self._hover_label.hide()
-
-    def _on_mouse_moved(self, evt):
-        pos = evt[0] if isinstance(evt, (tuple, list)) else evt
-        if not self.plot.sceneBoundingRect().contains(pos):
-            self._hide_hover()
-            return
-
-        if not self.curves:
-            self._hide_hover()
-            return
-
-        vb = self.plot.getViewBox()
-        view_pos = vb.mapSceneToView(pos)
-        x = view_pos.x()
-
-        best = None
-        best_dist2 = None
-        for curve in self.curves:
-            xdata, ydata = curve.getData()
-            if xdata is None or ydata is None or len(xdata) == 0:
-                continue
-
-            if len(xdata) >= 2 and xdata[0] <= xdata[-1]:
-                idx = int(np.searchsorted(xdata, x))
-                candidates = []
-                if 0 <= idx < len(xdata):
-                    candidates.append(idx)
-                if idx - 1 >= 0:
-                    candidates.append(idx - 1)
-            else:
-                idx = int(np.argmin(np.abs(xdata - x)))
-                candidates = [idx]
-
-            for i in candidates:
-                px = float(xdata[i])
-                py = float(ydata[i])
-                pt_scene = vb.mapViewToScene(QPointF(px, py))
-                dx = pt_scene.x() - pos.x()
-                dy = pt_scene.y() - pos.y()
-                dist2 = dx * dx + dy * dy
-                if best_dist2 is None or dist2 < best_dist2:
-                    best_dist2 = dist2
-                    best = (px, py)
-
-        if best is None or best_dist2 is None or best_dist2 > 120:  # 约11px半径
-            self._hide_hover()
-            return
-
-        bx, by = best
-        self._hover_marker.setData([bx], [by])
-        self._hover_marker.show()
-        self._hover_label.setText(f'({bx:.4f}, {by:.4f})')
-        self._hover_label.setPos(bx, by)
-        self._hover_label.show()
-
-    def load_spectrum(self, wavelengths: np.ndarray, intensities: np.ndarray,
-                      label: str = '', color: Optional[Tuple[int, int, int]] = None):
-        """加载一条光谱数据"""
-        idx = self._curve_count
-        if idx >= 64:
-            return
-        if color is None:
-            color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
-        pen = pg.mkPen(color=color, width=1.5)
-        curve = self.plot.plot(pen=pen, name=label)
-        curve.setData(wavelengths, intensities)
-        self.curves.append(curve)
-        self._curve_count += 1
+    def load_spectrum(self, wavelengths, intensities, label="", color=None):
+        if self._history_index >= 64:
+            return False
+        key = self._history_index
+        self.update_device_curve(key, wavelengths, intensities, label or f"光谱 {key + 1}")
+        if color is not None:
+            self.set_device_color(key, color)
+        self._history_index += 1
+        return True
 
     def clear(self):
-        for curve in self.curves:
-            self.plot.removeItem(curve)
-        self.curves.clear()
-        self._curve_count = 0
+        self.clear_all(); self._history_index = 0

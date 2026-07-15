@@ -9,14 +9,16 @@ from datetime import datetime
 from typing import Optional, List
 import numpy as np
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from ..qt import QtCore, Signal
+
+QObject = QtCore.QObject
 
 
 class DataExporter(QObject):
     """数据导出器"""
 
-    export_complete = pyqtSignal(str)       # file_path
-    export_error = pyqtSignal(str)          # error_msg
+    export_complete = Signal(str)       # file_path
+    export_error = Signal(str)          # error_msg
 
     def __init__(self, device_manager):
         super().__init__()

@@ -1,44 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
+# 兼容原文件名；构建内容与 spectrometer.spec 保持一致。
 
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
-a = Analysis(
-    ['main.py'],
-    pathex=[],
-    binaries=[],
-    datas=[('C:\\Users\\admin\\Desktop\\光谱仪\\.venv\\Lib\\site-packages\\PyQt5\\Qt5\\bin\\Qt5SerialPort.dll', '.'), ('C:\\Users\\admin\\Desktop\\光谱仪\\.venv\\Lib\\site-packages\\PyQt5\\Qt5\\plugins\\platforms', 'platforms'), ('C:\\Users\\admin\\Desktop\\光谱仪\\.venv\\Lib\\site-packages\\PyQt5\\Qt5\\plugins\\styles', 'styles')],
-    hiddenimports=['PyQt5.QtSerialPort', 'PyQt5.QtWidgets', 'PyQt5.QtCore', 'PyQt5.QtGui', 'pyqtgraph', 'numpy.core._methods', 'numpy.lib.format', 'serial.tools.list_ports_windows'],
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=['tkinter', 'matplotlib', 'scipy', 'pandas', 'PyQt5.QtBluetooth', 'PyQt5.QtDBus', 'PyQt5.QtDesigner', 'PyQt5.QtHelp', 'PyQt5.QtLocation', 'PyQt5.QtMultimedia', 'PyQt5.QtMultimediaWidgets', 'PyQt5.QtNfc', 'PyQt5.QtPositioning', 'PyQt5.QtQml', 'PyQt5.QtQuick', 'PyQt5.QtQuickWidgets', 'PyQt5.QtRemoteObjects', 'PyQt5.QtSensors', 'PyQt5.QtSql', 'PyQt5.QtSvg', 'PyQt5.QtTest', 'PyQt5.QtTextToSpeech', 'PyQt5.QtWebChannel', 'PyQt5.QtWebSockets', 'PyQt5.QtWebView', 'PyQt5.QtWinExtras', 'PyQt5.QtXml', 'PyQt5.QtXmlPatterns', 'PyQt5.QtOpenGL', 'PyQt5.QtQuick3D', 'PyQt5.QtQuickControls2', 'PyQt5.QtQuickTemplates2'],
-    noarchive=False,
-    optimize=0,
-)
+root = Path(SPECPATH)
+datas = [(str(root / "spectrometer" / "ui" / "styles.qss"), "spectrometer/ui")]
+binaries = []
+hiddenimports = ["PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "PySide6.QtSerialPort", "numpy", "scipy", "xlsxwriter", "openpyxl"]
+for package in ("PySide6", "xlsxwriter", "openpyxl"):
+    package_datas, package_binaries, package_hidden = collect_all(package)
+    datas += package_datas; binaries += package_binaries; hiddenimports += package_hidden
+
+a = Analysis([str(root / "main.py")], pathex=[str(root)], binaries=binaries, datas=datas,
+             hiddenimports=hiddenimports, hookspath=[], hooksconfig={}, runtime_hooks=[],
+             excludes=["PyQt5", "tkinter", "matplotlib", "pandas"], noarchive=False, optimize=1)
 pyz = PYZ(a.pure)
-
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name='ZGCAI光谱仪控制软件',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='ZGCAI光谱仪控制软件',
-)
+exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="ZGCAI光谱仪控制软件",
+          debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
+          console=False, disable_windowed_traceback=False, target_arch="x86_64")
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="ZGCAI光谱仪控制软件")

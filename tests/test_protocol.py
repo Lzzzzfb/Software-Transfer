@@ -54,6 +54,22 @@ def test_parse_data_frame_uses_u32le_packet_number_and_u16be_pixels():
     }
 
 
+@pytest.mark.parametrize("pixel_count", [0, 1, 2048, 4096])
+def test_data_frame_pixel_boundaries(pixel_count):
+    pixels = tuple(index & 0xFFFF for index in range(pixel_count))
+    frame = make_data_frame(pixels=pixels)
+    parsed = parse_data_packet(frame, n_pixel=pixel_count)
+    assert len(frame) == 9 + pixel_count * 2
+    assert int.from_bytes(frame[1:3], "little") == 6 + pixel_count * 2
+    assert parsed["pixels"] == list(pixels)
+
+
+def test_trigger_mode_values_match_function_table():
+    from spectrometer.communication.protocol import TriggerMode
+
+    assert [mode.value for mode in TriggerMode] == [0, 1, 2]
+
+
 def test_data_checksum_is_consumed_but_not_validated():
     frame = make_data_frame(checksum=0xA5)
     cmd, params = parse_packet(frame)

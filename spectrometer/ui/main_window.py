@@ -1,795 +1,411 @@
-"""
-主窗口 — 光谱仪上位机控制软件核心界面。
-设备卡片式管理、实时可视化、数据存储。
-"""
+"""ZGCAI 光谱仪工作站主界面。"""
 
-import os
-import time
 from datetime import datetime
-from typing import Optional, Dict, List
+import math
+from pathlib import Path
+import shutil
+import time
+
 import numpy as np
 
-from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
-    QPushButton, QLabel, QComboBox, QCheckBox, QStatusBar,
-    QMessageBox, QToolBar, QAction, QMenuBar, QMenu, QFileDialog,
-    QDockWidget, QTabWidget, QGroupBox, QGridLayout, QLineEdit,
-    QDialog, QFormLayout, QDialogButtonBox, QTextEdit, QDoubleSpinBox, QSpinBox
-)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-
-from .device_panel import DeviceCardPanel
-from .plot_widget import SpectrumPlotWidget, COLOR_PALETTE
-from .settings_dialog import SettingsDialog, HistoryViewer
-from ..device.device_manager import DeviceManager
-from ..device.spectrometer import SpectrometerDevice
-from ..acquisition.engine import AcquisitionEngine, DataProcessor
-from ..storage.exporter import DataExporter
+from ..acquisition.coordinator import AcquisitionCoordinator
 from ..communication.serial_port import DeviceFinder
+from ..device.device_manager import DeviceManager
+from ..domain.enums import AcquisitionMode, ProcessingMode, StorageFormat, SyncMode
+from ..domain.models import AcquisitionSession, SpectrumFrame, SpectrumReference
+from ..processing.formula import FormulaError, validate_formula
+from ..processing.processor import ProcessingConfig, SpectrumProcessor
+from ..processing.references import ReferenceRepository
+from ..qt import QtCore, QtWidgets, dialog_exec
+from ..services.settings_service import SettingsService
+from ..storage.coordinator import BatchStorageCoordinator, StorageBackpressureError
+from ..storage.csv_exporter import export_device_csv
+from ..storage.recovery import scan_pending
+from ..storage.spool import read_spool
+from ..storage.xlsx_exporter import export_workbook
+from .device_sidebar import DeviceSidebar
+from .device_parameters import DeviceParametersDialog
+from .diagnostics import DiagnosticsPanel
+from .history_viewer import HistoryViewer
+from .plot_widget import SpectrumPlotWidget
+from .ribbon import MainRibbon
+from .settings_dialog import SettingsDialog
+from .status_panel import StatusPanel
 
 
-SENSOR_TYPE_NAMES = {
-    0: '未知',
-    1: 'CCD (线阵)',
-    2: 'CMOS (线阵)',
-    3: 'InGaAs (NIR)',
-    4: '背照式CCD',
-    5: 'NMOS',
-    6: 'PDA',
-}
-
-def sensor_type_name(n_type: int) -> str:
-    return SENSOR_TYPE_NAMES.get(n_type, f'类型代码 {n_type}')
-
-
-class MoreParamsDialog(QDialog):
-    """设备更多参数窗口 — 校准系数可编辑"""
-
-    def __init__(self, device, device_manager, parent=None):
-        super().__init__(parent)
-        self.device = device
-        self.dm = device_manager
-        self.setWindowTitle(f'设备 {device.device_id} 详细参数')
-        self.setMinimumSize(520, 580)
-        self._calib_spins = []  # 必须在 _make_calib_spin 之前初始化
-        layout = QFormLayout(self)
-
-        info = device.info
-        layout.addRow('端口:', QLabel(device.port_name))
-        layout.addRow('设备名称代号:', QLabel(str(info.name)))
-        layout.addRow('传感器类型:', QLabel(f'{sensor_type_name(info.dev_type)} (0x{info.dev_type:08X})'))
-        layout.addRow('硬件版本:', QLabel(f'{info.hw_ver:.2f}'))
-        layout.addRow('固件版本:', QLabel(f'{info.fw_ver:.2f}'))
-        layout.addRow('序列号:', QLabel(str(info.serial_num)))
-        layout.addRow('总像素数:', QLabel(str(info.pixel_count)))
-        layout.addRow('起始像素:', QLabel(str(info.start_pixel)))
-        layout.addRow('有效像素:', QLabel(str(info.valid_pixel)))
-        layout.addRow('曝光时间范围:', QLabel(f'{info.pos_time_min} - {info.pos_time_max} us'))
-        layout.addRow('产品序列号:', QLabel(info.prod_serial or '未写入'))
-        layout.addRow('', QLabel(''))
-        # ---- 校准系数 ----
-        layout.addRow('校准 C1 (0阶):', self._make_calib_spin(device.wavelength_calib.c1))
-        layout.addRow('校准 C2 (1阶):', self._make_calib_spin(device.wavelength_calib.c2))
-        layout.addRow('校准 C3 (2阶):', self._make_calib_spin(device.wavelength_calib.c3))
-        layout.addRow('校准 C4 (3阶):', self._make_calib_spin(device.wavelength_calib.c4))
-        self.btn_apply_calib = QPushButton('应用校准系数')
-        self.btn_apply_calib.clicked.connect(self._on_apply_calib)
-        layout.addRow(self.btn_apply_calib)
-        layout.addRow('', QLabel(''))
-
-        # ---- 触发模式 ----
-        self._combo_trig = QComboBox()
-        self._combo_trig.addItems(['软件触发', '软触发主机', '外部触发'])
-        self._combo_trig.setCurrentIndex(device.trigger_mode)
-        layout.addRow('触发模式:', self._combo_trig)
-        self.btn_apply_trig = QPushButton('应用触发模式')
-        self.btn_apply_trig.clicked.connect(self._on_apply_trig)
-        layout.addRow(self.btn_apply_trig)
-        layout.addRow('', QLabel(''))
-
-        # ---- 其他参数 ----
-        layout.addRow('增益 (0-63):', self._spin_value(device.gain, 0, 63))
-        layout.addRow('采集间隔(us):', self._spin_value(device.interval_us, 0, 99999999))
-        layout.addRow('触发延时(us):', self._spin_value(device.delay_us, 0, 99999999))
-        layout.addRow('积分时间(us):', self._spin_value(device.integration_time_us, 1, 99999999))
-        layout.addRow('平均次数:', self._spin_value(device.avg_count, 1, 10000))
-        self.btn_apply_params = QPushButton('应用其他参数')
-        self.btn_apply_params.clicked.connect(self._on_apply_params)
-        layout.addRow(self.btn_apply_params)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
-        buttons.accepted.connect(self.accept)
-        layout.addRow(buttons)
-
-    def _make_calib_spin(self, value: float) -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
-        spin.setDecimals(18)
-        spin.setRange(-9999.0, 9999.0)
-        spin.setValue(value)
-        spin.setMinimumWidth(160)
-        return spin
-
-    def _spin_value(self, value: int, vmin: int, vmax: int) -> QSpinBox:
-        spin = QSpinBox()
-        spin.setRange(vmin, vmax)
-        spin.setValue(value)
-        spin.setMinimumWidth(140)
-        return spin
-
-    def _on_apply_calib(self):
-        did = self.device.device_id
-        c1 = self._find_widget('校准 C1'); c2 = self._find_widget('校准 C2')
-        c3 = self._find_widget('校准 C3'); c4 = self._find_widget('校准 C4')
-        if all([c1, c2, c3, c4]):
-            self.dm.set_calib_coeff(did, c1.value(), c2.value(), c3.value(), c4.value())
-
-    def _on_apply_trig(self):
-        self.dm.set_trigger_mode(self.device.device_id, self._combo_trig.currentIndex())
-
-    def _on_apply_params(self):
-        did = self.device.device_id
-        w = lambda t: self._find_widget(t)
-        if w('增益'):       self.dm.set_gain(did, w('增益').value())
-        if w('采集间隔'):   self.dm.send_to_device(did, 0x22, self._pack('<I', w('采集间隔').value()))
-        if w('触发延时'):   self.dm.set_delay(did, w('触发延时').value())
-        if w('积分时间'):   self.dm.set_integration_time(did, w('积分时间').value())
-        if w('平均次数'):   self.dm.set_avg_count(did, w('平均次数').value())
-
-    def _find_widget(self, text: str):
-        lt = self.layout()
-        for i in range(lt.rowCount()):
-            item = lt.itemAt(i, QFormLayout.LabelRole)
-            if item and item.widget():
-                lbl = item.widget()
-                if hasattr(lbl, 'text') and text in lbl.text():
-                    field_item = lt.itemAt(i, QFormLayout.FieldRole)
-                    if field_item and field_item.widget():
-                        return field_item.widget()
-        return None
-
-    @staticmethod
-    def _pack(fmt: str, *args) -> bytes:
-        import struct
-        return struct.pack(fmt, *args)
-
-
-class MainWindow(QMainWindow):
-    """光谱仪上位机主窗口"""
-
-    def __init__(self):
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(
+        self,
+        simulation: bool = False,
+        *,
+        auto_start_simulation: bool = True,
+        settings_path=None,
+    ):
         super().__init__()
-        self.setWindowTitle('ZGCAI 光谱仪控制软件')
-        self.resize(1500, 900)
-        self.setMinimumSize(1200, 720)
+        self.simulation = simulation
+        self.setWindowTitle("ZGCAI 光谱仪采集与分析工作站")
+        self.resize(1480, 900); self.setMinimumSize(1100, 680)
 
-        # 核心组件
+        self.settings_service = SettingsService(settings_path)
+        self.settings = self.settings_service.load()
         self.device_manager = DeviceManager()
-        self.acq_engine = AcquisitionEngine(self.device_manager)
-        self.data_processor = DataProcessor(self.device_manager)
-        self.data_exporter = DataExporter(self.device_manager)
+        self.processor = SpectrumProcessor()
+        self.acquisition = AcquisitionCoordinator(self._store_frame, display_fps=30)
+        self.storage: BatchStorageCoordinator = None
+        self._latest_frames = {}
+        self._sim_x = {}; self._sim_sequence = {}; self._sim_phase = 0.0
+        self._sim_running = False
+        self._shown_since_status = 0; self._last_status_time = time.monotonic()
+        self._last_formula_error = ""
 
-        # 全局设置
-        self.settings = {
-            'storage_path': os.path.abspath('./data'),
-            'auto_save': False,
-            'save_mode': 'immediate',
-            'save_param': 10,
-            'merge_files': False,
-            'line_width': 1.0,
-            'auto_range': True,
-        }
+        self._build_ui(); self._connect_signals(); self._apply_settings()
+        self.reference_repository = ReferenceRepository(Path(self.settings["storage_path"]) / "references")
+        QtCore.QTimer.singleShot(0, self._report_pending_recovery)
 
-        # 显示模式
-        self.display_mode = 'raw'
-        self.custom_formula = ''
-        self.x_axis_mode = 'pixel'
+        self.plot_timer = QtCore.QTimer(self); self.plot_timer.timeout.connect(self._plot_tick); self.plot_timer.start(33)
+        self.status_timer = QtCore.QTimer(self); self.status_timer.timeout.connect(self._update_status); self.status_timer.start(1000)
 
-        # 历史查看器
-        self.history_viewer: Optional[HistoryViewer] = None
+        if simulation:
+            self._setup_simulation(auto_start_simulation)
+        else:
+            self.discovery_timer = QtCore.QTimer(self); self.discovery_timer.timeout.connect(self.scan_devices)
+            self.discovery_timer.start(3000); QtCore.QTimer.singleShot(0, self.scan_devices)
 
-        # 自动发现的端口缓存
-        self._known_ports: set = set()
-
-        # 设备验证超时定时器 (3秒内无版本响应则断开)
-        self._verify_timers: dict = {}
-
-        # 绘图节流: 每设备暂存最新一帧, 定时器 30fps 统一刷新
-        self._staging: dict = {}  # device_id -> (x, y)
-
-        self._plot_timer = QTimer(self)
-        self._plot_timer.timeout.connect(self._on_plot_tick)
-        self._plot_timer.start(33)  # ~30 fps
-
-        # 构建UI
-        self._setup_menu_bar()
-        self._setup_central_widget()
-        self._setup_status_bar()
-        self._connect_signals()
-
-        # 自动检测设备
-        self._auto_detect_timer = QTimer(self)
-        self._auto_detect_timer.timeout.connect(self._auto_detect_devices)
-        self._auto_detect_timer.start(1500)  # 每1.5秒检测新端口
-        self._auto_detect_devices()  # 立即执行一次
-
-    # ==================== UI构建 ====================
-
-    def _setup_menu_bar(self):
-        menu_bar = self.menuBar()
-
-        file_menu = menu_bar.addMenu('文件(&F)')
-        act_save = QAction('保存光谱数据...', self)
-        act_save.setShortcut('Ctrl+S')
-        act_save.triggered.connect(self._save_current_spectrum)
-        file_menu.addAction(act_save)
-
-        act_save_all = QAction('保存所有通道...', self)
-        act_save_all.triggered.connect(self._save_all_channels)
-        file_menu.addAction(act_save_all)
-
-        file_menu.addSeparator()
-        act_export_bg = QAction('导出背景光谱', self)
-        act_export_bg.triggered.connect(self._export_background)
-        file_menu.addAction(act_export_bg)
-        act_export_ref = QAction('导出参考光谱', self)
-        act_export_ref.triggered.connect(self._export_reference)
-        file_menu.addAction(act_export_ref)
-
-        file_menu.addSeparator()
-        act_exit = QAction('退出(&X)', self)
-        act_exit.setShortcut('Alt+F4')
-        act_exit.triggered.connect(self.close)
-        file_menu.addAction(act_exit)
-
-        view_menu = menu_bar.addMenu('视图(&V)')
-        act_history = QAction('历史数据查看器...', self)
-        act_history.triggered.connect(self._open_history_viewer)
-        view_menu.addAction(act_history)
-
-        settings_menu = menu_bar.addMenu('设置(&S)')
-        act_settings = QAction('系统设置...', self)
-        act_settings.triggered.connect(self._open_settings)
-        settings_menu.addAction(act_settings)
-
-        help_menu = menu_bar.addMenu('帮助(&H)')
-        act_about = QAction('关于...', self)
-        act_about.triggered.connect(self._show_about)
-        help_menu.addAction(act_about)
-
-    def _setup_central_widget(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(4, 4, 4, 4)
-
-        # 左侧: 设备卡片面板
-        self.device_panel = DeviceCardPanel()
-        main_layout.addWidget(self.device_panel)
-
-        # 右侧: 可视化 + 控制
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        # 绘图区
+    def _build_ui(self):
+        central = QtWidgets.QWidget(); self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(0)
+        self.ribbon = MainRibbon(); layout.addWidget(self.ribbon)
         self.plot_widget = SpectrumPlotWidget()
-        self.plot_widget.plot.getViewBox().sigRangeChangedManually.connect(
-            self._on_user_zoom)
+        self.context_bar = self._build_context_bar(); layout.addWidget(self.context_bar)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.sidebar = DeviceSidebar(); splitter.addWidget(self.sidebar)
+        self.tabs = QtWidgets.QTabWidget(); self.tabs.setObjectName("workspaceTabs")
+        self.tabs.addTab(self.plot_widget, "实时光谱")
+        self.history_viewer = HistoryViewer(); self.tabs.addTab(self.history_viewer, "历史数据")
+        self.diagnostics = DiagnosticsPanel(); self.tabs.addTab(self.diagnostics, "诊断")
+        splitter.addWidget(self.tabs); splitter.setStretchFactor(0, 0); splitter.setStretchFactor(1, 1)
+        splitter.setSizes([315, 1150]); layout.addWidget(splitter, 1)
+        self.status_panel = StatusPanel(); self.setStatusBar(self.status_panel)
 
-        # 模式/工具栏
-        mode_bar = self._setup_mode_bar()
-        right_layout.addLayout(mode_bar)
-
-        right_layout.addWidget(self.plot_widget, stretch=1)
-        main_layout.addWidget(right_widget, stretch=1)
-
-    def _setup_mode_bar(self) -> QHBoxLayout:
-        bar = QHBoxLayout()
-        bar.setSpacing(8)
-        _lbl = 'color: #5f6368; font-weight: bold; font-size: 12px;'
-
-        lbl_mode = QLabel('显示模式')
-        lbl_mode.setStyleSheet(_lbl)
-        bar.addWidget(lbl_mode)
-        self.combo_display_mode = QComboBox()
-        self.combo_display_mode.addItems(['原始光谱', '扣背景光谱', '吸收光谱', '自定义公式'])
-        self.combo_display_mode.currentIndexChanged.connect(self._on_display_mode_changed)
-        bar.addWidget(self.combo_display_mode)
-
-        self.edit_custom_formula = QLineEdit()
-        self.edit_custom_formula.setPlaceholderText('自定义公式 (例: log10(I0/I))')
-        self.edit_custom_formula.setVisible(False)
-        self.edit_custom_formula.textChanged.connect(self._on_custom_formula_changed)
-        bar.addWidget(self.edit_custom_formula)
-
-        lbl_x = QLabel('X轴')
-        lbl_x.setStyleSheet(_lbl)
-        bar.addWidget(lbl_x)
-        self.combo_x_axis = QComboBox()
-        self.combo_x_axis.addItems(['像素序号', '波长(nm)'])
-        self.combo_x_axis.currentIndexChanged.connect(self._on_x_axis_changed)
-        bar.addWidget(self.combo_x_axis)
-
-        self.btn_save_data = QPushButton('保存光谱数据')
-        self.btn_save_data.clicked.connect(self._save_current_spectrum)
-        bar.addWidget(self.btn_save_data)
-
-        self.btn_save_image = QPushButton('保存光谱图片')
-        self.btn_save_image.clicked.connect(self._save_plot_image)
-        bar.addWidget(self.btn_save_image)
-
-        bar.addStretch()
-
-        self.btn_rect_zoom = QPushButton('框选缩放')
-        self.btn_rect_zoom.setCheckable(True)
-        self.btn_rect_zoom.setChecked(False)
-        self.btn_rect_zoom.toggled.connect(self._on_rect_zoom_toggled)
-        bar.addWidget(self.btn_rect_zoom)
-
-        self.chk_auto_range = QCheckBox('自动缩放')
-        self.chk_auto_range.setChecked(True)
-        self.chk_auto_range.toggled.connect(
-            lambda v: self.plot_widget.plot.enableAutoRange() if v else None)
-        bar.addWidget(self.chk_auto_range)
-
-        self.btn_clear_ref = QPushButton('清除对比')
-        self.btn_clear_ref.clicked.connect(self.plot_widget.clear_reference_curves)
-        bar.addWidget(self.btn_clear_ref)
-
-        # ---- 基线校正 (airPLS) ----
-        bar.addSpacing(8)
-        lbl_bl = QLabel('基线校正')
-        lbl_bl.setStyleSheet(_lbl)
-        bar.addWidget(lbl_bl)
-
-        self.chk_baseline = QCheckBox('启用')
-        self.chk_baseline.setToolTip('自适应迭代重加权惩罚最小二乘基线校正')
-        self.chk_baseline.toggled.connect(self._on_baseline_toggled)
-        bar.addWidget(self.chk_baseline)
-
-        self.combo_bl_lam = QComboBox()
-        self.combo_bl_lam.addItems(['1e3', '1e4', '1e5', '1e6', '1e7', '1e8'])
-        self.combo_bl_lam.setCurrentIndex(2)  # 默认 1e5
-        self.combo_bl_lam.setToolTip('平滑度参数 λ (越大基线越平滑)')
-        self.combo_bl_lam.currentIndexChanged.connect(self._on_baseline_param_changed)
-        bar.addWidget(self.combo_bl_lam)
-
-        self.spin_bl_order = QSpinBox()
-        self.spin_bl_order.setRange(1, 3)
-        self.spin_bl_order.setValue(2)
-        self.spin_bl_order.setToolTip('差分阶数 (1=线性, 2=曲率惩罚)')
-        self.spin_bl_order.valueChanged.connect(self._on_baseline_param_changed)
-        bar.addWidget(self.spin_bl_order)
-
-        self.chk_show_bl = QCheckBox('显示基线')
-        self.chk_show_bl.setToolTip('在图上叠加显示估计的基线')
-        self.chk_show_bl.setEnabled(False)
-        self.chk_show_bl.toggled.connect(self._on_show_baseline_toggled)
-        bar.addWidget(self.chk_show_bl)
-
-        self.lbl_frame_rate = QLabel('帧率: -- fps')
-        self.lbl_frame_rate.setStyleSheet(
-            'color: #1a73e8; font-weight: bold; font-size: 13px; '
-            'background: #e8f0fe; padding: 4px 12px; border-radius: 4px;')
-        bar.addWidget(self.lbl_frame_rate)
-
-        self._frame_count = 0
-        self._last_fps_time = time.time()
-
+    def _build_context_bar(self):
+        bar = QtWidgets.QWidget(); bar.setObjectName("contextBar")
+        layout = QtWidgets.QHBoxLayout(bar); layout.setContentsMargins(12, 5, 12, 5)
+        open_button = QtWidgets.QPushButton("打开历史"); open_button.clicked.connect(self.history_viewer_open); layout.addWidget(open_button)
+        recover_button = QtWidgets.QPushButton("恢复缓存"); recover_button.clicked.connect(self.recover_spool); layout.addWidget(recover_button)
+        save_image = QtWidgets.QPushButton("保存图片"); save_image.clicked.connect(self.save_plot_image); layout.addWidget(save_image)
+        layout.addSpacing(16); layout.addWidget(QtWidgets.QLabel("处理"))
+        self.display_mode = QtWidgets.QComboBox()
+        for label, value in [("原始强度", "raw"), ("扣背景", "dark_subtract"), ("吸光度", "absorbance"), ("自定义公式", "custom")]:
+            self.display_mode.addItem(label, value)
+        self.display_mode.currentIndexChanged.connect(self._display_mode_changed); layout.addWidget(self.display_mode)
+        self.formula_edit = QtWidgets.QLineEdit(); self.formula_edit.setPlaceholderText("例：-log10((I-Idark)/(I0-Idark))")
+        self.formula_edit.setMinimumWidth(280); self.formula_edit.setVisible(False); self.formula_edit.editingFinished.connect(self._validate_formula)
+        layout.addWidget(self.formula_edit, 1)
+        layout.addWidget(QtWidgets.QLabel("X 轴")); self.x_axis = QtWidgets.QComboBox()
+        self.x_axis.addItem("像素序号", "pixel"); self.x_axis.addItem("波长 (nm)", "wavelength"); layout.addWidget(self.x_axis)
+        self.auto_range = QtWidgets.QCheckBox("自动缩放"); self.auto_range.setChecked(True)
+        self.auto_range.toggled.connect(self.plot_widget.enable_auto_range); layout.addWidget(self.auto_range)
+        clear = QtWidgets.QPushButton("清除对比"); clear.clicked.connect(self.plot_widget.clear_reference_curves); layout.addWidget(clear)
         return bar
 
-    def _setup_status_bar(self):
-        self.status_bar = QStatusBar()
-        self.setStatusBar(self.status_bar)
-        self.lbl_connection = QLabel('设备: 自动检测中...')
-        self.status_bar.addPermanentWidget(self.lbl_connection)
-
-    # ==================== 信号连接 ====================
-
     def _connect_signals(self):
-        # 卡片面板 → MainWindow
-        self.device_panel.bg_requested.connect(self._on_bg_for_device)
-        self.device_panel.ref_requested.connect(self._on_ref_for_device)
-        self.device_panel.acq_start_requested.connect(self._on_acq_start_for_device)
-        self.device_panel.acq_stop_requested.connect(self._on_acq_stop_for_device)
-        self.device_panel.integ_time_requested.connect(self._on_set_integ_for_device)
-        self.device_panel.avg_count_requested.connect(self._on_set_avg_for_device)
-        self.device_panel.enable_toggled.connect(self._on_device_enable_toggled)
-        self.device_panel.more_params_requested.connect(self._on_more_params_for_device)
-        self.device_panel.close_requested.connect(self._on_close_device)
+        self.ribbon.start_requested.connect(self.start_acquisition)
+        self.ribbon.stop_requested.connect(self.stop_acquisition)
+        self.ribbon.background_requested.connect(self.capture_background)
+        self.ribbon.reference_requested.connect(self.capture_reference)
+        self.ribbon.sync_mode_changed.connect(self._sync_mode_changed)
+        self.ribbon.discover_requested.connect(self.scan_devices)
+        self.ribbon.new_history_requested.connect(lambda: self.history_viewer.new_page())
+        self.ribbon.settings_requested.connect(self.open_settings)
+        self.ribbon.help_requested.connect(self.show_help)
+        self.ribbon.exit_requested.connect(self.close)
+        self.sidebar.integration_changed.connect(self.device_manager.set_integration_time)
+        self.sidebar.enabled_changed.connect(self._device_enabled_changed)
+        self.sidebar.parameters_requested.connect(self.open_device_parameters)
+        self.sidebar.connect_requested.connect(self.device_manager.add_and_connect)
+        self.sidebar.disconnect_requested.connect(self.device_manager.remove_device)
+        self.sidebar.refresh_button.clicked.connect(self.scan_devices)
+        self.device_manager.device_added.connect(self._device_changed)
+        self.device_manager.device_connected.connect(self._device_connected)
+        self.device_manager.device_updated.connect(self._device_changed)
+        self.device_manager.device_removed.connect(self._device_removed)
+        self.device_manager.frame_arrived.connect(self._frame_arrived)
+        self.device_manager.error_occurred.connect(lambda did, msg: self._log(f"设备 {did}: {msg}", "ERROR"))
+        self.device_manager.device_connect_failed.connect(lambda did, msg: self._log(f"设备 {did} 连接失败: {msg}", "WARN"))
+        self.device_manager.diagnostic_event.connect(self._log)
 
-        # 总控按钮 (所有设备)
-        self.device_panel.master_start_requested.connect(self._on_master_start)
-        self.device_panel.master_stop_requested.connect(self._on_master_stop)
+    def _apply_settings(self):
+        self.sidebar.batch_size.setValue(self.settings["batch_size"])
+        index = self.sidebar.storage_format.findData(self.settings["storage_format"])
+        self.sidebar.storage_format.setCurrentIndex(max(0, index))
+        self.sidebar.auto_store.setChecked(bool(self.settings["auto_store"]))
+        self.plot_widget.set_line_width(self.settings["line_width"])
+        index = self.display_mode.findData(self.settings["display_mode"]); self.display_mode.setCurrentIndex(max(0, index))
+        index = self.x_axis.findData(self.settings["x_axis"]); self.x_axis.setCurrentIndex(max(0, index))
 
-        # 设备管理器 → MainWindow
-        self.device_manager.device_removed.connect(self._on_device_removed)
-        self.device_manager.device_updated.connect(self._on_device_updated)
-        self.device_manager.device_connected.connect(self._on_device_connected)
-        self.device_manager.device_connect_failed.connect(self._on_device_connect_failed)
-        self.device_manager.calib_ready.connect(self._on_calib_ready)
-        self.device_manager.data_arrived.connect(self._on_data_arrived)
-        self.device_manager.error_occurred.connect(self._on_device_error)
-
-        # 采集引擎 → MainWindow
-        self.acq_engine.device_acq_started.connect(self._on_device_acq_started)
-        self.acq_engine.device_acq_stopped.connect(self._on_device_acq_stopped)
-        self.acq_engine.frame_collected.connect(self._on_frame_collected)
-
-    # ==================== 自动检测设备 ====================
-
-    def _auto_detect_devices(self):
-        """扫描全部 COM 口尝试连接光谱仪"""
+    def scan_devices(self):
+        if self.simulation: return
         ports = DeviceFinder.list_available_ports()
-        for p in ports:
-            port_name = p['port_name']
-            if port_name in self._known_ports:
-                continue
-            self._known_ports.add(port_name)
-            # 全部尝试连接（非阻塞：线程中打开）
-            self.device_manager.add_and_connect(port_name, 115200)
+        self.sidebar.set_available_ports([port["port_name"] for port in ports])
+        existing = {device.port_name for device in self.device_manager.devices.values()}
+        for port in ports:
+            if port["port_name"] not in existing and DeviceFinder.is_likely_spectrometer(port):
+                self.device_manager.add_and_connect(port["port_name"], 115200)
+        self.status_panel.state_label.setText("设备扫描完成")
 
-    # ==================== 设备连接 ====================
-
-    def _on_device_connected(self, device_id: int):
+    def _device_changed(self, device_id):
         device = self.device_manager.get_device(device_id)
-        if not device:
+        if device: self.sidebar.add_or_update_device(device)
+
+    def _device_connected(self, device_id):
+        self._device_changed(device_id)
+        device = self.device_manager.get_device(device_id)
+        if not device or device.port_name.startswith("SIM"):
             return
-        if device_id not in self.device_panel.cards:
-            self.device_panel.add_card(device_id, device)
-        self.status_bar.showMessage(f'{device.port_name} 已连接 (设备{device_id})', 3000)
         self.device_manager.init_device(device_id)
-        did = device_id
-        QTimer.singleShot(200, lambda: self.device_manager.query_version(did))
-        QTimer.singleShot(500, lambda: self.device_manager.query_calibration(did))
-        QTimer.singleShot(800, lambda: self.device_manager.query_serial_number(did))
+        QtCore.QTimer.singleShot(150, lambda: self.device_manager.query_version(device_id))
+        QtCore.QTimer.singleShot(300, lambda: self.device_manager.query_calibration(device_id))
+        QtCore.QTimer.singleShot(450, lambda: self.device_manager.query_serial_number(device_id))
+        query_commands = [0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x38, 0x39, 0x3A, 0x3B]
+        for index, command in enumerate(query_commands):
+            QtCore.QTimer.singleShot(
+                600 + index * 80,
+                lambda value=command: self.device_manager.send_to_device(device_id, value),
+            )
 
-        # 3秒验证超时: 收不到版本响应则断开(不是光谱仪)
-        self._cancel_verify_timer(device_id)
-        t = QTimer(self)
-        t.setSingleShot(True)
-        t.timeout.connect(lambda: self._on_verify_timeout(did))
-        t.start(3000)
-        self._verify_timers[device_id] = t
+    def _device_removed(self, device_id):
+        self.sidebar.remove_device(device_id); self.plot_widget.remove_device_curve(device_id)
 
-    def _cancel_verify_timer(self, device_id: int):
-        t = self._verify_timers.pop(device_id, None)
-        if t:
-            t.stop()
-
-    def _on_verify_timeout(self, device_id: int):
-        """版本查询超时 — 不是光谱仪，断开连接"""
+    def _device_enabled_changed(self, device_id, enabled):
         device = self.device_manager.get_device(device_id)
-        if device and not device.initialized:
-            self.status_bar.showMessage(f'{device.port_name} 无响应, 已断开', 3000)
-            self.device_manager.remove_device(device_id)
+        if device: device.enabled = enabled
 
-    def _on_device_connect_failed(self, device_id: int, error_msg: str):
-        device = self.device_manager.get_device(device_id)
-        port = device.port_name if device else f'设备{device_id}'
-        # 静默失败（自动检测时很多端口不是光谱仪）
-        self.device_manager.remove_device(device_id)
+    def _sync_mode_changed(self, mode):
+        hard = mode in ("hard_internal", "hard_external")
+        self.device_manager.global_sync_enabled = mode != "independent"
+        self.device_manager.sync_mode = "hard" if hard else "soft"
+        if mode == "hard_internal":
+            self.device_manager.master_device_id = self.sidebar.selected_device_id
+        elif mode == "hard_external":
+            self.device_manager.master_device_id = None
+        self._log(f"同步模式：{self.ribbon.sync_combo.currentText()}")
 
-    def _on_device_removed(self, device_id: int):
-        self.device_panel.remove_card(device_id)
-        self._known_ports.discard(
-            self.device_manager.get_device(device_id).port_name
-            if self.device_manager.get_device(device_id) else '')
-        if device_id in self.plot_widget.device_curves:
-            curve = self.plot_widget.device_curves[device_id]
-            name = curve.opts.get('name', '')
-            if name:
-                self.plot_widget.legend.removeItem(name)
-            self.plot_widget.plot.removeItem(curve)
-            del self.plot_widget.device_curves[device_id]
+    def start_acquisition(self):
+        devices = [device for device in self.device_manager.get_connected_devices() if device.enabled]
+        if not devices:
+            self.status_panel.state_label.setText("没有可采集设备"); self._log("没有可采集设备", "WARN"); return
+        if self.sidebar.auto_store.isChecked() and self.storage is None:
+            try: self._start_storage(devices)
+            except Exception as exc: self._log(f"无法启动批量存储: {exc}", "ERROR"); return
+        continuous = self.sidebar.acquisition_mode.currentIndex() == 0
+        self.device_manager.start_sync_acquisition(continuous)
+        self._sim_running = self.simulation
+        self.status_panel.state_label.setText("连续采集中" if continuous else "单次采集中")
+        self._log(f"开始{'连续' if continuous else '单次'}采集，共 {len(devices)} 台设备")
 
-    def _on_device_updated(self, device_id: int):
-        device = self.device_manager.get_device(device_id)
-        if device:
-            self.device_panel.update_card(device_id, device)
-            # 设备已初始化(收到版本信息) → 取消验证超时
-            if device.initialized:
-                self._cancel_verify_timer(device_id)
+    def stop_acquisition(self):
+        self._sim_running = False; self.device_manager.stop_all()
+        self.status_panel.state_label.setText("正在排空存储队列…")
+        self._close_storage(); self.status_panel.state_label.setText("已停止")
+        self._log("采集停止，存储队列已排空")
 
-    def _on_close_device(self, device_id: int):
-        if self.acq_engine.is_device_running(device_id):
-            self.acq_engine.stop_device(device_id)
-        self.device_manager.remove_device(device_id)
+    def _start_storage(self, devices):
+        sync_value = self.ribbon.sync_combo.currentData()
+        session = AcquisitionSession.create(
+            [device.device_id for device in devices],
+            mode=(AcquisitionMode.CONTINUOUS if self.sidebar.acquisition_mode.currentIndex() == 0 else AcquisitionMode.SINGLE),
+            sync_mode=SyncMode(sync_value),
+            storage_format=StorageFormat(self.sidebar.storage_format.currentData()),
+            batch_size=self.sidebar.batch_size.value(),
+        )
+        wavelengths = {device.device_id: tuple(device.get_wavelength_array(device.info.valid_pixel or device.info.pixel_count or 4096)) for device in devices}
+        labels = {device.device_id: (device.info.prod_serial or device.port_name or f"设备_{device.device_id}") for device in devices}
+        metadata = {device.device_id: {"Port": device.port_name, "Serial": device.info.prod_serial, "Integration Time (us)": device.integration_time_us, "Trigger Mode": device.trigger_mode} for device in devices}
+        self.storage = BatchStorageCoordinator(
+            self.settings["storage_path"], session, wavelengths_by_device=wavelengths,
+            device_labels=labels, device_metadata=metadata,
+            warning_callback=lambda message: self._log(message, "WARN"),
+            controlled_stop_callback=self._storage_stop_requested,
+        )
+        self.storage.start(); self._log(f"批量存储已启动：{session.batch_size} 帧/批，{session.storage_format.value}")
 
-    def _on_master_start(self, continuous: bool):
-        """总控按钮 — 启动所有已启用设备"""
-        enabled_ids = [did for did, dev in self.device_manager.devices.items()
-                       if dev.enabled and dev.connected]
-        if enabled_ids:
-            self.acq_engine.start(continuous=continuous, device_ids=enabled_ids)
+    def _store_frame(self, frame):
+        if self.storage:
+            self.storage.submit(frame)
 
-    def _on_master_stop(self):
-        """总控按钮 — 停止所有设备"""
-        self.acq_engine.stop()
+    def _storage_stop_requested(self, message):
+        self._log(message, "ERROR"); QtCore.QTimer.singleShot(0, self.stop_acquisition)
 
-    # ==================== 卡片按钮操作 ====================
+    def _close_storage(self):
+        storage, self.storage = self.storage, None
+        if storage:
+            storage.close()
+            for error in storage.errors: self._log(f"存储错误: {error}", "ERROR")
+            if storage.exported_files: self._log(f"已生成 {len(storage.exported_files)} 个批量文件")
 
-    def _on_bg_for_device(self, device_id: int):
-        device = self.device_manager.get_device(device_id)
-        if device and device.latest_pixels is not None:
-            self.data_processor.store_background(device_id)
-            self.data_exporter.export_background(device)
-            self.status_bar.showMessage(f'设备{device_id} 背景光谱已存储', 2000)
+    def _frame_arrived(self, frame):
+        self._latest_frames[frame.device_id] = frame
+        try:
+            observation = self.acquisition.ingest(frame)
+            if observation.missing: self._log(f"设备 {frame.device_id} 检测到缺少 {observation.missing} 帧", "WARN")
+        except StorageBackpressureError as exc:
+            self._log(str(exc), "ERROR"); self.stop_acquisition()
+        except Exception as exc:
+            self._log(f"采集帧处理错误: {exc}", "ERROR")
 
-    def _on_ref_for_device(self, device_id: int):
-        device = self.device_manager.get_device(device_id)
-        if device and device.latest_pixels is not None:
-            self.data_processor.store_reference(device_id)
-            self.data_exporter.export_reference(device)
-            self.status_bar.showMessage(f'设备{device_id} 参考光谱已存储', 2000)
-
-    def _on_acq_start_for_device(self, device_id: int, continuous: bool):
-        if not self.device_panel.get_card(device_id):
-            return
-        card = self.device_panel.get_card(device_id)
-        if not card or not card.is_enabled():
-            return
-        self.acq_engine.start_device(device_id, continuous)
-
-    def _on_acq_stop_for_device(self, device_id: int):
-        self.acq_engine.stop_device(device_id)
-
-    def _on_set_integ_for_device(self, device_id: int, time_us: int):
-        self.device_manager.set_integration_time(device_id, time_us)
-
-    def _on_set_avg_for_device(self, device_id: int, count: int):
-        self.device_manager.set_avg_count(device_id, count)
-
-    def _on_device_enable_toggled(self, device_id: int, enabled: bool):
-        device = self.device_manager.get_device(device_id)
-        if device:
-            device.enabled = enabled
-        # 禁用时停止采集
-        if not enabled and self.acq_engine.is_device_running(device_id):
-            self.acq_engine.stop_device(device_id)
-
-    def _on_more_params_for_device(self, device_id: int):
-        device = self.device_manager.get_device(device_id)
-        if device:
-            dlg = MoreParamsDialog(device, self.device_manager, self)
-            dlg.exec_()
-
-    # ==================== 采集状态 ====================
-
-    def _on_device_acq_started(self, device_id: int):
-        self.device_panel.set_card_acquiring(device_id, True)
-        self.device_panel.set_master_acquiring(True)
-
-    def _on_device_acq_stopped(self, device_id: int):
-        self.device_panel.set_card_acquiring(device_id, False)
-        if not self.acq_engine.is_running():
-            self.device_panel.set_master_acquiring(False)
-
-    def _on_frame_collected(self, device_id: int, frame_count: int):
-        self._frame_count += 1
-        now = time.time()
-        elapsed = now - self._last_fps_time
-        if elapsed >= 0.5:
-            fps = self._frame_count / elapsed
-            self.lbl_frame_rate.setText(f'帧率: {fps:.1f} fps')
-            self._frame_count = 0
-            self._last_fps_time = now
-
-    # ==================== 数据显示 ====================
-
-    def _get_x_axis_data(self, device) -> np.ndarray:
-        if self.x_axis_mode == 'wavelength' and device.latest_wavelengths is not None:
-            return device.latest_wavelengths.copy()
-        if device.latest_pixels is not None:
-            return np.arange(len(device.latest_pixels), dtype=np.float64)
-        return np.array([])
-
-    def _on_data_arrived(self, device_id: int, pixel_indices: np.ndarray,
-                         pixels: np.ndarray):
-        """收到数据 — 暂存, 由 _on_plot_tick 批量绘图 (一次 autoRange)"""
-        device = self.device_manager.get_device(device_id)
-        if not device or not device.enabled:
-            return
-        mode_map = {'原始光谱': 'raw', '扣背景光谱': 'dark_subtract',
-                    '吸收光谱': 'absorbance', '自定义公式': 'custom'}
-        mode_str = mode_map.get(self.combo_display_mode.currentText(), 'raw')
-        result = device.get_display_spectrum(mode_str, self.custom_formula)
-        if result is not None:
-            _, y = result
-            x = self._get_x_axis_data(device)
-            self._staging[device_id] = (x, y)
-
-    def _on_plot_tick(self):
-        """30fps 批量绘图 — 所有暂存设备一次 setData + 一次 autoRange"""
-        if not self._staging:
-            return
-        staging = dict(self._staging)
-        self._staging.clear()
-        auto = self.chk_auto_range.isChecked()
-        for did, (x, y) in staging.items():
-            dev = self.device_manager.get_device(did)
-            if not dev:
+    def _plot_tick(self):
+        frames = self.acquisition.take_display_frames()
+        for device_id, frame in frames.items():
+            device = self.device_manager.get_device(device_id)
+            if not device: continue
+            wavelengths = device.get_wavelength_array(frame.pixel_count)
+            mode = ProcessingMode(self.display_mode.currentData())
+            config = ProcessingConfig(mode=mode, custom_formula=self.formula_edit.text().strip())
+            try:
+                processed = self.processor.process(
+                    wavelengths, frame.pixels, config,
+                    intensity_calibration=device.intensity_calib,
+                    background=device.background_spectrum,
+                    reference=device.reference_spectrum,
+                )
+            except (FormulaError, ValueError) as exc:
+                message = str(exc)
+                if message != self._last_formula_error:
+                    self._last_formula_error = message; self._log(f"处理未应用: {message}", "WARN")
                 continue
-            sn = dev.info.prod_serial or f'SN{dev.info.serial_num}' if dev.info.serial_num else f'Ch{did}'
-            self.plot_widget.update_device_curve(did, x, y, sn)
-        self._update_baseline_curves()
-        if auto:
-            self.plot_widget.plot.enableAutoRange()
+            x = np.arange(frame.pixel_count) if self.x_axis.currentData() == "pixel" else processed.wavelengths
+            label = device.info.prod_serial or device.port_name or f"设备 {device_id}"
+            self.plot_widget.update_device_curve(device_id, x, processed.values, label)
+            self._shown_since_status += 1
+            self.diagnostics.update_device(device_id, self.acquisition.diagnostics(device_id))
+        self.plot_widget.set_axis_labels("像素序号" if self.x_axis.currentData() == "pixel" else "波长 (nm)", "吸光度" if self.display_mode.currentData() == "absorbance" else "强度 (counts)")
 
-    def _on_x_axis_changed(self, idx: int):
-        self.x_axis_mode = 'wavelength' if idx == 1 else 'pixel'
-        label = '波长' if idx == 1 else '像素序号'
-        self.plot_widget.plot.setLabel('bottom', label, units='nm' if idx == 1 else '')
-        self._refresh_all_curves()
+    def capture_background(self): self._capture_reference_kind("background")
+    def capture_reference(self): self._capture_reference_kind("reference")
 
-    def _on_rect_zoom_toggled(self, checked: bool):
-        self.plot_widget.set_rect_zoom_mode(checked)
-        if checked:
-            self.btn_rect_zoom.setText('框选缩放 (开)')
-        else:
-            self.btn_rect_zoom.setText('框选缩放')
+    def _capture_reference_kind(self, kind):
+        device_id = self.sidebar.selected_device_id; frame = self._latest_frames.get(device_id)
+        device = self.device_manager.get_device(device_id) if device_id is not None else None
+        if not device or not frame: self._log("所选设备尚无可用光谱", "WARN"); return
+        values = np.asarray(frame.pixels, dtype=np.float64)
+        if kind == "background": device.background_spectrum = values.copy()
+        else: device.reference_spectrum = values.copy()
+        serial = device.info.prod_serial or f"PORT-{device.port_name}"
+        reference = SpectrumReference.create(serial, kind, values)
+        self.reference_repository.save(reference)
+        self._log(f"设备 {device_id} 的{'背景' if kind == 'background' else '参考'}光谱已记录")
 
-    def _on_user_zoom(self, *args):
-        if self.chk_auto_range.isChecked():
-            self.chk_auto_range.setChecked(False)
+    def _display_mode_changed(self):
+        self.formula_edit.setVisible(self.display_mode.currentData() == "custom")
+        self._last_formula_error = ""
 
-    def _on_display_mode_changed(self, idx: int):
-        self.edit_custom_formula.setVisible(idx == 3)
-        mode_map = {0: 'raw', 1: 'dark_subtract', 2: 'absorbance', 3: 'custom'}
-        self.display_mode = mode_map.get(idx, 'raw')
-        self._refresh_all_curves()
+    def _validate_formula(self):
+        if self.display_mode.currentData() != "custom": return
+        try:
+            validate_formula(self.formula_edit.text()); self.status_panel.state_label.setText("公式有效")
+        except FormulaError as exc:
+            self.status_panel.state_label.setText(f"公式错误: {exc}"); self._log(f"公式错误: {exc}", "WARN")
 
-    def _on_custom_formula_changed(self, text: str):
-        self.custom_formula = text
-        if self.display_mode == 'custom':
-            self._refresh_all_curves()
+    def open_settings(self):
+        dialog = SettingsDialog(self.settings, self)
+        if dialog_exec(dialog):
+            self.settings.update(dialog.values()); self.plot_widget.set_line_width(self.settings["line_width"])
+            self.reference_repository = ReferenceRepository(Path(self.settings["storage_path"]) / "references")
+            self.settings_service.save(self.settings); self._log("设置已保存")
 
-    # ==================== 基线校正 ====================
+    def open_device_parameters(self, device_id):
+        device = self.device_manager.get_device(device_id)
+        if device:
+            dialog_exec(DeviceParametersDialog(device, self.device_manager, self))
 
-    def _on_baseline_toggled(self, enabled: bool):
-        """启用/禁用 airPLS 基线校正"""
-        for dev in self.device_manager.devices.values():
-            dev.baseline_enabled = enabled
-        self.chk_show_bl.setEnabled(enabled)
-        if not enabled:
-            self.chk_show_bl.setChecked(False)
-        self._refresh_all_curves()
+    def _report_pending_recovery(self):
+        pending = scan_pending(self.settings["storage_path"])
+        for path, recovery in pending.items():
+            detail = f"发现未完成缓存 {path.name}：{len(recovery.frames)} 个完整帧"
+            if recovery.issues:
+                detail += f"，{recovery.issues[0].message}"
+            self._log(detail, "WARN")
 
-    def _on_baseline_param_changed(self):
-        """更新基线校正参数 (lambda, order)"""
-        lam_str = self.combo_bl_lam.currentText()
-        lam = float(lam_str)
-        order = self.spin_bl_order.value()
-        for dev in self.device_manager.devices.values():
-            dev.baseline_lam = lam
-            dev.baseline_order = order
-        self._refresh_all_curves()
-
-    def _on_show_baseline_toggled(self, show: bool):
-        """切换基线叠加显示"""
-        if not show:
-            self.plot_widget.clear_reference_curves()
-        self._refresh_all_curves()
-
-    def _refresh_all_curves(self):
-        """用户触发刷新(模式/轴切换) — 直接绘图, 不走节流"""
-        for device_id, device in self.device_manager.devices.items():
-            if device.latest_pixels is not None:
-                x = self._get_x_axis_data(device)
-                mode_map = {'原始光谱': 'raw', '扣背景光谱': 'dark_subtract',
-                            '吸收光谱': 'absorbance', '自定义公式': 'custom'}
-                mode_str = mode_map.get(self.combo_display_mode.currentText(), 'raw')
-                result = device.get_display_spectrum(mode_str, self.custom_formula)
-                if result is not None:
-                    _, y = result
-                    sn = device.info.prod_serial or f'SN{device.info.serial_num}' if device.info.serial_num else f'Ch{device_id}'
-                    self.plot_widget.update_device_curve(device_id, x, y, sn)
-        self._update_baseline_curves()
-        if self.chk_auto_range.isChecked():
-            self.plot_widget.plot.enableAutoRange()
-
-    def _update_baseline_curves(self):
-        """更新基线叠加显示曲线"""
-        self.plot_widget.clear_reference_curves()
-        if not self.chk_show_bl.isChecked():
-            return
-        for device_id, device in self.device_manager.devices.items():
-            if device.baseline_enabled and device.baseline_y is not None:
-                x = self._get_x_axis_data(device)
-                # 基线颜色 = 设备颜色, 虚线
-                color = COLOR_PALETTE[device_id % len(COLOR_PALETTE)]
-                sn = device.info.prod_serial or f'Ch{device_id}'
-                self.plot_widget.add_reference_curve(x, device.baseline_y,
-                                                     f'基线-{sn}', color)
-
-    def _on_calib_ready(self, device_id: int, c1, c2, c3, c4):
-        self._refresh_all_curves()
-
-    def _on_device_error(self, device_id: int, error_msg: str):
-        self.status_bar.showMessage(f'[设备{device_id}] {error_msg}', 5000)
-
-    # ==================== 存储 ====================
-
-    def _save_current_spectrum(self):
-        frames_by_device = {}
-        for did, wl, px, ts in self.acq_engine.buffer:
-            if did not in frames_by_device:
-                frames_by_device[did] = ([], [])
-            frames_by_device[did][0].append(wl)
-            frames_by_device[did][1].append(px)
-
-        if not frames_by_device:
-            for did, dev in self.device_manager.devices.items():
-                if dev.latest_pixels is not None and dev.latest_wavelengths is not None:
-                    frames_by_device[did] = ([dev.latest_wavelengths], [dev.latest_pixels])
-
-        if not frames_by_device:
-            QMessageBox.information(self, '提示', '无数据可保存')
-            return
-
-        saved = self.data_exporter.export_buffered(
-            self.device_manager, frames_by_device, self.settings.get('storage_path', './data'))
-        self.status_bar.showMessage(f'已保存 {saved} 个文件', 3000)
-
-    def _save_all_channels(self):
-        self._save_current_spectrum()
-
-    def _export_background(self):
-        for d in self.device_manager.devices.values():
-            if d.background_spectrum is not None:
-                self.data_exporter.export_background(d)
-
-    def _export_reference(self):
-        for d in self.device_manager.devices.values():
-            if d.reference_spectrum is not None:
-                self.data_exporter.export_reference(d)
-
-    def _save_plot_image(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, '保存光谱图片', '', 'PNG (*.png);;JPEG (*.jpg);;BMP (*.bmp)')
+    def recover_spool(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择待恢复缓存", self.settings["storage_path"], "采集缓存 (*.part)"
+        )
         if not path:
             return
-        pixmap = self.plot_widget.grab()
-        pixmap.save(path)
-        self.status_bar.showMessage(f'图片已保存: {path}', 3000)
+        try:
+            outputs, recovery = self._recover_spool_file(path)
+            self._log(f"缓存恢复完成：{len(recovery.frames)} 帧，生成 {len(outputs)} 个文件")
+            if recovery.issues:
+                self._log(f"缓存尾部提示：{recovery.issues[0].message}", "WARN")
+        except Exception as exc:
+            self._log(f"缓存恢复失败: {exc}", "ERROR")
 
-    # ==================== 菜单 ====================
+    def _recover_spool_file(self, path):
+        recovery = read_spool(path)
+        frames_by_device = {}
+        for frame in recovery.frames:
+            frames_by_device.setdefault(frame.device_id, []).append(frame)
+        if not frames_by_device:
+            raise ValueError("缓存中没有完整帧")
+        source = Path(path); stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = source.parent / f"{source.stem}_recovered_{stamp}"
+        outputs = []
+        for device_id, frames in frames_by_device.items():
+            target = Path(f"{prefix}_device_{device_id}.csv")
+            export_device_csv(target, device_id, frames, metadata={"Recovered From": source.name})
+            outputs.append(target)
+        workbook = Path(f"{prefix}.xlsx")
+        export_workbook(workbook, frames_by_device, session_metadata={"Recovered From": source.name})
+        outputs.append(workbook)
+        return outputs, recovery
 
-    def _open_settings(self):
-        dialog = SettingsDialog(self, self.settings)
-        dialog.settings_changed.connect(self._on_settings_changed)
-        if dialog.exec_():
-            self._on_settings_changed(dialog.get_settings())
+    def history_viewer_open(self):
+        self.tabs.setCurrentWidget(self.history_viewer); self.history_viewer.open_files()
 
-    def _on_settings_changed(self, settings: dict):
-        self.settings.update(settings)
-        self.data_exporter.set_default_path(settings.get('storage_path', './data'))
-        self.acq_engine.auto_save_enabled = settings.get('auto_save', False)
-        self.acq_engine.auto_save_mode = settings.get('save_mode', 'immediate')
-        self.acq_engine.auto_save_count = settings.get('save_param', 10)
-        self.acq_engine.auto_save_interval_s = float(settings.get('save_param', 5))
-        self.plot_widget.set_line_width(settings.get('line_width', 1.0))
+    def save_plot_image(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "保存光谱图片", f"spectrum_{datetime.now():%Y%m%d_%H%M%S}.png", "PNG (*.png)")
+        if path and self.plot_widget.save_image(path): self._log(f"光谱图片已保存: {path}")
 
-    def _open_history_viewer(self):
-        if self.history_viewer is None:
-            self.history_viewer = HistoryViewer()
-        self.history_viewer.show()
-        self.history_viewer.raise_()
+    def show_help(self):
+        QtWidgets.QMessageBox.information(self, "操作提示", "1. 查找并选择设备\n2. 选择采集、同步和批量存储方式\n3. 点击开始\n\n硬同步脉冲由下位机自动输出，上位机只负责布防和接收。")
 
-    def _show_about(self):
-        QMessageBox.about(self, '关于 ZGCAI 光谱仪控制软件',
-                          '<h3>ZGCAI 光谱仪控制软件 v1.0</h3>'
-                          '<p>基于 Python + PyQt5 开发</p>'
-                          '<p>设备卡片式管理，独立控制每台光谱仪</p>'
-                          '<hr>'
-                          '<p>通信协议: 二进制包协议 (0x24帧头)</p>')
+    def _log(self, message, level="INFO"):
+        self.diagnostics.append(message, level)
 
-    # ==================== 生命周期 ====================
+    def _update_status(self):
+        now = time.monotonic(); elapsed = max(1e-6, now - self._last_status_time)
+        fps = self._shown_since_status / elapsed; self._shown_since_status = 0; self._last_status_time = now
+        missing = sum(self.acquisition.diagnostics(device_id).missing for device_id in self.device_manager.devices)
+        queue_ratio = self.storage.queue_ratio if self.storage else 0.0
+        try: free_gb = shutil.disk_usage(Path(self.settings["storage_path"]).resolve()).free / (1024 ** 3)
+        except OSError: free_gb = 0.0
+        self.status_panel.update_metrics(len(self.device_manager.get_connected_devices()), fps, missing, queue_ratio, free_gb)
+
+    def _setup_simulation(self, auto_start):
+        configurations = [("SIM1", "SIM-VIS-001", 350.0, 0.12), ("SIM2", "SIM-VIS-002", 500.0, 0.14), ("SIM3", "SIM-NIR-001", 850.0, 0.18), ("SIM4", "SIM-NIR-002", 1000.0, 0.20)]
+        for port, serial, start, step in configurations:
+            device_id = self.device_manager.add_simulated_device(port, serial, 4096, start, step)
+            self._sim_x[device_id] = np.arange(4096, dtype=np.float64); self._sim_sequence[device_id] = 0
+        self.simulation_timer = QtCore.QTimer(self); self.simulation_timer.timeout.connect(self._simulation_tick); self.simulation_timer.start(10)
+        self._sim_running = bool(auto_start)
+        if auto_start: QtCore.QTimer.singleShot(0, self.start_acquisition)
+        self._log("模拟模式：4 台设备 × 4096 像素，目标 100 fps")
+
+    def _simulation_tick(self):
+        if not self._sim_running: return
+        self._sim_phase += 0.045
+        for device_id, x in self._sim_x.items():
+            center = 900 + device_id * 560 + 180 * math.sin(self._sim_phase * (1 + device_id * 0.08))
+            peak = 28000 * np.exp(-0.5 * ((x - center) / (85 + 14 * device_id)) ** 2)
+            ripple = 1800 * np.sin(x / (48 + device_id * 9) + self._sim_phase * 2)
+            pixels = np.clip(9000 + peak + ripple + device_id * 900, 0, 65535).astype(np.uint16)
+            sequence = self._sim_sequence[device_id] & 0xFFFFFF; self._sim_sequence[device_id] = sequence + 1
+            self.device_manager.inject_simulated_frame(SpectrumFrame.create(device_id, sequence << 8, pixels))
 
     def closeEvent(self, event):
-        if self.acq_engine.is_running():
-            self.acq_engine.stop()
-        for did in list(self.device_manager.devices.keys()):
-            self.device_manager.remove_device(did)
-        event.accept()
+        self._sim_running = False
+        self.device_manager.stop_all(); self._close_storage()
+        self.settings.update({"batch_size": self.sidebar.batch_size.value(), "storage_format": self.sidebar.storage_format.currentData(), "auto_store": self.sidebar.auto_store.isChecked(), "display_mode": self.display_mode.currentData(), "x_axis": self.x_axis.currentData()})
+        try: self.settings_service.save(self.settings)
+        except OSError as exc: self._log(f"设置保存失败: {exc}", "WARN")
+        self.device_manager.remove_all_devices(); event.accept()

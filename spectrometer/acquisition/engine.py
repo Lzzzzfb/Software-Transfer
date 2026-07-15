@@ -8,16 +8,19 @@ from collections import deque
 from typing import Optional, Dict, Callable
 import numpy as np
 
-from PyQt5.QtCore import QObject, pyqtSignal, QTimer
+from ..qt import QtCore, Signal
+
+QObject = QtCore.QObject
+QTimer = QtCore.QTimer
 
 
 class AcquisitionEngine(QObject):
     """采集控制引擎 — 支持每设备独立启停"""
 
-    device_acq_started = pyqtSignal(int)       # (device_id) 单设备采集开始
-    device_acq_stopped = pyqtSignal(int)       # (device_id) 单设备采集停止
-    frame_collected = pyqtSignal(int, int)     # (device_id, frame_count)
-    storage_triggered = pyqtSignal(int, np.ndarray, np.ndarray)  # (device_id, wl, pixels)
+    device_acq_started = Signal(int)       # (device_id) 单设备采集开始
+    device_acq_stopped = Signal(int)       # (device_id) 单设备采集停止
+    frame_collected = Signal(int, int)     # (device_id, frame_count)
+    storage_triggered = Signal(int, object, object)  # (device_id, wl, pixels)
 
     def __init__(self, device_manager):
         super().__init__()

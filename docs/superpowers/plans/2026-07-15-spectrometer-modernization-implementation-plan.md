@@ -2,7 +2,7 @@
 
 日期：2026-07-15
 依据：`docs/superpowers/specs/2026-07-15-spectrometer-modernization-design.md`
-状态：可执行
+状态：非实机代码、自动测试、模拟压力测试和文档已完成；实机与正式 PySide6 打包环境待验证，详见 `docs/hardware-validation-pending.md`
 
 ## 1. 执行原则
 

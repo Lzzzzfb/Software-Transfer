@@ -2,8 +2,8 @@
 
 from typing import Optional
 
-from PyQt5.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
-from PyQt5.QtSerialPort import QSerialPort, QSerialPortInfo
+from ..qt import QtCore, QtSerialPort, Signal, Slot
+from ..domain.models import SpectrumFrame
 
 from .frame_decoder import FrameDecoder
 from .protocol import CmdCode, build_packet, parse_data_packet, parse_packet
@@ -12,14 +12,27 @@ from .protocol import CmdCode, build_packet, parse_data_packet, parse_packet
 MAX_BUFFER_SIZE = 2 * 1024 * 1024
 
 
-class SerialWorker(QObject):
+QSerialPort = QtSerialPort.QSerialPort
+QSerialPortInfo = QtSerialPort.QSerialPortInfo
+
+
+def _serial_enum(group_name: str, value_name: str):
+    """兼容 PySide6 scoped enum 与 PyQt5 flat enum。"""
+
+    if hasattr(QSerialPort, value_name):
+        return getattr(QSerialPort, value_name)
+    return getattr(getattr(QSerialPort, group_name), value_name)
+
+
+class SerialWorker(QtCore.QObject):
     """单台光谱仪的串口工作对象。"""
 
-    data_received = pyqtSignal(int, list)
-    packet_error = pyqtSignal(int, str)
-    connection_lost = pyqtSignal(int)
-    response_ready = pyqtSignal(int, int, bytes)
-    open_finished = pyqtSignal(int, bool, str)
+    data_received = Signal(int, list)
+    frame_received = Signal(object)
+    packet_error = Signal(int, str)
+    connection_lost = Signal(int)
+    response_ready = Signal(int, int, bytes)
+    open_finished = Signal(int, bool, str)
 
     def __init__(self, device_index: int, port_name: str, baud_rate: int):
         super().__init__()
@@ -36,18 +49,24 @@ class SerialWorker(QObject):
         self.latest_pixels = None
         self.latest_frame_metadata = None
 
-    @pyqtSlot()
+    @Slot()
     def do_connect(self):
         try:
             self._serial = QSerialPort()
             self._serial.setPortName(self._port_name)
             self._serial.setBaudRate(self._baud_rate)
-            self._serial.setDataBits(QSerialPort.Data8)
-            self._serial.setParity(QSerialPort.NoParity)
-            self._serial.setStopBits(QSerialPort.OneStop)
-            self._serial.setFlowControl(QSerialPort.NoFlowControl)
+            self._serial.setDataBits(_serial_enum("DataBits", "Data8"))
+            self._serial.setParity(_serial_enum("Parity", "NoParity"))
+            self._serial.setStopBits(_serial_enum("StopBits", "OneStop"))
+            self._serial.setFlowControl(_serial_enum("FlowControl", "NoFlowControl"))
 
-            if self._serial.open(QSerialPort.ReadWrite):
+            if hasattr(QSerialPort, "ReadWrite"):
+                read_write = QSerialPort.ReadWrite
+            elif hasattr(QtCore.QIODevice, "ReadWrite"):
+                read_write = QtCore.QIODevice.ReadWrite
+            else:
+                read_write = QtCore.QIODevice.OpenModeFlag.ReadWrite
+            if self._serial.open(read_write):
                 self._serial.readyRead.connect(self._on_ready_read)
                 self._serial.errorOccurred.connect(self._on_error)
                 self.open_finished.emit(self.device_index, True, "")
@@ -58,22 +77,22 @@ class SerialWorker(QObject):
         except Exception as exc:
             self.open_finished.emit(self.device_index, False, str(exc))
 
-    @pyqtSlot()
+    @Slot()
     def do_close(self):
         if self._serial and self._serial.isOpen():
             self._serial.close()
         self._decoder.reset()
 
-    @pyqtSlot(bytes)
+    @Slot(bytes)
     def do_write(self, data: bytes):
         if self._serial and self._serial.isOpen():
             self._serial.write(data)
 
-    @pyqtSlot(int, bytes)
+    @Slot(int, bytes)
     def do_send_command(self, cmd: int, params: bytes):
         self.do_write(build_packet(cmd, params))
 
-    @pyqtSlot(int, int, int)
+    @Slot(int, int, int)
     def set_pixel_info(self, n_pixel: int, n_start_pixel: int, n_valid_pixel: int):
         self._n_pixel = n_pixel
         self._n_start_pixel = n_start_pixel
@@ -118,6 +137,13 @@ class SerialWorker(QObject):
                     "reserved": parsed["reserved"],
                     "source_pixel_count": parsed["source_pixel_count"],
                 }
+                self.frame_received.emit(
+                    SpectrumFrame.create(
+                        self.device_index,
+                        parsed["packet_number"],
+                        pixels,
+                    )
+                )
                 # 逐帧信号供无丢帧存储链路使用；显示仍可读取 latest_pixels 节流。
                 self.data_received.emit(self.device_index, pixels)
             else:
@@ -126,15 +152,15 @@ class SerialWorker(QObject):
         except (IndexError, ValueError) as exc:
             self.packet_error.emit(self.device_index, str(exc))
 
-    def _on_error(self, error: QSerialPort.SerialPortError):
-        if error == QSerialPort.ResourceError:
+    def _on_error(self, error):
+        if error == _serial_enum("SerialPortError", "ResourceError"):
             self.connection_lost.emit(self.device_index)
 
 
-class DeviceFinder(QObject):
+class DeviceFinder(QtCore.QObject):
     """枚举串口并按常见 USB 串口特征识别候选设备。"""
 
-    devices_found = pyqtSignal(list)
+    devices_found = Signal(list)
 
     @staticmethod
     def list_available_ports() -> list:

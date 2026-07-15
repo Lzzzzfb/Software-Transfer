@@ -1,0 +1,32 @@
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from spectrometer.processing.references import ReferenceRepository
+from spectrometer.qt import QtWidgets
+from spectrometer.ui.main_window import MainWindow
+
+
+_APPLICATION = None
+
+
+def application():
+    global _APPLICATION
+    _APPLICATION = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    return _APPLICATION
+
+
+def test_simulated_multi_device_session_exports_default_layout(tmp_path):
+    app = application()
+    window = MainWindow(simulation=True, auto_start_simulation=False, settings_path=tmp_path / "settings.json")
+    window.settings["storage_path"] = str(tmp_path)
+    window.reference_repository = ReferenceRepository(tmp_path / "references")
+    window.sidebar.batch_size.setValue(2)
+    window.start_acquisition()
+    window._simulation_tick(); window._simulation_tick()
+    window.stop_acquisition(); app.processEvents()
+
+    assert len(list(tmp_path.glob("*.csv"))) == 4
+    assert len(list(tmp_path.glob("*.xlsx"))) == 1
+    assert not list(tmp_path.glob("*.part"))
+    window.close(); app.processEvents()

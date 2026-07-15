@@ -101,6 +101,7 @@ class SpectrometerDevice:
 
         # 起始波长 (用于排序)
         self.start_wavelength: float = 0.0
+        self.last_processing_error: str = ''
 
     def update_start_wavelength(self):
         """根据校准参数更新起始波长"""
@@ -158,7 +159,12 @@ class SpectrometerDevice:
             else:
                 return None
         elif mode == 'custom' and custom_formula:
-            y = self._eval_custom_formula(custom_formula, x, y)
+            try:
+                y = self._eval_custom_formula(custom_formula, x, y)
+                self.last_processing_error = ''
+            except ValueError as exc:
+                self.last_processing_error = str(exc)
+                return None
 
         # airPLS 基线校正 (在各显示模式之后应用)
         if self.baseline_enabled and mode != 'absorbance':
@@ -174,17 +180,15 @@ class SpectrometerDevice:
         return baseline, y - baseline
 
     def _eval_custom_formula(self, formula: str, x: np.ndarray, I: np.ndarray) -> np.ndarray:
-        """计算用户自定义公式"""
+        """通过受限 AST 解析器计算用户自定义公式，不执行任意代码。"""
+        from ..processing.formula import evaluate_formula
+
         Ib = self._match_length(self.background_spectrum, len(I)) if self.background_spectrum is not None else np.zeros_like(I)
         I0 = self._match_length(self.reference_spectrum, len(I)) if self.reference_spectrum is not None else np.ones_like(I)
-        context = {'I': I, 'Ib': Ib, 'I0': I0, 'x': x,
-                    'np': np, 'log10': np.log10, 'log': np.log, 'loge': np.log,
-                    'abs': np.abs, 'sqrt': np.sqrt}
-        try:
-            result = eval(formula, {"__builtins__": {}}, context)
-            return np.array(result, dtype=np.float64)
-        except Exception:
-            return I
+        return evaluate_formula(
+            formula,
+            {'I': I, 'Idark': Ib, 'Ib': Ib, 'I0': I0, 'x': x},
+        )
 
     @staticmethod
     def _match_length(arr: np.ndarray, target_len: int) -> np.ndarray:

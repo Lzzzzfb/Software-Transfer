@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zgcai-spectrometer-workstation"
+version = "2.0.0"
+description = "ZGCAI multi-device spectrometer acquisition and analysis workstation"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "PySide6>=6.7,<7",
+  "numpy>=1.26,<3",
+  "scipy>=1.11,<2",
+  "XlsxWriter>=3.2,<4",
+  "openpyxl>=3.1,<4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

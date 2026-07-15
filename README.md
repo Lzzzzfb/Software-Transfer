@@ -1,153 +1,73 @@
-# ZGCAI 光谱仪上位机控制软件
+# ZGCAI 光谱仪采集与分析工作站
 
-基于 Python + PyQt5 开发的光谱仪上位机控制软件，支持多通道光谱仪控制、实时数据采集与可视化分析。
+面向 Windows 64 位的多设备光谱仪上位机。产品界面使用 PySide6/Qt Widgets，支持串口采集、同步布防、实时处理、批量 CSV/Excel、断点缓存恢复、历史查看和诊断。
 
-## 项目结构
+## 已实现能力
 
-```
-光谱仪/
-├── main.py                          # 程序入口
-├── requirements.txt                 # Python 依赖
-├── README.md                        # 本文件
-├── data/                            # 数据存储目录(自动创建)
-└── spectrometer/                    # 核心包
-    ├── __init__.py
-    ├── communication/               # 通信层
-    │   ├── __init__.py
-    │   ├── protocol.py              # 二进制通信协议(帧头0x24)
-    │   └── serial_port.py           # 串口通信管理
-    ├── device/                      # 设备层
-    │   ├── __init__.py
-    │   ├── spectrometer.py          # 单设备模型与状态
-    │   └── device_manager.py        # 多设备管理器
-    ├── acquisition/                 # 采集层
-    │   ├── __init__.py
-    │   └── engine.py                # 采集引擎 + 数据处理器
-    ├── storage/                     # 存储层
-    │   ├── __init__.py
-    │   └── exporter.py              # CSV/TXT 数据导出
-    ├── ui/                          # 用户界面层
-    │   ├── __init__.py
-    │   ├── main_window.py           # 主窗口
-    │   ├── device_panel.py          # 设备控制面板
-    │   ├── plot_widget.py           # 实时绘图组件
-    │   └── settings_dialog.py       # 设置对话框 + 历史查看器
-    └── utils/                       # 工具层
-        └── __init__.py
+- 协议普通帧与 `0x80` 数据帧分别按正确长度拆包。
+- `nPacketNumb` 按 U32 小端解析，像素按 U16 大端解析。
+- 最多按当前目标同时使用约 4 台设备；显示约 30 fps，存储通道接收每一帧。
+- 24 位帧序号缺口、重复、乱序和回绕诊断。
+- 单次、连续、软件同步、内部硬同步和外部硬同步布防。
+- 原始、强度校准、扣背景、吸光度、airPLS 和受限自定义公式。
+- 默认每 500 帧一批，可设置 1–1000；默认同时输出 CSV 和 Excel。
+- CSV 每台设备一个文件；Excel 一个设备一个工作表。
+- 所有批量文件均为每帧一列、每像素一行。
+- `.part` 临时缓存包含版本、元数据和逐帧 CRC32，可恢复截断尾记录。
+- 现代化双层工具带、设备侧栏、实时/历史/诊断页和状态栏。
+- `--simulate` 可在无光谱仪时模拟 4 台 4096 像素设备。
+
+## 环境
+
+- Windows 10/11 64 位
+- Python 3.12 64 位
+- 依赖见 `requirements.txt`
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\python main.py --simulate
 ```
 
-## 环境要求
+连接实机运行：
 
-- Windows 10+ (x86/x64)
-- Python 3.7+
-- PyQt5
-- pyqtgraph
-- numpy
-- pyserial
-
-## 快速开始
-
-### 1. 安装 Python 依赖
-
-```bash
-pip install -r requirements.txt
+```powershell
+.venv\Scripts\python main.py
 ```
 
-### 2. 运行程序
+## 自动测试
 
-```bash
-python main.py
+```powershell
+python -m pytest -q
+python -m compileall -q main.py spectrometer
 ```
 
-### 3. 连接设备
+## 64 位打包
 
-1. 在左侧设备面板的"串口"下拉框中选择光谱仪对应的串口
-2. 选择合适的波特率（默认115200）
-3. 点击"连接"按钮
+在安装 PySide6 和 PyInstaller 的 Python 3.12 64 位环境中：
 
-## 功能说明
-
-### 设备管理
-- 自动扫描可用串口
-- 支持多台光谱仪同时连接
-- 按起始波长自动排序
-- 设备初始化与参数查询
-
-### 采集控制
-- **连续采集**: 点击"连续采集"按钮，以曝光时间为周期连续获取数据
-- **单次采集**: 点击"单次采集"按钮，采集单帧数据
-- **外触发模式**: 勾选"外触发模式"后，采集等待外部触发信号
-- **同步采集**: 支持软同步和硬同步两种多设备同步模式
-
-### 参数设置
-- 积分时间 (1us ~ 99999999us)
-- 触发模式 (软件触发 / 外部触发 / 软触发主机)
-- 平均次数 (1 ~ 10000)
-- 增益 (0 ~ 63)
-- 采集间隔
-- 触发延时
-- 波长校准系数 (3阶多项式: C1 + C2*x + C3*x² + C4*x³)
-
-### 光谱显示模式
-- **原始光谱**: 直接显示像素强度
-- **扣背景光谱**: I - Idark
-- **吸收光谱**: A = -log10((I - Idark) / (I0 - Idark))
-- **自定义公式**: 支持运算符(+, -, *, /, **, log10, log, abs, sqrt)和变量(I, Ib, I0, x)
-
-### 数据存储
-- 自动/手动存储可选
-- 支持 CSV 和 TXT 格式
-- 多通道数据可合并为单文件
-- 自动存储模式: 立即存储 / 按帧数间隔 / 按时间间隔
-- 文件命名包含: 采集时间、曝光时间、触发模式等信息
-- 背景/参考光谱单独存储（background_/reference_前缀）
-
-### 可视化
-- 实时滚动显示光谱数据
-- 支持缩放（选框/滚轮/拖动）和双击还原
-- 最多64条对比光谱叠加
-- 可自定义曲线颜色和粗细
-- 采集过程中保持缩放状态
-
-### 历史数据查看
-- 最多12个标签页
-- 每个标签页最多64条曲线
-- 支持 CSV/TXT 文件导入
-
-## 通信协议
-
-遵循二进制包协议规范:
-
-```
-帧格式:
-  指令头 (1B): 0x24
-  长度字 (2B): U16 LE, 命令码+参数/数据的字节数
-  命令码 (1B)
-  参数/数据 (变长)
-  校验码 (1B): 长度字/命令码/参数/数据域的字节累加和
-
-数据包格式 (0x80):
-  0x24 U16(nLength) 0x80 U32(nPacketNumb) U16[]Data U8(CheckSum)
+```powershell
+python -m PyInstaller --clean --noconfirm spectrometer.spec
 ```
 
-### 主要命令码
+输出位于 `dist/ZGCAI_Spectrometer_Workstation/`。当前开发机未安装 PySide6，因此打包执行留到发布环境验证；配置已迁移为 PySide6，并显式包含 Qt SerialPort。
 
-| 命令码 | 功能 | 方向 |
-|--------|------|------|
-| 0x01 | 查询版本信息 | 发送 |
-| 0x10 | 设备初始化 | 发送 |
-| 0x20 | 积分时间设置 | 发送 |
-| 0x21 | 触发模式设置 | 发送 |
-| 0x23 | 平均次数设置 | 发送 |
-| 0x25 | 增益设置 | 发送 |
-| 0x27 | 校准系数设置 | 发送 |
-| 0x2b | 延时时间设置 | 发送 |
-| 0x30-0x3c | 参数查询 | 发送 |
-| 0x50 | 单次采集启动 | 发送 |
-| 0x51 | 连续采集启动 | 发送 |
-| 0x52 | 采集停止 | 发送 |
-| 0x80 | 光谱数据上传 | 返回 |
+## 协议要点
 
-## 许可
+普通帧：
 
-内部使用
+```text
+0x24 | nLength(U16LE) | Cmd | Params | Checksum
+物理总长度 = 4 + nLength，nLength 不含校验码
+```
+
+数据帧：
+
+```text
+0x24 | nLength(U16LE) | 0x80 | nPacketNumb(U32LE) | Data(U16BE[]) | Checksum
+nLength = 6 + 2*N，物理总长度 = 3 + nLength
+```
+
+数据帧的校验字节会被消费，但按现有下位机约定不验证其数值。波长校准系数收发顺序继续沿用原工程正确的反序逻辑：下位机为 `C4,C3,C2,C1`，上位机模型为 `C1,C2,C3,C4`。
+
+详细操作见 [用户指南](docs/user-guide.md)，实机验收项见 [实机联调清单](docs/hardware-validation-pending.md)。
