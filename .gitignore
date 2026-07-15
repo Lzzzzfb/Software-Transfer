@@ -1,0 +1,29 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Build and package outputs
+build/
+dist/
+
+# Runtime acquisition data
+data/
+*.part
+
+# Local design companion/session files
+.superpowers/
+
+# Test and tool caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and OS files
+.idea/
+.vscode/
+~$*
+Thumbs.db
+.DS_Store
