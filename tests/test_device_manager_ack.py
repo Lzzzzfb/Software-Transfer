@@ -87,3 +87,22 @@ def test_compatible_init_ack_reports_original_init_command():
     manager._on_response(0, CmdCode.GET_VERSION, b"\x61")
 
     assert results == [(0, int(CmdCode.DEVICE_INIT), True, b"\x61")]
+
+
+def test_simulated_control_commands_emit_the_same_completion_events():
+    manager = DeviceManager()
+    device_id = manager.add_simulated_device("SIM-1", "SIM001", 16, 400, 1)
+    results = []
+    manager.command_completed.connect(
+        lambda did, cmd, success, params: results.append((did, cmd, success))
+    )
+
+    manager.set_trigger_mode(device_id, 0)
+    manager.start_acquisition(device_id, continuous=True)
+    manager.stop_acquisition(device_id)
+
+    assert results == [
+        (device_id, int(CmdCode.SET_TRIG_MODE), True),
+        (device_id, int(CmdCode.START_CONTINUOUS), True),
+        (device_id, int(CmdCode.STOP_ACQUISITION), True),
+    ]

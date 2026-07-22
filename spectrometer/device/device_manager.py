@@ -229,6 +229,7 @@ class DeviceManager(QtCore.QObject):
             self.device_updated.emit(device_id)
             if int(cmd) == int(CmdCode.SET_TRIG_MODE):
                 self._complete_sync_trigger_mode(device_id, True)
+            self.command_completed.emit(device_id, int(cmd), True, b"\x60")
         else:
             self._pending_updates[(device_id, int(cmd))] = apply
         return True
@@ -308,6 +309,7 @@ class DeviceManager(QtCore.QObject):
         if result and self.devices[device_id].port_name.startswith("SIM"):
             self.devices[device_id].acquiring = True
             self.device_updated.emit(device_id)
+            self.command_completed.emit(device_id, int(cmd), True, b"\x60")
         return result
 
     def stop_acquisition(self, device_id: int):
@@ -317,6 +319,10 @@ class DeviceManager(QtCore.QObject):
         if device:
             device.acquiring = False
             self.device_updated.emit(device_id)
+            if result and device.port_name.startswith("SIM"):
+                self.command_completed.emit(
+                    device_id, int(CmdCode.STOP_ACQUISITION), True, b"\x60"
+                )
         return result
 
     def start_sync_acquisition(self, continuous: bool = True):

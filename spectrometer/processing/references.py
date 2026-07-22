@@ -13,25 +13,54 @@ class ReferenceRepository:
         self.directory.mkdir(parents=True, exist_ok=True)
 
     def save(self, reference: SpectrumReference) -> Path:
-        path = self.directory / f"{reference.reference_id}.json"
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(
-                {
-                    "reference_id": reference.reference_id,
-                    "device_serial": reference.device_serial,
-                    "pixel_count": reference.pixel_count,
-                    "kind": reference.kind,
-                    "pixels": list(reference.pixels),
-                    "created_at": reference.created_at,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
-        return path
+        return self.save_batch([reference])[0]
+
+    def save_batch(self, references) -> List[Path]:
+        """Write a group of immutable references with rollback on commit failure."""
+
+        items = list(references)
+        if not items:
+            raise ValueError("参考批次不能为空")
+        if len({item.reference_id for item in items}) != len(items):
+            raise ValueError("参考批次不能包含重复 ID")
+        temporary_paths = []
+        final_paths = []
+        committed_paths = []
+        try:
+            for reference in items:
+                path = self.directory / f"{reference.reference_id}.json"
+                if path.exists():
+                    raise FileExistsError(f"参考记录已存在：{path.name}")
+                temporary = path.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(
+                        {
+                            "reference_id": reference.reference_id,
+                            "device_serial": reference.device_serial,
+                            "pixel_count": reference.pixel_count,
+                            "kind": reference.kind,
+                            "pixels": list(reference.pixels),
+                            "created_at": reference.created_at,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                temporary_paths.append(temporary)
+                final_paths.append(path)
+            for temporary, final in zip(temporary_paths, final_paths):
+                temporary.replace(final)
+                committed_paths.append(final)
+            return final_paths
+        except Exception:
+            for path in temporary_paths:
+                if path.exists():
+                    path.unlink()
+            for path in committed_paths:
+                if path.exists():
+                    path.unlink()
+            raise
 
     def load(self, reference_id: str) -> SpectrumReference:
         data = json.loads((self.directory / f"{reference_id}.json").read_text(encoding="utf-8"))

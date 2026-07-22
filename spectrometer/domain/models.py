@@ -202,10 +202,17 @@ class AcquisitionRequest:
 
     @classmethod
     def create(cls, owner, device_ids, **kwargs) -> "AcquisitionRequest":
+        values = dict(kwargs)
+        if "mode" in values:
+            values["mode"] = AcquisitionMode(values["mode"])
+        if "sync_mode" in values:
+            values["sync_mode"] = SyncMode(values["sync_mode"])
+        if "storage_format" in values:
+            values["storage_format"] = StorageFormat(values["storage_format"])
         return cls(
             task_id=uuid.uuid4().hex,
             started_at=datetime.now().astimezone().isoformat(),
             owner=AcquisitionOwner(owner),
             device_ids=tuple(int(device_id) for device_id in device_ids),
-            **kwargs,
+            **values,
         )
