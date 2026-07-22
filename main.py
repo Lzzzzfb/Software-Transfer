@@ -30,7 +30,8 @@ def main(argv=None):
     if struct.calcsize("P") * 8 != 64:
         raise RuntimeError("本软件仅支持 64 位 Python / Windows")
     args = parse_args(argv)
-    if hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
+    # Qt 6 默认启用高 DPI；仅 Qt 5 兼容运行时需要显式设置。
+    if QT_API == "PyQt5" and hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     application = QtWidgets.QApplication(sys.argv[:1])
     application.setApplicationName("ZGCAI 光谱仪工作站")

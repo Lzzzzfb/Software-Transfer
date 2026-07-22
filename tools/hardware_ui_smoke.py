@@ -20,12 +20,16 @@ from spectrometer.ui.main_window import MainWindow
 
 
 class UiHardwareSmoke(QtCore.QObject):
-    def __init__(self, app, ports, output_dir, target_frames, timeout_seconds):
+    def __init__(
+        self, app, ports, output_dir, target_frames, timeout_seconds,
+        expected_devices=None,
+    ):
         super().__init__()
         self.app = app
         self.ports = ports
         self.output_dir = output_dir
         self.target_frames = target_frames
+        self.expected_devices = expected_devices or len(ports)
         self.counts = Counter()
         self.started = False
         self.finishing = False
@@ -59,7 +63,7 @@ class UiHardwareSmoke(QtCore.QObject):
         if self.started or self.finishing:
             return
         devices = self.window.device_manager.get_connected_devices()
-        if len(devices) != len(self.ports):
+        if len(devices) != self.expected_devices:
             return
         if not all(device.initialized and device.info.prod_serial for device in devices):
             return
@@ -127,11 +131,23 @@ def main():
     parser.add_argument("--output-dir", default="data/validation/ui_hardware")
     parser.add_argument("--frames", type=int, default=10)
     parser.add_argument("--timeout", type=float, default=25.0)
+    parser.add_argument(
+        "--expected-devices",
+        type=int,
+        help="预期通过协议握手的设备数；默认等于端口数",
+    )
     args = parser.parse_args()
     app = QtWidgets.QApplication([])
     app.setStyle("Fusion")
     app.setStyleSheet(load_stylesheet())
-    run = UiHardwareSmoke(app, args.ports, Path(args.output_dir), args.frames, args.timeout)
+    run = UiHardwareSmoke(
+        app,
+        args.ports,
+        Path(args.output_dir),
+        args.frames,
+        args.timeout,
+        args.expected_devices,
+    )
     return application_exec(app)
 
 

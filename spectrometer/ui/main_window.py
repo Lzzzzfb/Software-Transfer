@@ -125,7 +125,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.integration_changed.connect(self.device_manager.set_integration_time)
         self.sidebar.enabled_changed.connect(self._device_enabled_changed)
         self.sidebar.parameters_requested.connect(self.open_device_parameters)
-        self.sidebar.connect_requested.connect(self.device_manager.add_and_connect)
+        self.sidebar.connect_requested.connect(
+            lambda port, baud: self.device_manager.add_and_connect(
+                port, baud, force=True
+            )
+        )
         self.sidebar.disconnect_requested.connect(self.device_manager.remove_device)
         self.sidebar.refresh_button.clicked.connect(self.scan_devices)
         self.device_manager.device_added.connect(self._device_changed)
@@ -210,9 +214,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(f"同步模式：{self.ribbon.sync_combo.currentText()}")
 
     def start_acquisition(self):
-        devices = [device for device in self.device_manager.get_connected_devices() if device.enabled]
+        devices = [
+            device
+            for device in self.device_manager.get_connected_devices()
+            if device.enabled and device.initialized
+        ]
         if not devices:
-            self.status_panel.state_label.setText("没有可采集设备"); self._log("没有可采集设备", "WARN"); return
+            message = "没有已识别且初始化完成的光谱仪"
+            self.status_panel.state_label.setText(message); self._log(message, "WARN"); return
         if self.device_manager.acquisition_active:
             self._log("采集已在运行或正在启动", "WARN"); return
         pending = [device.port_name for device in devices if device.device_id in self._initializing_devices]

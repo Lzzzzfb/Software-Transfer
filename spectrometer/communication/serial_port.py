@@ -83,14 +83,14 @@ class SerialWorker(QtCore.QObject):
             self._serial.close()
         self._decoder.reset()
 
-    @Slot(bytes)
-    def do_write(self, data: bytes):
+    @Slot(QtCore.QByteArray)
+    def do_write(self, data):
         if self._serial and self._serial.isOpen():
             self._serial.write(data)
 
-    @Slot(int, bytes)
-    def do_send_command(self, cmd: int, params: bytes):
-        self.do_write(build_packet(cmd, params))
+    @Slot(int, QtCore.QByteArray)
+    def do_send_command(self, cmd: int, params):
+        self.do_write(QtCore.QByteArray(build_packet(cmd, bytes(params))))
 
     @Slot(int, int, int)
     def set_pixel_info(self, n_pixel: int, n_start_pixel: int, n_valid_pixel: int):

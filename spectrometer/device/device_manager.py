@@ -1,6 +1,8 @@
-"""多设备连接、状态、参数 ACK 和显示节流管理。"""
+"""多设备连接、协议识别、状态、参数 ACK 和显示节流管理。"""
 
+import math
 import struct
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -37,6 +39,11 @@ class DeviceManager(QtCore.QObject):
         self._acquisition_requested = set()
         self._reconnect_attempts: Dict[int, int] = {}
         self._removing = set()
+        self._probing = set()
+        self._announced_devices = set()
+        self._probe_tokens: Dict[int, int] = {}
+        self._probe_failures: Dict[str, int] = {}
+        self._probe_retry_after: Dict[str, float] = {}
         self._sync_generation = 0
         self._sync_setup = None
 
@@ -48,10 +55,19 @@ class DeviceManager(QtCore.QObject):
         self.sync_mode = "soft"
         self.master_device_id: Optional[int] = None
 
-    def add_and_connect(self, port_name: str, baud_rate: int = 115200) -> int:
+    def add_and_connect(
+        self, port_name: str, baud_rate: int = 115200, force: bool = False
+    ) -> int:
+        port_key = port_name.upper()
+        if force:
+            self._probe_failures.pop(port_key, None)
+            self._probe_retry_after.pop(port_key, None)
+        elif time.monotonic() < self._probe_retry_after.get(port_key, 0):
+            return -1
+
         for device_id, device in self.devices.items():
             if device.port_name == port_name:
-                if device.connected:
+                if device.connected or device_id in self._probing:
                     self.device_updated.emit(device_id)
                     return device_id
                 self._schedule_reconnect(device_id, immediate=True)
@@ -61,7 +77,6 @@ class DeviceManager(QtCore.QObject):
         self._next_id += 1
         self.devices[device_id] = SpectrometerDevice(device_id, port_name)
         self._create_worker(device_id, port_name, baud_rate)
-        self.device_added.emit(device_id)
         return device_id
 
     def add_simulated_device(
@@ -94,6 +109,7 @@ class DeviceManager(QtCore.QObject):
         device.wavelength_calib = CalibrationData(wavelength_start, wavelength_step, 0, 0)
         device.update_start_wavelength()
         self.devices[device_id] = device
+        self._announced_devices.add(device_id)
         self.device_added.emit(device_id)
         self.device_connected.emit(device_id)
         self.device_updated.emit(device_id)
@@ -118,7 +134,10 @@ class DeviceManager(QtCore.QObject):
         thread.finished.connect(thread.deleteLater)
         thread.start()
 
-    def remove_device(self, device_id: int):
+    def remove_device(self, device_id: int, preserve_probe_backoff: bool = False):
+        device = self.devices.get(device_id)
+        port_key = device.port_name.upper() if device else ""
+        was_announced = device_id in self._announced_devices
         self._removing.add(device_id)
         worker = self._workers.get(device_id)
         thread = self._threads.get(device_id)
@@ -135,10 +154,17 @@ class DeviceManager(QtCore.QObject):
         self._acquisition_requested.discard(device_id)
         self.devices.pop(device_id, None)
         self._reconnect_attempts.pop(device_id, None)
+        self._probing.discard(device_id)
+        self._probe_tokens.pop(device_id, None)
+        self._announced_devices.discard(device_id)
+        if port_key and not preserve_probe_backoff:
+            self._probe_failures.pop(port_key, None)
+            self._probe_retry_after.pop(port_key, None)
         for key in [key for key in self._pending_updates if key[0] == device_id]:
             self._pending_updates.pop(key, None)
         self._removing.discard(device_id)
-        self.device_removed.emit(device_id)
+        if was_announced:
+            self.device_removed.emit(device_id)
 
     disconnect_device = remove_device
 
@@ -153,7 +179,11 @@ class DeviceManager(QtCore.QObject):
         return sorted(self.devices.values(), key=lambda item: item.start_wavelength)
 
     def get_connected_devices(self) -> List[SpectrometerDevice]:
-        return [device for device in self.devices.values() if device.connected]
+        return [
+            device
+            for device in self.devices.values()
+            if device.connected and device.initialized
+        ]
 
     @property
     def acquisition_active(self) -> bool:
@@ -178,7 +208,7 @@ class DeviceManager(QtCore.QObject):
             worker,
             "do_write",
             QtCore.Qt.QueuedConnection,
-            QtCore.Q_ARG(bytes, packet),
+            QtCore.Q_ARG(QtCore.QByteArray, QtCore.QByteArray(packet)),
         )
         return True
 
@@ -398,14 +428,40 @@ class DeviceManager(QtCore.QObject):
         device = self.devices.get(device_id)
         if not device:
             return
-        device.connected = success
         if success:
             self._reconnect_attempts[device_id] = 0
-            self.device_connected.emit(device_id)
+            device.connected = False
+            device.initialized = False
+            device.acquiring = False
+            token = self._probe_tokens.get(device_id, 0) + 1
+            self._probe_tokens[device_id] = token
+            self._probing.add(device_id)
+            self.diagnostic_event.emit(
+                f"{device.port_name} 串口已打开，正在进行光谱仪协议握手"
+            )
+            self.query_version(device_id)
+            QtCore.QTimer.singleShot(
+                2500, lambda: self._on_probe_timeout(device_id, token)
+            )
         else:
-            self.device_connect_failed.emit(device_id, error_msg or f"无法打开 {device.port_name}")
-            self._schedule_reconnect(device_id)
-        self.device_updated.emit(device_id)
+            device.connected = False
+            if device_id in self._announced_devices:
+                self.device_connect_failed.emit(
+                    device_id, error_msg or f"无法打开 {device.port_name}"
+                )
+                self._schedule_reconnect(device_id)
+                self.device_updated.emit(device_id)
+            else:
+                retry_seconds = self._register_probe_failure(device.port_name)
+                self.diagnostic_event.emit(
+                    f"{device.port_name} 无法打开，自动识别将在 {retry_seconds}s 后重试"
+                )
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda: self.remove_device(
+                        device_id, preserve_probe_backoff=True
+                    ),
+                )
 
     def _on_frame_received(self, frame: SpectrumFrame):
         device = self.devices.get(frame.device_id)
@@ -440,7 +496,8 @@ class DeviceManager(QtCore.QObject):
                 self.diagnostic_event.emit(
                     f"设备 {device_id} 已接收兼容型初始化 ACK（响应 Cmd=0x01）"
                 )
-            self.device_updated.emit(device_id)
+            if device_id in self._announced_devices:
+                self.device_updated.emit(device_id)
             return
         is_set = cmd == CmdCode.DEVICE_INIT or 0x20 <= cmd <= 0x2C or 0x50 <= cmd <= 0x54
         if is_set:
@@ -470,13 +527,16 @@ class DeviceManager(QtCore.QObject):
                 device.acquiring = False
 
         if cmd == CmdCode.GET_VERSION and len(params) >= 32:
-            values = list(struct.unpack("<IIffIIII", params[:32]))
-            values.extend(struct.unpack("<II", params[32:40]) if len(params) >= 40 else (0, 0))
-            device.info = DeviceInfo(
-                name=values[0], dev_type=values[1], hw_ver=values[2], fw_ver=values[3],
-                serial_num=values[4], pixel_count=values[5], start_pixel=values[6],
-                valid_pixel=values[7], pos_time_min=values[8], pos_time_max=values[9],
-            )
+            try:
+                device.info = self._decode_device_info(params)
+            except ValueError as exc:
+                if device_id in self._probing:
+                    self.diagnostic_event.emit(
+                        f"{device.port_name} 返回的设备信息无效：{exc}"
+                    )
+                else:
+                    self.error_occurred.emit(device_id, f"设备信息无效：{exc}")
+                return
             device.initialized = True
             device.update_start_wavelength()
             worker = self._workers.get(device_id)
@@ -487,6 +547,21 @@ class DeviceManager(QtCore.QObject):
                     QtCore.Q_ARG(int, device.info.start_pixel),
                     QtCore.Q_ARG(int, device.info.valid_pixel),
                 )
+            if device_id in self._probing:
+                self._probing.discard(device_id)
+                self._probe_tokens.pop(device_id, None)
+                device.connected = True
+                port_key = device.port_name.upper()
+                self._probe_failures.pop(port_key, None)
+                self._probe_retry_after.pop(port_key, None)
+                if device_id not in self._announced_devices:
+                    self._announced_devices.add(device_id)
+                    self.device_added.emit(device_id)
+                self.diagnostic_event.emit(
+                    f"已识别光谱仪 {device.port_name}："
+                    f"{device.info.valid_pixel} 个有效像素"
+                )
+                self.device_connected.emit(device_id)
         elif cmd == CmdCode.QUERY_CALIB_COEFF and len(params) >= 16:
             c4, c3, c2, c1 = struct.unpack("<4f", params[:16])
             device.wavelength_calib = CalibrationData(c1, c2, c3, c4)
@@ -508,7 +583,8 @@ class DeviceManager(QtCore.QObject):
             value = bytes(params[:32]).rstrip(b"\x00").decode("ascii", errors="replace").strip()
             if value and not set(value) <= {"0"}:
                 device.info.prod_serial = value
-        self.device_updated.emit(device_id)
+        if device_id in self._announced_devices:
+            self.device_updated.emit(device_id)
 
     def _on_error(self, device_id: int, message: str):
         self.error_occurred.emit(device_id, message)
@@ -517,10 +593,81 @@ class DeviceManager(QtCore.QObject):
         self._acquisition_requested.discard(device_id)
         device = self.devices.get(device_id)
         if device:
+            self._probing.discard(device_id)
+            self._probe_tokens.pop(device_id, None)
             device.connected = False
+            device.initialized = False
             device.acquiring = False
-            self.device_updated.emit(device_id)
-            self._schedule_reconnect(device_id)
+            if device_id in self._announced_devices:
+                self.device_updated.emit(device_id)
+                self._schedule_reconnect(device_id)
+            else:
+                retry_seconds = self._register_probe_failure(device.port_name)
+                self.diagnostic_event.emit(
+                    f"{device.port_name} 在协议识别期间断开，"
+                    f"将在 {retry_seconds}s 后重试"
+                )
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda: self.remove_device(
+                        device_id, preserve_probe_backoff=True
+                    ),
+                )
+
+    def _on_probe_timeout(self, device_id: int, token: int):
+        if self._probe_tokens.get(device_id) != token:
+            return
+        device = self.devices.get(device_id)
+        if not device or device_id not in self._probing:
+            return
+        retry_seconds = self._register_probe_failure(device.port_name)
+        self.diagnostic_event.emit(
+            f"{device.port_name} 未通过光谱仪协议握手，已忽略；"
+            f"自动识别将在 {retry_seconds}s 后重试"
+        )
+        self.remove_device(device_id, preserve_probe_backoff=True)
+
+    def _register_probe_failure(self, port_name: str) -> int:
+        port_key = port_name.upper()
+        failures = self._probe_failures.get(port_key, 0) + 1
+        self._probe_failures[port_key] = failures
+        retry_seconds = min(300, 30 * (2 ** min(failures - 1, 4)))
+        self._probe_retry_after[port_key] = time.monotonic() + retry_seconds
+        return retry_seconds
+
+    @staticmethod
+    def _decode_device_info(params: bytes) -> DeviceInfo:
+        if len(params) < 32:
+            raise ValueError("版本响应少于 32 字节")
+        values = list(struct.unpack("<IIffIIII", params[:32]))
+        values.extend(
+            struct.unpack("<II", params[32:40]) if len(params) >= 40 else (0, 0)
+        )
+        pixel_count = values[5]
+        start_pixel = values[6]
+        valid_pixel = values[7]
+        if not math.isfinite(values[2]) or not math.isfinite(values[3]):
+            raise ValueError("硬件或固件版本号不是有效数值")
+        if pixel_count <= 0 or pixel_count > 65_536:
+            raise ValueError(f"像素总数异常（{pixel_count}）")
+        if valid_pixel <= 0:
+            raise ValueError("有效像素数必须大于 0")
+        if start_pixel + valid_pixel > pixel_count:
+            raise ValueError(
+                f"有效像素范围 {start_pixel}+{valid_pixel} 超出总像素 {pixel_count}"
+            )
+        return DeviceInfo(
+            name=values[0],
+            dev_type=values[1],
+            hw_ver=values[2],
+            fw_ver=values[3],
+            serial_num=values[4],
+            pixel_count=pixel_count,
+            start_pixel=start_pixel,
+            valid_pixel=valid_pixel,
+            pos_time_min=values[8],
+            pos_time_max=values[9],
+        )
 
     def _schedule_reconnect(self, device_id: int, immediate: bool = False):
         if device_id not in self.devices or device_id in self._removing:

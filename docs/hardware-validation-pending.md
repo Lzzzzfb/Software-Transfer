@@ -1,12 +1,13 @@
 # 实机联调与发布环境待验证清单
 
-状态：COM14/COM17/COM18 的协议、参数、采集、存储和程序化重连已验证。详见 [2026-07-15 三机联调报告](hardware-validation-report-2026-07-15.md)。本文仅保留未具备现场条件的项目。
+状态：COM14/COM17/COM18 的协议、参数、采集、存储、程序化重连和 PySide6 自动识别已验证，COM10 非光谱仪端口可由协议握手自动排除。详见 [2026-07-22 PySide6 自动识别联调报告](hardware-validation-report-2026-07-22.md)。本文仅保留未具备现场条件的项目。
 
 ## 1. 协议和连接
 
 - [x] 确认 40 字节版本参数、U16LE 实机包号、U16BE 像素及两种数据帧格式兼容。
 - [x] 三台设备 27 组设置命令均返回 `0x61` 并回读一致。
 - [x] 程序化关闭串口后的 1 秒退避重连验证。
+- [x] Python 3.13/PySide6 6.11 下自动排除无协议响应的 COM10，并识别 COM14/COM17/COM18。
 - [ ] 实际拔插 USB，验证 Windows 设备移除/恢复事件。
 
 ## 2. 参数与校准
@@ -33,7 +34,8 @@
 
 ## 5. 64 位发布
 
-- 当前开发机没有 PySide6，尚未实际执行 PyInstaller；需在 Python 3.12 64 位正式环境运行 `python -m PyInstaller --clean --noconfirm spectrometer.spec`。
+- 当前项目 `.venv` 已安装并验证 PySide6 6.11；尚未安装 PyInstaller，也未生成正式发布目录。
+- 需在确定的 64 位发布环境运行 `python -m PyInstaller --clean --noconfirm spectrometer.spec`。
 - 在干净 Windows 10/11 64 位机器确认 Qt 平台插件、Qt SerialPort、CSV/Excel、中文路径和安全退出。
 - 确认程序关闭后无残留串口线程、存储线程或 `.part`（存在导出错误时除外）。
 

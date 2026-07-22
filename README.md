@@ -5,6 +5,7 @@
 ## 已实现能力
 
 - 协议普通帧与 `0x80` 数据帧分别按正确长度拆包。
+- 自动扫描会发送版本查询进行协议握手，只有返回合法设备信息的串口才会显示并参与采集。
 - `nPacketNumb` 自动兼容实机 U16LE 与函数表 U32LE，像素按 U16 大端解析。
 - 最多按当前目标同时使用约 4 台设备；显示约 30 fps，存储通道接收每一帧。
 - 实机 16 位与新格式 24 位帧序号缺口、重复、乱序和回绕诊断。
@@ -35,7 +36,7 @@ py -3.12 -m venv .venv
 .venv\Scripts\python main.py
 ```
 
-只连接指定串口（推荐用于多个同型 USB 串口并存的电脑）：
+排查串口问题时也可临时限制扫描范围；正常使用无需指定端口：
 
 ```powershell
 .venv\Scripts\python main.py --ports COM14 COM17 COM18
@@ -56,7 +57,7 @@ python -m compileall -q main.py spectrometer
 python -m PyInstaller --clean --noconfirm spectrometer.spec
 ```
 
-输出位于 `dist/ZGCAI_Spectrometer_Workstation/`。当前开发机未安装 PySide6，因此打包执行留到发布环境验证；配置已迁移为 PySide6，并显式包含 Qt SerialPort。
+输出位于 `dist/ZGCAI_Spectrometer_Workstation/`。源代码已在 Python 3.13 64 位、PySide6 6.11 环境通过三台实机测试；正式发布包仍需在目标 Windows 环境执行打包验证。配置已显式包含 Qt SerialPort。
 
 ## 协议要点
 
@@ -80,4 +81,4 @@ nLength = 6 + 2*N，物理总长度 = 3 + nLength
 `nLength=3+2*N`、物理总长度为 `4+nLength`。解析器按 `nLength`
 奇偶性自动兼容两种格式。
 
-详细操作见 [用户指南](docs/user-guide.md)，实机结果见 [2026-07-15 三机联调报告](docs/hardware-validation-report-2026-07-15.md)，余下现场项见 [实机联调清单](docs/hardware-validation-pending.md)。
+详细操作见 [用户指南](docs/user-guide.md)，实机结果见 [2026-07-22 PySide6 自动识别联调报告](docs/hardware-validation-report-2026-07-22.md)，余下现场项见 [实机联调清单](docs/hardware-validation-pending.md)。
