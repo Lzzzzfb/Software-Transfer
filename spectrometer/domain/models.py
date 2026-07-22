@@ -6,7 +6,13 @@ from typing import Optional, Tuple
 import time
 import uuid
 
-from .enums import AcquisitionMode, DeviceState, StorageFormat, SyncMode
+from .enums import (
+    AcquisitionMode,
+    AcquisitionOwner,
+    DeviceState,
+    StorageFormat,
+    SyncMode,
+)
 
 
 @dataclass(frozen=True)
@@ -156,5 +162,50 @@ class AcquisitionSession:
             session_id=uuid.uuid4().hex,
             started_at=datetime.now(timezone.utc).isoformat(),
             device_ids=tuple(device_ids),
+            **kwargs,
+        )
+
+
+@dataclass(frozen=True)
+class AcquisitionRequest:
+    """一次采集动作的不可变控制快照。"""
+
+    task_id: str
+    started_at: str
+    owner: AcquisitionOwner
+    device_ids: Tuple[int, ...]
+    mode: AcquisitionMode = AcquisitionMode.CONTINUOUS
+    sync_mode: SyncMode = SyncMode.INDEPENDENT
+    auto_store: bool = False
+    storage_format: StorageFormat = StorageFormat.CSV_EXCEL
+    batch_size: int = 500
+    reference_kind: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.task_id:
+            raise ValueError("采集任务必须具有 task_id")
+        if not self.device_ids:
+            raise ValueError("采集请求至少需要一台设备")
+        if len(set(self.device_ids)) != len(self.device_ids):
+            raise ValueError("采集请求不能包含重复设备")
+        if any(device_id < 0 for device_id in self.device_ids):
+            raise ValueError("device_id 不能为负数")
+        if not 1 <= self.batch_size <= 1000:
+            raise ValueError("批量帧数范围为 1–1000")
+        if self.owner is AcquisitionOwner.CALIBRATION:
+            if self.reference_kind not in ("background", "reference"):
+                raise ValueError("校准任务必须指定 background 或 reference")
+            if self.mode is not AcquisitionMode.SINGLE:
+                raise ValueError("背景和参考必须使用单次采集")
+        elif self.reference_kind is not None:
+            raise ValueError("普通采集请求不能指定 reference_kind")
+
+    @classmethod
+    def create(cls, owner, device_ids, **kwargs) -> "AcquisitionRequest":
+        return cls(
+            task_id=uuid.uuid4().hex,
+            started_at=datetime.now().astimezone().isoformat(),
+            owner=AcquisitionOwner(owner),
+            device_ids=tuple(int(device_id) for device_id in device_ids),
             **kwargs,
         )

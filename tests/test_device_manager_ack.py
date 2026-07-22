@@ -37,3 +37,53 @@ def test_real_firmware_init_ack_with_cmd_01_is_recognized_as_compatibility_respo
     assert diagnostics and "Cmd=0x01" in diagnostics[-1]
     assert errors == []
     assert not manager.devices[0].initialized
+
+
+def test_set_command_emits_one_successful_command_result_after_ack():
+    manager = DeviceManager()
+    manager.devices[0] = SpectrometerDevice(0, "COM_TEST")
+    results = []
+    manager.command_completed.connect(
+        lambda device_id, cmd, success, params: results.append(
+            (device_id, cmd, success, bytes(params))
+        )
+    )
+
+    manager._on_response(0, CmdCode.START_CONTINUOUS, b"\x60")
+
+    assert results == [(0, int(CmdCode.START_CONTINUOUS), True, b"\x60")]
+    assert manager.devices[0].acquiring
+
+
+def test_set_command_emits_failure_for_missing_status_and_nak():
+    manager = DeviceManager()
+    manager.devices[0] = SpectrometerDevice(0, "COM_TEST")
+    results = []
+    manager.command_completed.connect(
+        lambda device_id, cmd, success, params: results.append(
+            (device_id, cmd, success, bytes(params))
+        )
+    )
+
+    manager._on_response(0, CmdCode.SET_TRIG_MODE, b"")
+    manager._on_response(0, CmdCode.STOP_ACQUISITION, b"\x70")
+
+    assert results == [
+        (0, int(CmdCode.SET_TRIG_MODE), False, b""),
+        (0, int(CmdCode.STOP_ACQUISITION), False, b"\x70"),
+    ]
+
+
+def test_compatible_init_ack_reports_original_init_command():
+    manager = DeviceManager()
+    manager.devices[0] = SpectrometerDevice(0, "COM_TEST")
+    results = []
+    manager.command_completed.connect(
+        lambda device_id, cmd, success, params: results.append(
+            (device_id, cmd, success, bytes(params))
+        )
+    )
+
+    manager._on_response(0, CmdCode.GET_VERSION, b"\x61")
+
+    assert results == [(0, int(CmdCode.DEVICE_INIT), True, b"\x61")]

@@ -16,6 +16,37 @@ class AcquisitionMode(str, Enum):
     CONTINUOUS = "continuous"
 
 
+class AcquisitionOwner(str, Enum):
+    GLOBAL = "global"
+    LOCAL = "local"
+    CALIBRATION = "calibration"
+
+
+class ControlState(str, Enum):
+    IDLE = "idle"
+    CONFIGURING = "configuring"
+    STARTING = "starting"
+    ACQUIRING = "acquiring"
+    STOPPING = "stopping"
+    FINALIZING = "finalizing"
+    ERROR = "error"
+
+
+_CONTROL_STATE_LABELS = {
+    ControlState.IDLE: "空闲",
+    ControlState.CONFIGURING: "正在配置",
+    ControlState.STARTING: "正在启动",
+    ControlState.ACQUIRING: "采集中",
+    ControlState.STOPPING: "正在停止",
+    ControlState.FINALIZING: "正在保存",
+    ControlState.ERROR: "错误",
+}
+
+
+def control_state_label(state: ControlState) -> str:
+    return _CONTROL_STATE_LABELS[ControlState(state)]
+
+
 class SyncMode(str, Enum):
     INDEPENDENT = "independent"
     SOFTWARE = "software"

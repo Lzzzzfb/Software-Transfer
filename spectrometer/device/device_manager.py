@@ -27,6 +27,7 @@ class DeviceManager(QtCore.QObject):
     diagnostic_event = Signal(str)
     sync_started = Signal(object)
     sync_configuration_failed = Signal(str)
+    command_completed = Signal(int, int, bool, object)
 
     def __init__(self):
         super().__init__()
@@ -490,21 +491,27 @@ class DeviceManager(QtCore.QObject):
         # be a version response, so it is safe to recognize this deviation.
         if (cmd == CmdCode.GET_VERSION and len(params) == 1
                 and (params[0] & 0xE0) == 0x60):
-            if check_status(params[0]):
+            success = not bool(check_status(params[0]))
+            if not success:
                 self.error_occurred.emit(device_id, "设备初始化返回失败")
             else:
                 self.diagnostic_event.emit(
                     f"设备 {device_id} 已接收兼容型初始化 ACK（响应 Cmd=0x01）"
                 )
+            self.command_completed.emit(
+                device_id, int(CmdCode.DEVICE_INIT), success, bytes(params)
+            )
             if device_id in self._announced_devices:
                 self.device_updated.emit(device_id)
             return
         is_set = cmd == CmdCode.DEVICE_INIT or 0x20 <= cmd <= 0x2C or 0x50 <= cmd <= 0x54
         if is_set:
+            response_params = bytes(params)
             if not params:
                 if cmd == CmdCode.SET_TRIG_MODE:
                     self._complete_sync_trigger_mode(device_id, False)
                 self.error_occurred.emit(device_id, f"命令 0x{cmd:02X} 响应缺少状态")
+                self.command_completed.emit(device_id, int(cmd), False, response_params)
                 return
             if check_status(params[0]):
                 if cmd == CmdCode.SET_TRIG_MODE:
@@ -513,6 +520,7 @@ class DeviceManager(QtCore.QObject):
                     self._acquisition_requested.discard(device_id)
                 self._pending_updates.pop((device_id, int(cmd)), None)
                 self.error_occurred.emit(device_id, f"命令 0x{cmd:02X} 返回失败")
+                self.command_completed.emit(device_id, int(cmd), False, response_params)
                 return
             apply = self._pending_updates.pop((device_id, int(cmd)), None)
             if apply:
@@ -525,6 +533,7 @@ class DeviceManager(QtCore.QObject):
             elif cmd == CmdCode.STOP_ACQUISITION:
                 self._acquisition_requested.discard(device_id)
                 device.acquiring = False
+            self.command_completed.emit(device_id, int(cmd), True, response_params)
 
         if cmd == CmdCode.GET_VERSION and len(params) >= 32:
             try:
