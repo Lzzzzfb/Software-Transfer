@@ -33,6 +33,17 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert not hasattr(window.sidebar, "baud_combo")
     assert "history" not in window.ribbon.buttons
     assert "acquisition" in window.ribbon.buttons
+    context_labels = {
+        button.text()
+        for button in window.context_bar.findChildren(QtWidgets.QPushButton)
+    }
+    history_labels = {
+        button.text()
+        for button in window.history_viewer.findChildren(QtWidgets.QPushButton)
+    }
+    assert "打开文件" in context_labels
+    assert "打开历史" not in context_labels
+    assert "打开 CSV / Excel" in history_labels
     assert all(card.enabled.text() == "参与总控" for card in window.sidebar.cards.values())
     assert all(card.acquisition_button.text() == "开始" for card in window.sidebar.cards.values())
     window.close(); app.processEvents()

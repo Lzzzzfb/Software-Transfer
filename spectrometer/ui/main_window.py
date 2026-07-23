@@ -110,7 +110,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_context_bar(self):
         bar = QtWidgets.QWidget(); bar.setObjectName("contextBar")
         layout = QtWidgets.QHBoxLayout(bar); layout.setContentsMargins(12, 5, 12, 5)
-        open_button = QtWidgets.QPushButton("打开历史"); open_button.clicked.connect(self.history_viewer_open); layout.addWidget(open_button)
+        open_button = QtWidgets.QPushButton("打开文件"); open_button.clicked.connect(self.history_viewer_open); layout.addWidget(open_button)
         recover_button = QtWidgets.QPushButton("恢复缓存"); recover_button.clicked.connect(self.recover_spool); layout.addWidget(recover_button)
         save_image = QtWidgets.QPushButton("保存图片"); save_image.clicked.connect(self.save_plot_image); layout.addWidget(save_image)
         layout.addSpacing(16); layout.addWidget(QtWidgets.QLabel("处理"))
