@@ -27,6 +27,7 @@ from .device_sidebar import DeviceSidebar
 from .device_parameters import DeviceParametersDialog
 from .diagnostics import DiagnosticsPanel
 from .history_viewer import HistoryViewer
+from .input_controls import NoWheelComboBox
 from .plot_widget import SpectrumPlotWidget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
@@ -97,14 +98,14 @@ class MainWindow(QtWidgets.QMainWindow):
         recover_button = QtWidgets.QPushButton("恢复缓存"); recover_button.clicked.connect(self.recover_spool); layout.addWidget(recover_button)
         save_image = QtWidgets.QPushButton("保存图片"); save_image.clicked.connect(self.save_plot_image); layout.addWidget(save_image)
         layout.addSpacing(16); layout.addWidget(QtWidgets.QLabel("处理"))
-        self.display_mode = QtWidgets.QComboBox()
+        self.display_mode = NoWheelComboBox()
         for label, value in [("原始强度", "raw"), ("扣背景", "dark_subtract"), ("吸光度", "absorbance"), ("自定义公式", "custom")]:
             self.display_mode.addItem(label, value)
         self.display_mode.currentIndexChanged.connect(self._display_mode_changed); layout.addWidget(self.display_mode)
         self.formula_edit = QtWidgets.QLineEdit(); self.formula_edit.setPlaceholderText("例：-log10((I-Idark)/(I0-Idark))")
         self.formula_edit.setMinimumWidth(280); self.formula_edit.setVisible(False); self.formula_edit.editingFinished.connect(self._validate_formula)
         layout.addWidget(self.formula_edit, 1)
-        layout.addWidget(QtWidgets.QLabel("X 轴")); self.x_axis = QtWidgets.QComboBox()
+        layout.addWidget(QtWidgets.QLabel("X 轴")); self.x_axis = NoWheelComboBox()
         self.x_axis.addItem("像素序号", "pixel"); self.x_axis.addItem("波长 (nm)", "wavelength"); layout.addWidget(self.x_axis)
         self.auto_range = QtWidgets.QCheckBox("自动缩放"); self.auto_range.setChecked(True)
         self.auto_range.toggled.connect(self.plot_widget.enable_auto_range); layout.addWidget(self.auto_range)
@@ -112,26 +113,18 @@ class MainWindow(QtWidgets.QMainWindow):
         return bar
 
     def _connect_signals(self):
-        self.ribbon.start_requested.connect(self.start_acquisition)
-        self.ribbon.stop_requested.connect(self.stop_acquisition)
+        self.ribbon.acquisition_requested.connect(self._toggle_acquisition)
         self.ribbon.background_requested.connect(self.capture_background)
         self.ribbon.reference_requested.connect(self.capture_reference)
         self.ribbon.sync_mode_changed.connect(self._sync_mode_changed)
         self.ribbon.discover_requested.connect(self.scan_devices)
-        self.ribbon.new_history_requested.connect(lambda: self.history_viewer.new_page())
         self.ribbon.settings_requested.connect(self.open_settings)
         self.ribbon.help_requested.connect(self.show_help)
         self.ribbon.exit_requested.connect(self.close)
         self.sidebar.integration_changed.connect(self.device_manager.set_integration_time)
         self.sidebar.enabled_changed.connect(self._device_enabled_changed)
         self.sidebar.parameters_requested.connect(self.open_device_parameters)
-        self.sidebar.connect_requested.connect(
-            lambda port, baud: self.device_manager.add_and_connect(
-                port, baud, force=True
-            )
-        )
         self.sidebar.disconnect_requested.connect(self.device_manager.remove_device)
-        self.sidebar.refresh_button.clicked.connect(self.scan_devices)
         self.device_manager.device_added.connect(self._device_changed)
         self.device_manager.device_connected.connect(self._device_connected)
         self.device_manager.device_updated.connect(self._device_changed)
@@ -147,7 +140,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sidebar.batch_size.setValue(self.settings["batch_size"])
         index = self.sidebar.storage_format.findData(self.settings["storage_format"])
         self.sidebar.storage_format.setCurrentIndex(max(0, index))
-        self.sidebar.auto_store.setChecked(bool(self.settings["auto_store"]))
+        # 自动存储是一次采集的主动选择，每次启动均保持未勾选。
+        self.sidebar.auto_store.setChecked(False)
         self.plot_widget.set_line_width(self.settings["line_width"])
         index = self.display_mode.findData(self.settings["display_mode"]); self.display_mode.setCurrentIndex(max(0, index))
         index = self.x_axis.findData(self.settings["x_axis"]); self.x_axis.setCurrentIndex(max(0, index))
@@ -155,7 +149,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def scan_devices(self):
         if self.simulation: return
         ports = DeviceFinder.list_available_ports()
-        self.sidebar.set_available_ports([port["port_name"] for port in ports])
         existing = {device.port_name for device in self.device_manager.devices.values()}
         for port in ports:
             allowed = not self.port_allowlist or port["port_name"].upper() in self.port_allowlist
@@ -242,6 +235,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.device_manager.prepare_sync_acquisition(continuous):
             self._close_storage(); return
         self._sim_running = self.simulation
+        self.ribbon.set_acquisition_state("configuring")
         if sync_mode in ("hard_internal", "hard_external"):
             self.status_panel.state_label.setText("正在配置硬同步触发模式…")
 
@@ -255,6 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             state = "连续采集中" if continuous else "单次采集中"
         self.status_panel.state_label.setText(state)
+        self.ribbon.set_acquisition_state("acquiring")
         self._log(f"开始{'连续' if continuous else '单次'}采集，共 {len(device_ids)} 台设备")
 
     def _sync_configuration_failed(self, message):
@@ -262,13 +257,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sim_running = False
         self.device_manager.stop_all()
         self._close_storage()
+        self.ribbon.set_acquisition_state("idle")
         self.status_panel.state_label.setText("同步配置失败")
 
     def stop_acquisition(self):
         self._sim_running = False; self.device_manager.stop_all()
+        self.ribbon.set_acquisition_state("stopping")
         self.status_panel.state_label.setText("正在排空存储队列…")
         self._close_storage(); self.status_panel.state_label.setText("已停止")
+        self.ribbon.set_acquisition_state("idle")
         self._log("采集停止，存储队列已排空")
+
+    def _toggle_acquisition(self):
+        if self.device_manager.acquisition_active or self._sim_running:
+            self.stop_acquisition()
+        else:
+            self.start_acquisition()
 
     def _start_storage(self, devices):
         sync_value = self.ribbon.sync_combo.currentData()
@@ -466,7 +470,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self._sim_running = False
         self.device_manager.stop_all(); self._close_storage()
-        self.settings.update({"batch_size": self.sidebar.batch_size.value(), "storage_format": self.sidebar.storage_format.currentData(), "auto_store": self.sidebar.auto_store.isChecked(), "display_mode": self.display_mode.currentData(), "x_axis": self.x_axis.currentData()})
+        self.settings.update({"batch_size": self.sidebar.batch_size.value(), "storage_format": self.sidebar.storage_format.currentData(), "auto_store": False, "display_mode": self.display_mode.currentData(), "x_axis": self.x_axis.currentData()})
         try: self.settings_service.save(self.settings)
         except OSError as exc: self._log(f"设置保存失败: {exc}", "WARN")
         self.device_manager.remove_all_devices(); event.accept()

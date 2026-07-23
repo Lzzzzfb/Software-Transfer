@@ -1,4 +1,5 @@
 import os
+import json
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -26,8 +27,30 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert window.plot_widget.objectName() == "spectrumPlot"
     assert window.sidebar.batch_size.value() == 500
     assert window.sidebar.storage_format.currentData() == "csv_excel"
+    assert not window.sidebar.auto_store.isChecked()
     assert len(window.sidebar.cards) == 4
+    assert not hasattr(window.sidebar, "port_combo")
+    assert not hasattr(window.sidebar, "baud_combo")
+    assert "history" not in window.ribbon.buttons
+    assert "acquisition" in window.ribbon.buttons
+    assert all(card.enabled.text() == "参与总控" for card in window.sidebar.cards.values())
+    assert all(card.acquisition_button.text() == "开始" for card in window.sidebar.cards.values())
     window.close(); app.processEvents()
+
+
+def test_auto_store_is_unchecked_even_if_previous_settings_enabled_it(tmp_path):
+    app = application()
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"auto_store": True}), encoding="utf-8")
+    window = MainWindow(
+        simulation=True,
+        auto_start_simulation=False,
+        settings_path=settings_path,
+    )
+    assert not window.sidebar.auto_store.isChecked()
+    window.close(); app.processEvents()
+    stored = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert stored["auto_store"] is False
 
 
 def test_custom_plot_runs_without_pyqtgraph_and_preserves_manual_range():

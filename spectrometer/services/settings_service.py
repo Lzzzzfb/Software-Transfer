@@ -9,7 +9,7 @@ DEFAULT_SETTINGS = {
     "storage_path": "data",
     "batch_size": 500,
     "storage_format": "csv_excel",
-    "auto_store": True,
+    "auto_store": False,
     "display_mode": "raw",
     "x_axis": "pixel",
     "line_width": 1.4,

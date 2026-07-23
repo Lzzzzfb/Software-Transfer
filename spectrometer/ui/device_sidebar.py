@@ -1,6 +1,7 @@
 """左侧总控和设备卡片。"""
 
 from ..qt import QtCore, QtWidgets, Signal
+from .input_controls import DirectSpinBox, NoWheelComboBox
 
 
 class DeviceCard(QtWidgets.QFrame):
@@ -9,6 +10,9 @@ class DeviceCard(QtWidgets.QFrame):
     integration_changed = Signal(int, int)
     parameters_requested = Signal(int)
     disconnect_requested = Signal(int)
+    acquisition_requested = Signal(int)
+    background_requested = Signal(int)
+    reference_requested = Signal(int)
 
     def __init__(self, device, parent=None):
         super().__init__(parent)
@@ -21,7 +25,8 @@ class DeviceCard(QtWidgets.QFrame):
         self.radio.clicked.connect(lambda: self.selected.emit(self.device_id))
         top.addWidget(self.radio)
         self.title = QtWidgets.QLabel(); self.title.setObjectName("deviceTitle"); top.addWidget(self.title, 1)
-        self.enabled = QtWidgets.QCheckBox("启用"); self.enabled.setChecked(True)
+        self.enabled = QtWidgets.QCheckBox("参与总控"); self.enabled.setChecked(True)
+        self.enabled.setToolTip("仅决定顶部总控是否包含本设备，不影响本卡片单独采集")
         self.enabled.toggled.connect(lambda value: self.enabled_changed.emit(self.device_id, value))
         top.addWidget(self.enabled)
         disconnect = QtWidgets.QToolButton(); disconnect.setText("×"); disconnect.setToolTip("断开并移除设备")
@@ -29,7 +34,7 @@ class DeviceCard(QtWidgets.QFrame):
         layout.addLayout(top)
         self.details = QtWidgets.QLabel(); self.details.setObjectName("deviceDetails"); layout.addWidget(self.details)
         controls = QtWidgets.QHBoxLayout(); controls.addWidget(QtWidgets.QLabel("积分 µs"))
-        self.integration = QtWidgets.QSpinBox(); self.integration.setRange(1, 99_999_999)
+        self.integration = DirectSpinBox(); self.integration.setRange(1, 99_999_999)
         self.integration.setSingleStep(1000); self.integration.setValue(device.integration_time_us)
         controls.addWidget(self.integration, 1)
         apply_button = QtWidgets.QPushButton("应用")
@@ -38,6 +43,24 @@ class DeviceCard(QtWidgets.QFrame):
         parameters = QtWidgets.QPushButton("设备参数与校准…")
         parameters.clicked.connect(lambda: self.parameters_requested.emit(self.device_id))
         layout.addWidget(parameters)
+        acquisition_controls = QtWidgets.QHBoxLayout()
+        self.acquisition_button = QtWidgets.QPushButton("开始")
+        self.acquisition_button.setObjectName("deviceAcquisitionButton")
+        self.acquisition_button.clicked.connect(
+            lambda: self.acquisition_requested.emit(self.device_id)
+        )
+        background_button = QtWidgets.QPushButton("背景")
+        background_button.clicked.connect(
+            lambda: self.background_requested.emit(self.device_id)
+        )
+        reference_button = QtWidgets.QPushButton("参考")
+        reference_button.clicked.connect(
+            lambda: self.reference_requested.emit(self.device_id)
+        )
+        acquisition_controls.addWidget(self.acquisition_button, 2)
+        acquisition_controls.addWidget(background_button, 1)
+        acquisition_controls.addWidget(reference_button, 1)
+        layout.addLayout(acquisition_controls)
         self.update_device(device)
 
     def update_device(self, device):
@@ -54,14 +77,28 @@ class DeviceCard(QtWidgets.QFrame):
         self.radio.setChecked(selected); self.setProperty("selected", selected)
         self.style().unpolish(self); self.style().polish(self)
 
+    def set_acquisition_state(self, state: str):
+        labels = {
+            "idle": "开始",
+            "configuring": "停止",
+            "armed": "停止",
+            "acquiring": "停止",
+            "stopping": "停止中…",
+            "finalizing": "保存中…",
+            "error": "开始",
+        }
+        self.acquisition_button.setText(labels.get(str(state), "开始"))
+
 
 class DeviceSidebar(QtWidgets.QWidget):
     selection_changed = Signal(int)
     integration_changed = Signal(int, int)
     enabled_changed = Signal(int, bool)
     parameters_requested = Signal(int)
-    connect_requested = Signal(str, int)
     disconnect_requested = Signal(int)
+    acquisition_requested = Signal(int)
+    background_requested = Signal(int)
+    reference_requested = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -69,28 +106,18 @@ class DeviceSidebar(QtWidgets.QWidget):
         self.cards = {}; self.selected_device_id = None
         layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(8, 8, 8, 8)
         title = QtWidgets.QLabel("设备与批量存储"); title.setObjectName("sectionTitle"); layout.addWidget(title)
-        connection_box = QtWidgets.QFrame(); connection_box.setObjectName("storageBox")
-        connection_layout = QtWidgets.QGridLayout(connection_box); connection_layout.setContentsMargins(10, 8, 10, 8)
-        connection_layout.addWidget(QtWidgets.QLabel("串口"), 0, 0)
-        self.port_combo = QtWidgets.QComboBox(); connection_layout.addWidget(self.port_combo, 0, 1)
-        self.refresh_button = QtWidgets.QPushButton("刷新"); connection_layout.addWidget(self.refresh_button, 0, 2)
-        connection_layout.addWidget(QtWidgets.QLabel("波特率"), 1, 0)
-        self.baud_combo = QtWidgets.QComboBox(); self.baud_combo.setEditable(True)
-        self.baud_combo.addItems(["115200", "230400", "460800", "921600"]); connection_layout.addWidget(self.baud_combo, 1, 1)
-        connect_button = QtWidgets.QPushButton("手动连接"); connect_button.clicked.connect(self._manual_connect)
-        connection_layout.addWidget(connect_button, 1, 2); layout.addWidget(connection_box)
         storage_box = QtWidgets.QFrame(); storage_box.setObjectName("storageBox")
         form = QtWidgets.QFormLayout(storage_box); form.setContentsMargins(10, 8, 10, 8)
-        self.acquisition_mode = QtWidgets.QComboBox(); self.acquisition_mode.addItems(["连续采集", "单次采集"])
+        self.acquisition_mode = NoWheelComboBox(); self.acquisition_mode.addItems(["连续采集", "单次采集"])
         form.addRow("采集方式", self.acquisition_mode)
-        self.batch_size = QtWidgets.QSpinBox(); self.batch_size.setRange(1, 1000); self.batch_size.setValue(500)
+        self.batch_size = DirectSpinBox(); self.batch_size.setRange(1, 1000); self.batch_size.setValue(500)
         form.addRow("每批帧数", self.batch_size)
-        self.storage_format = QtWidgets.QComboBox()
+        self.storage_format = NoWheelComboBox()
         self.storage_format.addItem("CSV + Excel", "csv_excel")
         self.storage_format.addItem("仅 CSV", "csv")
         self.storage_format.addItem("仅 Excel", "excel")
         form.addRow("存储格式", self.storage_format)
-        self.auto_store = QtWidgets.QCheckBox("采集时自动批量存储"); self.auto_store.setChecked(True)
+        self.auto_store = QtWidgets.QCheckBox("采集时自动批量存储"); self.auto_store.setChecked(False)
         form.addRow(self.auto_store); layout.addWidget(storage_box)
         self.scroll = QtWidgets.QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         container = QtWidgets.QWidget(); self.card_layout = QtWidgets.QVBoxLayout(container)
@@ -105,6 +132,9 @@ class DeviceSidebar(QtWidgets.QWidget):
             card.integration_changed.connect(self.integration_changed)
             card.parameters_requested.connect(self.parameters_requested)
             card.disconnect_requested.connect(self.disconnect_requested)
+            card.acquisition_requested.connect(self.acquisition_requested)
+            card.background_requested.connect(self.background_requested)
+            card.reference_requested.connect(self.reference_requested)
             self.card_layout.insertWidget(self.card_layout.count() - 1, card)
         else:
             card.update_device(device)
@@ -125,16 +155,7 @@ class DeviceSidebar(QtWidgets.QWidget):
         for key, card in self.cards.items(): card.set_selected(key == device_id)
         self.selection_changed.emit(device_id)
 
-    def set_available_ports(self, port_names):
-        current = self.port_combo.currentText()
-        self.port_combo.blockSignals(True); self.port_combo.clear(); self.port_combo.addItems(port_names)
-        index = self.port_combo.findText(current)
-        if index >= 0: self.port_combo.setCurrentIndex(index)
-        self.port_combo.blockSignals(False)
-
-    def _manual_connect(self):
-        port = self.port_combo.currentText().strip()
-        if not port: return
-        try: baud = int(self.baud_combo.currentText())
-        except ValueError: baud = 115200
-        self.connect_requested.emit(port, baud)
+    def set_device_control_state(self, device_id: int, state: str):
+        card = self.cards.get(device_id)
+        if card:
+            card.set_acquisition_state(state)
