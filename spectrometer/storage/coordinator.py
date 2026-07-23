@@ -9,6 +9,7 @@ from typing import Callable, Dict, Mapping, Optional
 from ..domain.enums import StorageFormat
 from ..domain.models import AcquisitionSession, SpectrumFrame
 from .csv_exporter import export_device_csv
+from .naming import unique_path
 from .spool import SpoolWriter
 from .xlsx_exporter import export_workbook
 
@@ -26,6 +27,8 @@ class BatchStorageCoordinator:
         wavelengths_by_device: Mapping[int, tuple] = None,
         device_labels: Mapping[int, str] = None,
         device_metadata: Mapping[int, Mapping] = None,
+        filename_stem: str = "",
+        device_filename_stems: Mapping[int, str] = None,
         warning_callback: Optional[Callable[[str], None]] = None,
         controlled_stop_callback: Optional[Callable[[str], None]] = None,
     ):
@@ -35,6 +38,8 @@ class BatchStorageCoordinator:
         self.wavelengths_by_device = dict(wavelengths_by_device or {})
         self.device_labels = dict(device_labels or {})
         self.device_metadata = dict(device_metadata or {})
+        self.filename_stem = str(filename_stem or "")
+        self.device_filename_stems = dict(device_filename_stems or {})
         self.warning_callback = warning_callback
         self.controlled_stop_callback = controlled_stop_callback
         self.capacity = session.batch_size * 4 * max(1, len(session.device_ids))
@@ -160,12 +165,21 @@ class BatchStorageCoordinator:
     def _export_batch(self, batch: Dict[int, list]) -> None:
         self._batch_index += 1
         prefix = f"{self.session.session_id}_batch_{self._batch_index:04d}"
+        batch_token = f"B{self._batch_index:04d}"
         if self.session.storage_format in (StorageFormat.CSV, StorageFormat.CSV_EXCEL):
             for device_id, frames in batch.items():
                 label = self._filename_token(
                     self.device_labels.get(device_id, f"device_{device_id}")
                 )
-                path = self.output_directory / f"{prefix}_{label}.csv"
+                if self.filename_stem:
+                    stem = self.device_filename_stems.get(
+                        device_id, f"{self.filename_stem}_{label}"
+                    )
+                    path = unique_path(
+                        self.output_directory / f"{stem}_{batch_token}.csv"
+                    )
+                else:
+                    path = self.output_directory / f"{prefix}_{label}.csv"
                 export_device_csv(
                     path,
                     device_id,
@@ -175,7 +189,13 @@ class BatchStorageCoordinator:
                 )
                 self.exported_files.append(path)
         if self.session.storage_format in (StorageFormat.EXCEL, StorageFormat.CSV_EXCEL):
-            path = self.output_directory / f"{prefix}.xlsx"
+            if self.filename_stem:
+                path = unique_path(
+                    self.output_directory
+                    / f"{self.filename_stem}_{batch_token}.xlsx"
+                )
+            else:
+                path = self.output_directory / f"{prefix}.xlsx"
             export_workbook(
                 path,
                 batch,

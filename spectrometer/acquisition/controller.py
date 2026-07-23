@@ -80,6 +80,14 @@ class AcquisitionController(QtCore.QObject):
             self.device_manager.device_removed.connect(self._on_device_changed)
         if storage_manager is not None:
             storage_manager.session_closed.connect(self._on_storage_closed)
+            if hasattr(storage_manager, "controlled_stop_requested"):
+                storage_manager.controlled_stop_requested.connect(
+                    self._on_storage_stop_requested
+                )
+            if hasattr(storage_manager, "warning_event"):
+                storage_manager.warning_event.connect(
+                    lambda task_id, message: self.diagnostic_event.emit(message)
+                )
 
     @property
     def global_state(self) -> ControlState:
@@ -538,6 +546,14 @@ class AcquisitionController(QtCore.QObject):
             for error in errors:
                 self.diagnostic_event.emit(f"存储错误：{error}")
         self._release_task(task, files)
+
+    def _on_storage_stop_requested(self, task_id: str, message: str) -> None:
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        task.failed = True
+        self.diagnostic_event.emit(message)
+        self._request_stop(task)
 
     def _release_task(self, task: _ActiveTask, files=None) -> None:
         task_id = task.request.task_id
