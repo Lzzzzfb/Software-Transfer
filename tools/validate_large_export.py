@@ -91,7 +91,10 @@ def main():
     args = parser.parse_args()
     result = {
         "xlsx": inspect_xlsx(args.xlsx),
-        "csv": {Path(path).stem.rsplit("_", 1)[-1]: inspect_csv(path) for path in args.csv},
+        # A batch normally contains one CSV per device.  Using only the trailing
+        # batch number (for example ``B0001``) silently overwrote the preceding
+        # devices in the validation report, so retain the complete filename.
+        "csv": {Path(path).name: inspect_csv(path) for path in args.csv},
     }
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
     print(rendered)
