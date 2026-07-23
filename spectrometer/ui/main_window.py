@@ -318,14 +318,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._operation_rejected(f"设备正在初始化：{', '.join(pending)}")
             return False
         device_ids = [device.device_id for device in devices]
-        self.acquisition.reset(device_ids)
-        return self.control.start_global(
+        started = self.control.start_global(
             device_ids,
             self._selected_acquisition_mode(),
             SyncMode(self.ribbon.sync_combo.currentData()),
             master_device_id=self.sidebar.selected_device_id,
             **self._storage_options(),
         )
+        if started:
+            self.acquisition.reset(device_ids)
+        return started
 
     def stop_acquisition(self):
         return self.control.stop_global()
@@ -339,14 +341,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_device_acquisition(self, device_id):
         state = self.control.device_state(device_id)
         if state is ControlState.IDLE:
-            self.acquisition.reset([device_id])
-            self.control.start_local(
+            started = self.control.start_local(
                 device_id,
                 self._selected_acquisition_mode(),
                 **self._storage_options(),
             )
+            if started:
+                self.acquisition.reset([device_id])
+            return started
         else:
-            self.control.stop_local(device_id)
+            return self.control.stop_local(device_id)
 
     def _selected_acquisition_mode(self):
         return (

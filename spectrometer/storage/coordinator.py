@@ -127,10 +127,15 @@ class BatchStorageCoordinator:
     def _run(self) -> None:
         while True:
             item = self._queue.get()
-            try:
-                if item is self._stop_token:
+            if item is self._stop_token:
+                try:
                     self._export_remaining()
-                    return
+                except Exception as exc:
+                    self.errors.append(str(exc))
+                finally:
+                    self._queue.task_done()
+                return
+            try:
                 self._buffers[item.device_id].append(item)
                 self._export_complete_batches()
             except Exception as exc:

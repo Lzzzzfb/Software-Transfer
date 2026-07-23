@@ -63,11 +63,14 @@ def test_multiple_local_cards_run_independently_and_block_global_start(tmp_path)
     item = window(tmp_path)
     item._toggle_device_acquisition(0)
     item._toggle_device_acquisition(1)
+    item._simulation_tick()
+    received_before_rejection = item.acquisition.diagnostics(0).received
     assert item.control.device_state(0) is ControlState.ACQUIRING
     assert item.control.device_state(1) is ControlState.ACQUIRING
     assert item.control.global_state is ControlState.IDLE
 
     assert not item.start_acquisition()
+    assert item.acquisition.diagnostics(0).received == received_before_rejection
     assert item.control.device_state(0) is ControlState.ACQUIRING
     assert item.control.device_state(1) is ControlState.ACQUIRING
 

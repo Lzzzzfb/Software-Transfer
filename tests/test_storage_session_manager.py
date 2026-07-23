@@ -30,6 +30,7 @@ def application():
 class FakeCoordinator:
     instances = []
     close_gate = None
+    close_error = None
 
     def __init__(self, output_directory, session, **kwargs):
         self.output_directory = output_directory
@@ -54,6 +55,8 @@ class FakeCoordinator:
     def close(self):
         if self.close_gate is not None:
             self.close_gate.wait(1)
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
 
 
@@ -99,6 +102,7 @@ def wait_until(predicate, timeout=1.0):
 def test_two_local_sessions_route_and_close_independently(tmp_path):
     FakeCoordinator.instances = []
     FakeCoordinator.close_gate = None
+    FakeCoordinator.close_error = None
     manager = StorageSessionManager(
         tmp_path, coordinator_factory=FakeCoordinator
     )
@@ -125,6 +129,7 @@ def test_two_local_sessions_route_and_close_independently(tmp_path):
 
 def test_slow_close_keeps_qt_event_loop_responsive(tmp_path):
     FakeCoordinator.instances = []
+    FakeCoordinator.close_error = None
     gate = threading.Event()
     FakeCoordinator.close_gate = gate
     manager = StorageSessionManager(
@@ -153,6 +158,7 @@ def test_slow_close_keeps_qt_event_loop_responsive(tmp_path):
 
 def test_detached_session_cannot_receive_tail_frames(tmp_path):
     FakeCoordinator.instances = []
+    FakeCoordinator.close_error = None
     gate = threading.Event()
     FakeCoordinator.close_gate = gate
     manager = StorageSessionManager(
@@ -167,6 +173,27 @@ def test_detached_session_cannot_receive_tail_frames(tmp_path):
     gate.set()
     assert wait_until(lambda: not manager.has_session(acquisition.task_id))
     FakeCoordinator.close_gate = None
+
+
+def test_close_error_releases_session_and_is_reported(tmp_path):
+    FakeCoordinator.instances = []
+    FakeCoordinator.close_gate = None
+    FakeCoordinator.close_error = RuntimeError("injected close failure")
+    manager = StorageSessionManager(
+        tmp_path, coordinator_factory=FakeCoordinator
+    )
+    acquisition = request(0)
+    manager.start_session(acquisition, [ready_device(0)])
+    closed = []
+    manager.session_closed.connect(
+        lambda task_id, files, errors: closed.append((task_id, errors))
+    )
+
+    assert manager.close_session(acquisition.task_id)
+    assert wait_until(lambda: bool(closed))
+    assert not manager.has_session(acquisition.task_id)
+    assert closed == [(acquisition.task_id, ["injected close failure"])]
+    FakeCoordinator.close_error = None
 
 
 def test_real_coordinator_exports_human_named_multi_device_files(tmp_path):

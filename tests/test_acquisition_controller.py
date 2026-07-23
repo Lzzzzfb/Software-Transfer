@@ -115,6 +115,53 @@ def test_local_start_always_configures_software_trigger_before_start():
     assert controller.device_state(0) is ControlState.ACQUIRING
 
 
+def test_repeated_start_and_stop_do_not_send_duplicate_commands():
+    manager = FakeDeviceManager()
+    controller = AcquisitionController(manager, tail_quiet_ms=0)
+    assert controller.start_local(0)
+    calls_after_start = list(manager.calls)
+    assert not controller.start_local(0)
+    assert manager.calls == calls_after_start
+    acknowledge_local_start(manager, 0)
+
+    assert controller.stop_local(0)
+    calls_after_stop = list(manager.calls)
+    assert not controller.stop_local(0)
+    assert manager.calls == calls_after_stop
+
+
+def test_configuration_timeout_releases_task_and_late_ack_is_ignored():
+    manager = FakeDeviceManager()
+    controller = AcquisitionController(manager, tail_quiet_ms=0)
+    assert controller.start_local(0)
+    task_id = controller.active_task_for_device(0).task_id
+
+    controller._on_command_timeout(
+        task_id, 0, int(CmdCode.SET_TRIG_MODE)
+    )
+    assert controller.device_state(0) is ControlState.IDLE
+    manager.ack(0, CmdCode.SET_TRIG_MODE)
+    assert not any(call[0] == "start" for call in manager.calls)
+
+
+def test_stale_timeout_from_previous_task_cannot_cancel_new_task():
+    manager = FakeDeviceManager()
+    controller = AcquisitionController(manager, tail_quiet_ms=0)
+    controller.start_local(0)
+    first_task_id = controller.active_task_for_device(0).task_id
+    controller._on_command_timeout(
+        first_task_id, 0, int(CmdCode.SET_TRIG_MODE)
+    )
+    assert controller.start_local(0)
+
+    controller._on_command_timeout(
+        first_task_id, 0, int(CmdCode.SET_TRIG_MODE)
+    )
+    manager.ack(0, CmdCode.SET_TRIG_MODE)
+    assert manager.calls[-1] == ("start", 0, True)
+    assert controller.device_state(0) is ControlState.STARTING
+
+
 def test_multiple_local_devices_can_run_and_stop_independently():
     manager = FakeDeviceManager()
     controller = AcquisitionController(manager, tail_quiet_ms=0)
