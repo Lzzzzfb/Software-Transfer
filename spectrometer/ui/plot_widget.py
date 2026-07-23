@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from ..qt import QtCore, QtGui, QtWidgets, Signal
+from ..qt import QT_API, QtCore, QtGui, QtWidgets, Signal
 
 
 COLOR_PALETTE = [
@@ -28,13 +28,20 @@ def _event_position(event):
     return position() if position else event.pos()
 
 
+def _text_width(metrics, text):
+    method = getattr(metrics, "horizontalAdvance", None) or metrics.width
+    return method(text)
+
+
 class SpectrumPlotWidget(QtWidgets.QWidget):
     user_zoomed = Signal()
+    view_reset = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("spectrumPlot")
         self.setMinimumSize(500, 360)
+        self.setToolTip("左键拖动框选放大；左键双击恢复初始视图；滚轮以光标为中心缩放")
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.device_curves: Dict[int, _Curve] = {}
@@ -42,11 +49,13 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self.baseline_curves: Dict[int, _Curve] = {}
         self.line_width = 1.4
         self.x_label = "像素序号"
-        self.y_label = "强度 (counts)"
+        self.y_label = "强度（计数）"
         self.auto_range_enabled = True
+        self.fixed_y_enabled = False
+        self.fixed_y_range: Optional[Tuple[float, float]] = None
         self._view_range: Optional[Tuple[float, float, float, float]] = None
-        self._drag_origin = None
-        self._drag_range = None
+        self._selection_origin = None
+        self._selection_current = None
         self._cursor_pos = None
         self._show_crosshair = True
 
@@ -62,7 +71,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
             label or f"设备 {device_id}", existing.visible if existing else True,
         )
         if self.auto_range_enabled:
-            self._view_range = self._calculate_bounds()
+            self._view_range = self._initial_view_range()
         self.update()
 
     update_spectrum = update_device_curve
@@ -70,6 +79,8 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
     def remove_device_curve(self, device_id: int):
         self.device_curves.pop(device_id, None)
         self.baseline_curves.pop(device_id, None)
+        if self.auto_range_enabled:
+            self._view_range = self._initial_view_range()
         self.update()
 
     def add_reference_curve(self, x, y, label: str = "对比光谱") -> bool:
@@ -104,7 +115,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self.device_curves.clear()
         self.reference_curves.clear()
         self.baseline_curves.clear()
-        self._view_range = None
+        self._view_range = self._initial_view_range()
         self.update()
 
     def set_axis_labels(self, x_label: str, y_label: str):
@@ -121,14 +132,34 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
             self.update()
 
     def auto_range(self):
-        self.auto_range_enabled = True
-        self._view_range = self._calculate_bounds()
-        self.update()
+        self.reset_initial_view()
 
     def enable_auto_range(self, enabled: bool):
         self.auto_range_enabled = bool(enabled)
         if enabled:
-            self.auto_range()
+            self.reset_initial_view()
+
+    def set_fixed_y_range(self, minimum: float, maximum: float):
+        minimum = float(minimum)
+        maximum = float(maximum)
+        if not np.isfinite(minimum) or not np.isfinite(maximum):
+            raise ValueError("固定 Y 轴范围必须是有限数值")
+        if minimum >= maximum:
+            raise ValueError("固定 Y 轴最小值必须小于最大值")
+        self.fixed_y_enabled = True
+        self.fixed_y_range = (minimum, maximum)
+        self.reset_initial_view()
+
+    def disable_fixed_y(self):
+        self.fixed_y_enabled = False
+        self.fixed_y_range = None
+        self.reset_initial_view()
+
+    def reset_initial_view(self):
+        self.auto_range_enabled = True
+        self._view_range = self._initial_view_range()
+        self.view_reset.emit()
+        self.update()
 
     def set_x_range(self, minimum: float, maximum: float):
         current = self._effective_range()
@@ -172,11 +203,64 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         y_pad = (y_max - y_min) * 0.08
         return (x_min - x_pad, x_max + x_pad, y_min - y_pad, y_max + y_pad)
 
+    def _initial_view_range(self):
+        bounds = self._calculate_bounds()
+        if self.fixed_y_enabled and self.fixed_y_range is not None:
+            return (bounds[0], bounds[1], *self.fixed_y_range)
+        return bounds
+
     def _effective_range(self):
-        return self._view_range or self._calculate_bounds()
+        return self._view_range or self._initial_view_range()
+
+    @staticmethod
+    def format_axis_value(value: float, prefer_integer: bool = False) -> str:
+        value = float(value)
+        if not np.isfinite(value):
+            return "--"
+        if abs(value) < 5e-13:
+            value = 0.0
+        if prefer_integer:
+            rounded = np.floor(value + 0.5) if value >= 0 else np.ceil(value - 0.5)
+            return str(int(rounded))
+        magnitude = abs(value)
+        if 0 < magnitude < 1:
+            decimals = min(12, max(6, int(-np.floor(np.log10(magnitude))) + 3))
+        else:
+            decimals = 6
+        text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+        return "0" if text in ("", "-0") else text
+
+    def _format_x(self, value):
+        return self.format_axis_value(value, self.x_label.startswith("像素"))
+
+    def _format_y(self, value):
+        return self.format_axis_value(value, self.y_label == "强度（计数）")
+
+    def _axis_layout(self, view=None):
+        view = view or self._effective_range()
+        metrics = QtGui.QFontMetrics(self.font())
+        y_labels = [
+            self._format_y(view[2] + index / 6 * (view[3] - view[2]))
+            for index in range(7)
+        ]
+        x_labels = [
+            self._format_x(view[0] + index / 6 * (view[1] - view[0]))
+            for index in range(7)
+        ]
+        widest_x = max(_text_width(metrics, label) for label in x_labels) + 12
+        left = max(
+            68,
+            max(_text_width(metrics, label) for label in y_labels) + 35,
+            widest_x / 2 + 8,
+        )
+        right = max(24, widest_x / 2 + 8)
+        rect = QtCore.QRectF(self.rect()).adjusted(left, 22, -right, -54)
+        x_ticks = max(2, min(7, int(rect.width() // max(1, widest_x)) + 1))
+        y_ticks = max(2, min(7, int(rect.height() // max(1, metrics.height() + 8)) + 1))
+        return rect, x_ticks, y_ticks
 
     def _plot_rect(self):
-        return QtCore.QRectF(self.rect()).adjusted(68, 22, -24, -52)
+        return self._axis_layout()[0]
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
@@ -188,30 +272,49 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
             antialias = QtGui.QPainter.RenderHint.Antialiasing
         painter.setRenderHint(antialias, True)
         painter.fillRect(self.rect(), QtGui.QColor("#FFFFFF"))
-        plot_rect = self._plot_rect()
-        painter.fillRect(plot_rect, QtGui.QColor("#FBFCFE"))
         view = self._effective_range()
-        self._draw_grid(painter, plot_rect, view)
+        plot_rect, x_ticks, y_ticks = self._axis_layout(view)
+        painter.fillRect(plot_rect, QtGui.QColor("#FBFCFE"))
+        self._draw_grid(painter, plot_rect, view, x_ticks, y_ticks)
         for curve in self._all_curves():
             if curve.visible:
                 self._draw_curve(painter, plot_rect, view, curve)
         self._draw_legend(painter, plot_rect)
         self._draw_crosshair(painter, plot_rect, view)
+        self._draw_selection(painter, plot_rect)
 
-    def _draw_grid(self, painter, rect, view):
+    def _draw_grid(self, painter, rect, view, x_ticks=7, y_ticks=7):
         painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0"), 1))
         font = painter.font(); font.setPointSize(8); painter.setFont(font)
-        for index in range(7):
-            ratio = index / 6
+        for index in range(x_ticks):
+            ratio = index / max(1, x_ticks - 1)
             px = rect.left() + ratio * rect.width()
-            py = rect.bottom() - ratio * rect.height()
             painter.drawLine(QtCore.QPointF(px, rect.top()), QtCore.QPointF(px, rect.bottom()))
-            painter.drawLine(QtCore.QPointF(rect.left(), py), QtCore.QPointF(rect.right(), py))
             x_value = view[0] + ratio * (view[1] - view[0])
+            painter.setPen(QtGui.QColor("#667085"))
+            label = self._format_x(x_value)
+            label_width = _text_width(QtGui.QFontMetrics(painter.font()), label) + 10
+            painter.drawText(
+                QtCore.QRectF(px - label_width / 2, rect.bottom() + 6, label_width, 18),
+                QtCore.Qt.AlignCenter,
+                label,
+            )
+            painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0"), 1))
+        for index in range(y_ticks):
+            ratio = index / max(1, y_ticks - 1)
+            py = rect.bottom() - ratio * rect.height()
+            painter.drawLine(QtCore.QPointF(rect.left(), py), QtCore.QPointF(rect.right(), py))
             y_value = view[2] + ratio * (view[3] - view[2])
             painter.setPen(QtGui.QColor("#667085"))
-            painter.drawText(QtCore.QRectF(px - 40, rect.bottom() + 6, 80, 18), QtCore.Qt.AlignCenter, f"{x_value:.3g}")
-            painter.drawText(QtCore.QRectF(3, py - 9, 58, 18), QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter, f"{y_value:.3g}")
+            painter.drawText(
+                QtCore.QRectF(3, py - 9, rect.left() - 10, 18),
+                (
+                    int(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+                    if QT_API == "PyQt5"
+                    else QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter
+                ),
+                self._format_y(y_value),
+            )
             painter.setPen(QtGui.QPen(QtGui.QColor("#E2E8F0"), 1))
         painter.setPen(QtGui.QPen(QtGui.QColor("#8492A6"), 1))
         painter.drawRect(rect)
@@ -250,7 +353,10 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor("#D0D5DD")); painter.drawRect(box)
         for index, curve in enumerate(items):
             y = box.top() + 14 + index * 20
-            painter.setPen(QtGui.QPen(curve.color, 2)); painter.drawLine(box.left() + 8, y, box.left() + 30, y)
+            painter.setPen(QtGui.QPen(curve.color, 2))
+            painter.drawLine(
+                QtCore.QLineF(box.left() + 8, y, box.left() + 30, y)
+            )
             painter.setPen(QtGui.QColor("#344054")); painter.drawText(QtCore.QPointF(box.left() + 36, y + 4), curve.label[:18])
 
     def _draw_crosshair(self, painter, rect, view):
@@ -262,36 +368,87 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         painter.drawLine(QtCore.QPointF(rect.left(), pos.y()), QtCore.QPointF(rect.right(), pos.y()))
         x_value = view[0] + (pos.x() - rect.left()) / rect.width() * (view[1] - view[0])
         y_value = view[3] - (pos.y() - rect.top()) / rect.height() * (view[3] - view[2])
-        text = f"X {x_value:.4f}   Y {y_value:.4f}"
-        box = QtCore.QRectF(pos.x() + 8, pos.y() - 27, 155, 22)
-        if box.right() > rect.right(): box.moveRight(pos.x() - 8)
+        text = f"X {self._format_x(x_value)}   Y {self._format_y(y_value)}"
+        width = _text_width(QtGui.QFontMetrics(painter.font()), text) + 18
+        box = QtCore.QRectF(pos.x() + 8, pos.y() - 27, width, 22)
+        if box.right() > rect.right():
+            box.moveRight(pos.x() - 8)
         painter.fillRect(box, QtGui.QColor(16, 24, 40, 220))
         painter.setPen(QtGui.QColor("white")); painter.drawText(box, QtCore.Qt.AlignCenter, text)
+
+    def _draw_selection(self, painter, rect):
+        if self._selection_origin is None or self._selection_current is None:
+            return
+        selection = QtCore.QRectF(
+            self._selection_origin, self._selection_current
+        ).normalized().intersected(rect)
+        if selection.isEmpty():
+            return
+        painter.fillRect(selection, QtGui.QColor(19, 103, 209, 45))
+        painter.setPen(QtGui.QPen(QtGui.QColor("#1367D1"), 1))
+        painter.drawRect(selection)
 
     def mouseMoveEvent(self, event):
         position = _event_position(event)
         self._cursor_pos = QtCore.QPointF(position)
-        if self._drag_origin is not None and self._drag_range is not None:
-            dx = position.x() - self._drag_origin.x(); dy = position.y() - self._drag_origin.y()
-            rect = self._plot_rect(); view = self._drag_range
-            x_shift = -dx / rect.width() * (view[1] - view[0])
-            y_shift = dy / rect.height() * (view[3] - view[2])
-            self._view_range = (view[0] + x_shift, view[1] + x_shift, view[2] + y_shift, view[3] + y_shift)
-            self.auto_range_enabled = False; self.user_zoomed.emit()
+        if self._selection_origin is not None:
+            rect = self._plot_rect()
+            self._selection_current = QtCore.QPointF(
+                min(rect.right(), max(rect.left(), position.x())),
+                min(rect.bottom(), max(rect.top(), position.y())),
+            )
         self.update()
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton and self._plot_rect().contains(_event_position(event)):
-            self._drag_origin = QtCore.QPointF(_event_position(event)); self._drag_range = self._effective_range()
+            self._selection_origin = QtCore.QPointF(_event_position(event))
+            self._selection_current = QtCore.QPointF(_event_position(event))
 
     def mouseReleaseEvent(self, event):
-        self._drag_origin = None; self._drag_range = None
+        if event.button() == QtCore.Qt.LeftButton and self._selection_origin is not None:
+            current = self._selection_current or QtCore.QPointF(_event_position(event))
+            self._apply_selection_zoom(self._selection_origin, current)
+        self._selection_origin = None
+        self._selection_current = None
+        self.update()
+
+    def _apply_selection_zoom(self, origin, current) -> bool:
+        rect = self._plot_rect()
+        selection = QtCore.QRectF(origin, current).normalized().intersected(rect)
+        if selection.width() < 6 or selection.height() < 6:
+            return False
+        x_min, x_max, y_min, y_max = self._effective_range()
+        selected_x_min = x_min + (
+            (selection.left() - rect.left()) / rect.width()
+        ) * (x_max - x_min)
+        selected_x_max = x_min + (
+            (selection.right() - rect.left()) / rect.width()
+        ) * (x_max - x_min)
+        selected_y_max = y_max - (
+            (selection.top() - rect.top()) / rect.height()
+        ) * (y_max - y_min)
+        selected_y_min = y_max - (
+            (selection.bottom() - rect.top()) / rect.height()
+        ) * (y_max - y_min)
+        self._view_range = (
+            selected_x_min,
+            selected_x_max,
+            selected_y_min,
+            selected_y_max,
+        )
+        self.auto_range_enabled = False
+        self.user_zoomed.emit()
+        return True
 
     def leaveEvent(self, event):
         self._cursor_pos = None; self.update()
 
     def mouseDoubleClickEvent(self, event):
-        self.auto_range()
+        if (
+            event.button() == QtCore.Qt.LeftButton
+            and self._plot_rect().contains(_event_position(event))
+        ):
+            self.reset_initial_view()
 
     def wheelEvent(self, event):
         position = _event_position(event)

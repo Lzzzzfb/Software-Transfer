@@ -36,7 +36,7 @@ from .device_sidebar import DeviceSidebar
 from .device_parameters import DeviceParametersDialog
 from .diagnostics import DiagnosticsPanel
 from .history_viewer import HistoryViewer
-from .input_controls import NoWheelComboBox
+from .input_controls import DirectDoubleSpinBox, NoWheelComboBox
 from .plot_widget import SpectrumPlotWidget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
@@ -125,8 +125,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.x_axis.addItem("像素序号", "pixel"); self.x_axis.addItem("波长 (nm)", "wavelength"); layout.addWidget(self.x_axis)
         self.auto_range = QtWidgets.QCheckBox("自动缩放"); self.auto_range.setChecked(True)
         self.auto_range.toggled.connect(self.plot_widget.enable_auto_range); layout.addWidget(self.auto_range)
+        self.plot_widget.user_zoomed.connect(self._plot_user_zoomed)
+        self.plot_widget.view_reset.connect(self._plot_view_reset)
+        self.fixed_y = QtWidgets.QCheckBox("固定 Y 轴")
+        self.fixed_y.toggled.connect(self._fixed_y_toggled)
+        layout.addWidget(self.fixed_y)
+        layout.addWidget(QtWidgets.QLabel("最小"))
+        self.y_minimum = DirectDoubleSpinBox(); self.y_minimum.setDecimals(6)
+        self.y_minimum.setRange(-1e12, 1e12); self.y_minimum.setValue(0)
+        self.y_minimum.setMaximumWidth(105); layout.addWidget(self.y_minimum)
+        layout.addWidget(QtWidgets.QLabel("最大"))
+        self.y_maximum = DirectDoubleSpinBox(); self.y_maximum.setDecimals(6)
+        self.y_maximum.setRange(-1e12, 1e12); self.y_maximum.setValue(65535)
+        self.y_maximum.setMaximumWidth(105); layout.addWidget(self.y_maximum)
+        apply_y = QtWidgets.QPushButton("应用 Y 轴")
+        apply_y.clicked.connect(self._apply_fixed_y_axis); layout.addWidget(apply_y)
         clear = QtWidgets.QPushButton("清除对比"); clear.clicked.connect(self.plot_widget.clear_reference_curves); layout.addWidget(clear)
         return bar
+
+    def _plot_user_zoomed(self):
+        self.auto_range.blockSignals(True)
+        self.auto_range.setChecked(False)
+        self.auto_range.blockSignals(False)
+
+    def _plot_view_reset(self):
+        self.auto_range.blockSignals(True)
+        self.auto_range.setChecked(True)
+        self.auto_range.blockSignals(False)
+
+    def _fixed_y_toggled(self, enabled):
+        if enabled:
+            self._apply_fixed_y_axis()
+        else:
+            self.plot_widget.disable_fixed_y()
+
+    def _apply_fixed_y_axis(self):
+        if not self.fixed_y.isChecked():
+            self.plot_widget.disable_fixed_y()
+            return True
+        minimum = self.y_minimum.value()
+        maximum = self.y_maximum.value()
+        try:
+            self.plot_widget.set_fixed_y_range(minimum, maximum)
+        except ValueError as exc:
+            self.fixed_y.blockSignals(True)
+            self.fixed_y.setChecked(False)
+            self.fixed_y.blockSignals(False)
+            self.plot_widget.disable_fixed_y()
+            self._operation_rejected(str(exc))
+            return False
+        self.status_panel.state_label.setText(
+            "固定 Y 轴初始范围："
+            f"{self.plot_widget.format_axis_value(minimum)} 至 "
+            f"{self.plot_widget.format_axis_value(maximum)}"
+        )
+        return True
 
     def _connect_signals(self):
         self.ribbon.acquisition_requested.connect(self._toggle_acquisition)
@@ -352,7 +405,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.plot_widget.update_device_curve(device_id, x, processed.values, label)
             self._shown_since_status += 1
             self.diagnostics.update_device(device_id, self.acquisition.diagnostics(device_id))
-        self.plot_widget.set_axis_labels("像素序号" if self.x_axis.currentData() == "pixel" else "波长 (nm)", "吸光度" if self.display_mode.currentData() == "absorbance" else "强度 (counts)")
+        y_labels = {
+            "raw": "强度（计数）",
+            "dark_subtract": "扣背景强度",
+            "absorbance": "吸光度",
+            "custom": "处理结果",
+        }
+        self.plot_widget.set_axis_labels(
+            "像素序号" if self.x_axis.currentData() == "pixel" else "波长 (nm)",
+            y_labels.get(self.display_mode.currentData(), "处理结果"),
+        )
 
     def capture_background(self):
         return self._capture_global_reference("background")
