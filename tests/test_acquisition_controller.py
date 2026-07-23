@@ -145,6 +145,29 @@ def test_global_start_is_rejected_while_any_local_device_is_busy():
     assert not any(call[0] == "start" for call in manager.calls)
 
 
+def test_global_start_rejects_unmanaged_busy_non_participating_device():
+    manager = FakeDeviceManager()
+    manager.devices[2].acquiring = True
+    controller = AcquisitionController(manager)
+    rejected = []
+    controller.operation_rejected.connect(rejected.append)
+
+    assert not controller.start_global(
+        [0, 1], AcquisitionMode.CONTINUOUS, SyncMode.SOFTWARE
+    )
+    assert rejected and "COM3" in rejected[-1]
+    assert manager.calls == []
+
+
+def test_reference_rejects_unmanaged_device_acquisition():
+    manager = FakeDeviceManager()
+    manager.devices[2].acquiring = True
+    controller = AcquisitionController(manager)
+
+    assert not controller.capture_local_reference(0, "background")
+    assert manager.calls == []
+
+
 def test_card_start_is_rejected_during_global_configuration():
     manager = FakeDeviceManager()
     controller = AcquisitionController(manager)

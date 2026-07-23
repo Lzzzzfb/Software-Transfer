@@ -62,6 +62,13 @@ class StorageSessionManager(QtCore.QObject):
     def has_session(self, task_id: str) -> bool:
         return task_id in self._sessions
 
+    def set_output_directory(self, output_directory) -> None:
+        if self._sessions:
+            raise RuntimeError("存储任务未结束，暂时不能更改数据目录")
+        directory = Path(output_directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        self.output_directory = directory
+
     def start_session(self, request, devices) -> None:
         if request.task_id in self._sessions:
             raise ValueError("存储任务已经存在")

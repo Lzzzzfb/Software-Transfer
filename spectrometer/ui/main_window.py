@@ -9,18 +9,27 @@ import time
 import numpy as np
 
 from ..acquisition.coordinator import AcquisitionCoordinator
+from ..acquisition.controller import AcquisitionController
 from ..communication.serial_port import DeviceFinder
 from ..device.device_manager import DeviceManager
-from ..domain.enums import AcquisitionMode, ProcessingMode, StorageFormat, SyncMode
-from ..domain.models import AcquisitionSession, SpectrumFrame, SpectrumReference
+from ..domain.enums import (
+    AcquisitionMode,
+    AcquisitionOwner,
+    ControlState,
+    ProcessingMode,
+    StorageFormat,
+    SyncMode,
+    control_state_label,
+)
+from ..domain.models import SpectrumFrame, SpectrumReference
 from ..processing.formula import FormulaError, validate_formula
 from ..processing.processor import ProcessingConfig, SpectrumProcessor
 from ..processing.references import ReferenceRepository
 from ..qt import QtCore, QtWidgets, dialog_exec
 from ..services.settings_service import SettingsService
-from ..storage.coordinator import BatchStorageCoordinator, StorageBackpressureError
 from ..storage.csv_exporter import export_device_csv
 from ..storage.recovery import scan_pending
+from ..storage.session_manager import StorageSessionManager
 from ..storage.spool import read_spool
 from ..storage.xlsx_exporter import export_workbook
 from .device_sidebar import DeviceSidebar
@@ -53,17 +62,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = self.settings_service.load()
         self.device_manager = DeviceManager()
         self.processor = SpectrumProcessor()
-        self.acquisition = AcquisitionCoordinator(self._store_frame, display_fps=30)
-        self.storage: BatchStorageCoordinator = None
+        self.acquisition = AcquisitionCoordinator(lambda frame: None, display_fps=30)
+        self.reference_repository = ReferenceRepository(
+            Path(self.settings["storage_path"]) / "references"
+        )
+        self.storage_manager = StorageSessionManager(self.settings["storage_path"])
+        self.control = AcquisitionController(
+            self.device_manager,
+            self.storage_manager,
+            reference_commit=self._commit_reference_frames,
+        )
         self._initializing_devices = set()
         self._latest_frames = {}
+        self._task_requests = {}
         self._sim_x = {}; self._sim_sequence = {}; self._sim_phase = 0.0
-        self._sim_running = False
         self._shown_since_status = 0; self._last_status_time = time.monotonic()
         self._last_formula_error = ""
 
         self._build_ui(); self._connect_signals(); self._apply_settings()
-        self.reference_repository = ReferenceRepository(Path(self.settings["storage_path"]) / "references")
         QtCore.QTimer.singleShot(0, self._report_pending_recovery)
 
         self.plot_timer = QtCore.QTimer(self); self.plot_timer.timeout.connect(self._plot_tick); self.plot_timer.start(33)
@@ -121,10 +137,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ribbon.settings_requested.connect(self.open_settings)
         self.ribbon.help_requested.connect(self.show_help)
         self.ribbon.exit_requested.connect(self.close)
-        self.sidebar.integration_changed.connect(self.device_manager.set_integration_time)
+        self.sidebar.integration_changed.connect(self._set_integration_time)
         self.sidebar.enabled_changed.connect(self._device_enabled_changed)
         self.sidebar.parameters_requested.connect(self.open_device_parameters)
-        self.sidebar.disconnect_requested.connect(self.device_manager.remove_device)
+        self.sidebar.acquisition_requested.connect(self._toggle_device_acquisition)
+        self.sidebar.background_requested.connect(
+            lambda device_id: self._capture_local_reference(device_id, "background")
+        )
+        self.sidebar.reference_requested.connect(
+            lambda device_id: self._capture_local_reference(device_id, "reference")
+        )
+        self.sidebar.disconnect_requested.connect(self._remove_device)
         self.device_manager.device_added.connect(self._device_changed)
         self.device_manager.device_connected.connect(self._device_connected)
         self.device_manager.device_updated.connect(self._device_changed)
@@ -133,8 +156,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_manager.error_occurred.connect(lambda did, msg: self._log(f"设备 {did}: {msg}", "ERROR"))
         self.device_manager.device_connect_failed.connect(lambda did, msg: self._log(f"设备 {did} 连接失败: {msg}", "WARN"))
         self.device_manager.diagnostic_event.connect(self._log)
-        self.device_manager.sync_started.connect(self._sync_started)
-        self.device_manager.sync_configuration_failed.connect(self._sync_configuration_failed)
+        self.control.global_state_changed.connect(self._global_control_state_changed)
+        self.control.device_state_changed.connect(self._device_control_state_changed)
+        self.control.operation_rejected.connect(self._operation_rejected)
+        self.control.diagnostic_event.connect(self._log)
+        self.control.task_started.connect(self._control_task_started)
+        self.control.task_finished.connect(self._control_task_finished)
+        self.control.reference_captured.connect(self._reference_captured)
 
     def _apply_settings(self):
         self.sidebar.batch_size.setValue(self.settings["batch_size"])
@@ -194,127 +222,108 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _device_enabled_changed(self, device_id, enabled):
         device = self.device_manager.get_device(device_id)
-        if device: device.enabled = enabled
+        if device is None:
+            return
+        if self.control.global_state is not ControlState.IDLE:
+            card = self.sidebar.cards.get(device_id)
+            if card:
+                card.enabled.blockSignals(True)
+                card.enabled.setChecked(device.enabled)
+                card.enabled.blockSignals(False)
+            self._operation_rejected("总控任务未完全结束，暂时不能更改参与设备")
+            return
+        device.enabled = enabled
+
+    def _set_integration_time(self, device_id, value):
+        if not self.control.can_modify_device(device_id):
+            device = self.device_manager.get_device(device_id)
+            card = self.sidebar.cards.get(device_id)
+            if device and card:
+                card.integration.setValue(device.integration_time_us)
+            self._operation_rejected("设备正在采集、停止或保存，暂时不能修改积分时间")
+            return False
+        return self.device_manager.set_integration_time(device_id, value)
+
+    def _remove_device(self, device_id):
+        if not self.control.can_remove_device(device_id):
+            self._operation_rejected("采集任务未完全结束，暂时不能移除设备")
+            return False
+        self.device_manager.remove_device(device_id)
+        return True
 
     def _sync_mode_changed(self, mode):
-        hard = mode in ("hard_internal", "hard_external")
-        self.device_manager.global_sync_enabled = mode != "independent"
-        self.device_manager.sync_mode = "hard" if hard else "soft"
-        if mode == "hard_internal":
-            self.device_manager.master_device_id = self.sidebar.selected_device_id
-        elif mode == "hard_external":
-            self.device_manager.master_device_id = None
         self._log(f"同步模式：{self.ribbon.sync_combo.currentText()}")
 
     def start_acquisition(self):
-        devices = [
-            device
+        devices = self._global_devices()
+        pending = [
+            device.port_name
             for device in self.device_manager.get_connected_devices()
-            if device.enabled and device.initialized
+            if device.device_id in self._initializing_devices
         ]
-        if not devices:
-            message = "没有已识别且初始化完成的光谱仪"
-            self.status_panel.state_label.setText(message); self._log(message, "WARN"); return
-        if self.device_manager.acquisition_active:
-            self._log("采集已在运行或正在启动", "WARN"); return
-        pending = [device.port_name for device in devices if device.device_id in self._initializing_devices]
         if pending:
-            message = f"设备正在初始化：{', '.join(pending)}"
-            self.status_panel.state_label.setText(message); self._log(message, "WARN"); return
-        if self.sidebar.auto_store.isChecked() and self.storage is None:
-            try: self._start_storage(devices)
-            except Exception as exc: self._log(f"无法启动批量存储: {exc}", "ERROR"); return
-        self.acquisition.reset(device.device_id for device in devices)
-        continuous = self.sidebar.acquisition_mode.currentIndex() == 0
-        sync_mode = self.ribbon.sync_combo.currentData()
-        if sync_mode == "hard_internal":
-            self.device_manager.master_device_id = self.sidebar.selected_device_id
-            if self.device_manager.master_device_id not in [device.device_id for device in devices]:
-                self._log("内部硬同步需要选择一台已启用的主设备", "ERROR")
-                self._close_storage(); return
-        if not self.device_manager.prepare_sync_acquisition(continuous):
-            self._close_storage(); return
-        self._sim_running = self.simulation
-        self.ribbon.set_acquisition_state("configuring")
-        if sync_mode in ("hard_internal", "hard_external"):
-            self.status_panel.state_label.setText("正在配置硬同步触发模式…")
-
-    def _sync_started(self, device_ids):
-        sync_mode = self.ribbon.sync_combo.currentData()
-        continuous = self.sidebar.acquisition_mode.currentIndex() == 0
-        if sync_mode == "hard_external":
-            state = "等待外部触发"
-        elif sync_mode == "hard_internal":
-            state = "内部硬同步采集中"
-        else:
-            state = "连续采集中" if continuous else "单次采集中"
-        self.status_panel.state_label.setText(state)
-        self.ribbon.set_acquisition_state("acquiring")
-        self._log(f"开始{'连续' if continuous else '单次'}采集，共 {len(device_ids)} 台设备")
-
-    def _sync_configuration_failed(self, message):
-        self._log(message, "ERROR")
-        self._sim_running = False
-        self.device_manager.stop_all()
-        self._close_storage()
-        self.ribbon.set_acquisition_state("idle")
-        self.status_panel.state_label.setText("同步配置失败")
+            self._operation_rejected(f"设备正在初始化：{', '.join(pending)}")
+            return False
+        device_ids = [device.device_id for device in devices]
+        self.acquisition.reset(device_ids)
+        return self.control.start_global(
+            device_ids,
+            self._selected_acquisition_mode(),
+            SyncMode(self.ribbon.sync_combo.currentData()),
+            master_device_id=self.sidebar.selected_device_id,
+            **self._storage_options(),
+        )
 
     def stop_acquisition(self):
-        self._sim_running = False; self.device_manager.stop_all()
-        self.ribbon.set_acquisition_state("stopping")
-        self.status_panel.state_label.setText("正在排空存储队列…")
-        self._close_storage(); self.status_panel.state_label.setText("已停止")
-        self.ribbon.set_acquisition_state("idle")
-        self._log("采集停止，存储队列已排空")
+        return self.control.stop_global()
 
     def _toggle_acquisition(self):
-        if self.device_manager.acquisition_active or self._sim_running:
+        if self.control.global_state is not ControlState.IDLE:
             self.stop_acquisition()
         else:
             self.start_acquisition()
 
-    def _start_storage(self, devices):
-        sync_value = self.ribbon.sync_combo.currentData()
-        session = AcquisitionSession.create(
-            [device.device_id for device in devices],
-            mode=(AcquisitionMode.CONTINUOUS if self.sidebar.acquisition_mode.currentIndex() == 0 else AcquisitionMode.SINGLE),
-            sync_mode=SyncMode(sync_value),
-            storage_format=StorageFormat(self.sidebar.storage_format.currentData()),
-            batch_size=self.sidebar.batch_size.value(),
+    def _toggle_device_acquisition(self, device_id):
+        state = self.control.device_state(device_id)
+        if state is ControlState.IDLE:
+            self.acquisition.reset([device_id])
+            self.control.start_local(
+                device_id,
+                self._selected_acquisition_mode(),
+                **self._storage_options(),
+            )
+        else:
+            self.control.stop_local(device_id)
+
+    def _selected_acquisition_mode(self):
+        return (
+            AcquisitionMode.CONTINUOUS
+            if self.sidebar.acquisition_mode.currentIndex() == 0
+            else AcquisitionMode.SINGLE
         )
-        wavelengths = {device.device_id: tuple(device.get_wavelength_array(device.info.valid_pixel or device.info.pixel_count or 4096)) for device in devices}
-        labels = {device.device_id: (device.info.prod_serial or device.port_name or f"设备_{device.device_id}") for device in devices}
-        metadata = {device.device_id: {"Port": device.port_name, "Serial": device.info.prod_serial, "Integration Time (us)": device.integration_time_us, "Trigger Mode": device.trigger_mode} for device in devices}
-        self.storage = BatchStorageCoordinator(
-            self.settings["storage_path"], session, wavelengths_by_device=wavelengths,
-            device_labels=labels, device_metadata=metadata,
-            warning_callback=lambda message: self._log(message, "WARN"),
-            controlled_stop_callback=self._storage_stop_requested,
-        )
-        self.storage.start(); self._log(f"批量存储已启动：{session.batch_size} 帧/批，{session.storage_format.value}")
 
-    def _store_frame(self, frame):
-        if self.storage:
-            self.storage.submit(frame)
+    def _storage_options(self):
+        return {
+            "auto_store": self.sidebar.auto_store.isChecked(),
+            "storage_format": StorageFormat(
+                self.sidebar.storage_format.currentData()
+            ),
+            "batch_size": self.sidebar.batch_size.value(),
+        }
 
-    def _storage_stop_requested(self, message):
-        self._log(message, "ERROR"); QtCore.QTimer.singleShot(0, self.stop_acquisition)
-
-    def _close_storage(self):
-        storage, self.storage = self.storage, None
-        if storage:
-            storage.close()
-            for error in storage.errors: self._log(f"存储错误: {error}", "ERROR")
-            if storage.exported_files: self._log(f"已生成 {len(storage.exported_files)} 个批量文件")
+    def _global_devices(self):
+        return [
+            device
+            for device in self.device_manager.get_connected_devices()
+            if device.enabled and device.initialized
+        ]
 
     def _frame_arrived(self, frame):
         self._latest_frames[frame.device_id] = frame
         try:
+            self.control.on_frame(frame)
             observation = self.acquisition.ingest(frame)
             if observation.missing: self._log(f"设备 {frame.device_id} 检测到缺少 {observation.missing} 帧", "WARN")
-        except StorageBackpressureError as exc:
-            self._log(str(exc), "ERROR"); self.stop_acquisition()
         except Exception as exc:
             self._log(f"采集帧处理错误: {exc}", "ERROR")
 
@@ -345,20 +354,98 @@ class MainWindow(QtWidgets.QMainWindow):
             self.diagnostics.update_device(device_id, self.acquisition.diagnostics(device_id))
         self.plot_widget.set_axis_labels("像素序号" if self.x_axis.currentData() == "pixel" else "波长 (nm)", "吸光度" if self.display_mode.currentData() == "absorbance" else "强度 (counts)")
 
-    def capture_background(self): self._capture_reference_kind("background")
-    def capture_reference(self): self._capture_reference_kind("reference")
+    def capture_background(self):
+        return self._capture_global_reference("background")
 
-    def _capture_reference_kind(self, kind):
-        device_id = self.sidebar.selected_device_id; frame = self._latest_frames.get(device_id)
-        device = self.device_manager.get_device(device_id) if device_id is not None else None
-        if not device or not frame: self._log("所选设备尚无可用光谱", "WARN"); return
-        values = np.asarray(frame.pixels, dtype=np.float64)
-        if kind == "background": device.background_spectrum = values.copy()
-        else: device.reference_spectrum = values.copy()
-        serial = device.info.prod_serial or f"PORT-{device.port_name}"
-        reference = SpectrumReference.create(serial, kind, values)
-        self.reference_repository.save(reference)
-        self._log(f"设备 {device_id} 的{'背景' if kind == 'background' else '参考'}光谱已记录")
+    def capture_reference(self):
+        return self._capture_global_reference("reference")
+
+    def _capture_global_reference(self, kind):
+        devices = self._global_devices()
+        return self.control.capture_global_reference(
+            [device.device_id for device in devices],
+            kind,
+            SyncMode(self.ribbon.sync_combo.currentData()),
+            master_device_id=self.sidebar.selected_device_id,
+        )
+
+    def _capture_local_reference(self, device_id, kind):
+        return self.control.capture_local_reference(device_id, kind)
+
+    def _commit_reference_frames(self, kind, frames):
+        references = []
+        pending_values = {}
+        for device_id, frame in frames.items():
+            device = self.device_manager.get_device(device_id)
+            if device is None:
+                raise RuntimeError(f"设备 {device_id} 已断开，取消整批参考提交")
+            values = np.asarray(frame.pixels, dtype=np.float64)
+            serial = device.info.prod_serial or f"PORT-{device.port_name}"
+            references.append(SpectrumReference.create(serial, kind, values))
+            pending_values[device_id] = values
+        self.reference_repository.save_batch(references)
+        for device_id, values in pending_values.items():
+            device = self.device_manager.get_device(device_id)
+            if kind == "background":
+                device.background_spectrum = values.copy()
+            else:
+                device.reference_spectrum = values.copy()
+
+    def _reference_captured(self, kind, frames):
+        label = "背景" if kind == "background" else "参考"
+        self._log(f"{len(frames)} 台设备的{label}光谱已使用新采集帧记录")
+
+    def _global_control_state_changed(self, state):
+        self.ribbon.set_acquisition_state(ControlState(state).value)
+        self._refresh_control_status()
+
+    def _device_control_state_changed(self, device_id, state):
+        value = ControlState(state)
+        self.sidebar.set_device_control_state(device_id, value.value)
+        self._refresh_control_status()
+
+    def _refresh_control_status(self):
+        if self.control.global_state is not ControlState.IDLE:
+            self.status_panel.state_label.setText(
+                f"总控：{control_state_label(self.control.global_state)}"
+            )
+            return
+        active = [
+            device_id
+            for device_id in self.device_manager.devices
+            if self.control.device_state(device_id) is not ControlState.IDLE
+        ]
+        if active:
+            details = "、".join(
+                f"{self.device_manager.get_device(device_id).port_name} "
+                f"{control_state_label(self.control.device_state(device_id))}"
+                for device_id in active
+                if self.device_manager.get_device(device_id) is not None
+            )
+            self.status_panel.state_label.setText(f"单机任务：{details}")
+        elif not self._initializing_devices:
+            count = len(self.device_manager.get_connected_devices())
+            self.status_panel.state_label.setText(f"就绪（{count} 台设备）")
+
+    def _operation_rejected(self, message):
+        self.status_panel.state_label.setText(message)
+        self._log(message, "WARN")
+
+    def _control_task_started(self, task_id, request):
+        self._task_requests[task_id] = request
+        scope = "总控" if request.owner is AcquisitionOwner.GLOBAL else "单机"
+        mode = "连续" if request.mode is AcquisitionMode.CONTINUOUS else "单次"
+        self._log(f"{scope}{mode}采集已启动，共 {len(request.device_ids)} 台设备")
+
+    def _control_task_finished(self, task_id, files, failed):
+        request = self._task_requests.pop(task_id, None)
+        if files:
+            self._log(f"采集存储完成，已生成 {len(files)} 个文件")
+        if failed:
+            self._log("采集任务结束，但存在错误，详情请查看诊断记录", "ERROR")
+        elif request is not None and request.owner is not AcquisitionOwner.CALIBRATION:
+            self._log("采集任务已完全停止")
+        self._refresh_control_status()
 
     def _display_mode_changed(self):
         self.formula_edit.setVisible(self.display_mode.currentData() == "custom")
@@ -372,13 +459,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status_panel.state_label.setText(f"公式错误: {exc}"); self._log(f"公式错误: {exc}", "WARN")
 
     def open_settings(self):
+        if self.control.busy:
+            self._operation_rejected("采集任务未完全结束，暂时不能更改系统选项")
+            return
         dialog = SettingsDialog(self.settings, self)
         if dialog_exec(dialog):
             self.settings.update(dialog.values()); self.plot_widget.set_line_width(self.settings["line_width"])
+            self.storage_manager.set_output_directory(self.settings["storage_path"])
             self.reference_repository = ReferenceRepository(Path(self.settings["storage_path"]) / "references")
             self.settings_service.save(self.settings); self._log("设置已保存")
 
     def open_device_parameters(self, device_id):
+        if not self.control.can_modify_device(device_id):
+            self._operation_rejected("设备正在采集、停止或保存，暂时不能修改参数")
+            return
         device = self.device_manager.get_device(device_id)
         if device:
             dialog_exec(DeviceParametersDialog(device, self.device_manager, self))
@@ -441,7 +535,7 @@ class MainWindow(QtWidgets.QMainWindow):
         now = time.monotonic(); elapsed = max(1e-6, now - self._last_status_time)
         fps = self._shown_since_status / elapsed; self._shown_since_status = 0; self._last_status_time = now
         missing = sum(self.acquisition.diagnostics(device_id).missing for device_id in self.device_manager.devices)
-        queue_ratio = self.storage.queue_ratio if self.storage else 0.0
+        queue_ratio = self.storage_manager.queue_ratio
         try: free_gb = shutil.disk_usage(Path(self.settings["storage_path"]).resolve()).free / (1024 ** 3)
         except OSError: free_gb = 0.0
         self.status_panel.update_metrics(len(self.device_manager.get_connected_devices()), fps, missing, queue_ratio, free_gb)
@@ -452,14 +546,21 @@ class MainWindow(QtWidgets.QMainWindow):
             device_id = self.device_manager.add_simulated_device(port, serial, 4096, start, step)
             self._sim_x[device_id] = np.arange(4096, dtype=np.float64); self._sim_sequence[device_id] = 0
         self.simulation_timer = QtCore.QTimer(self); self.simulation_timer.timeout.connect(self._simulation_tick); self.simulation_timer.start(10)
-        self._sim_running = bool(auto_start)
         if auto_start: QtCore.QTimer.singleShot(0, self.start_acquisition)
         self._log("模拟模式：4 台设备 × 4096 像素，目标 100 fps")
 
     def _simulation_tick(self):
-        if not self._sim_running: return
+        active_ids = {
+            device_id
+            for device_id in self._sim_x
+            if self.control.device_state(device_id) is ControlState.ACQUIRING
+        }
+        if not active_ids:
+            return
         self._sim_phase += 0.045
         for device_id, x in self._sim_x.items():
+            if device_id not in active_ids:
+                continue
             center = 900 + device_id * 560 + 180 * math.sin(self._sim_phase * (1 + device_id * 0.08))
             peak = 28000 * np.exp(-0.5 * ((x - center) / (85 + 14 * device_id)) ** 2)
             ripple = 1800 * np.sin(x / (48 + device_id * 9) + self._sim_phase * 2)
@@ -468,8 +569,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_manager.inject_simulated_frame(SpectrumFrame.create(device_id, sequence << 8, pixels))
 
     def closeEvent(self, event):
-        self._sim_running = False
-        self.device_manager.stop_all(); self._close_storage()
+        if self.control.global_state is not ControlState.IDLE:
+            self.control.stop_global()
+        else:
+            for device_id in list(self.device_manager.devices):
+                task = self.control.active_task_for_device(device_id)
+                if task is not None and task.owner is AcquisitionOwner.LOCAL:
+                    self.control.stop_local(device_id)
+        self.control.finish_pending_stops()
+        self.storage_manager.shutdown(timeout=10.0)
         self.settings.update({"batch_size": self.sidebar.batch_size.value(), "storage_format": self.sidebar.storage_format.currentData(), "auto_store": False, "display_mode": self.display_mode.currentData(), "x_axis": self.x_axis.currentData()})
         try: self.settings_service.save(self.settings)
         except OSError as exc: self._log(f"设置保存失败: {exc}", "WARN")

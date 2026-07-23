@@ -1,4 +1,5 @@
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,12 +21,19 @@ def test_simulated_multi_device_session_exports_default_layout(tmp_path):
     app = application()
     window = MainWindow(simulation=True, auto_start_simulation=False, settings_path=tmp_path / "settings.json")
     window.settings["storage_path"] = str(tmp_path)
+    window.storage_manager.set_output_directory(tmp_path)
     window.reference_repository = ReferenceRepository(tmp_path / "references")
     window.sidebar.batch_size.setValue(2)
     window.sidebar.auto_store.setChecked(True)
     window.start_acquisition()
     window._simulation_tick(); window._simulation_tick()
-    window.stop_acquisition(); app.processEvents()
+    window.stop_acquisition()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and (
+        len(list(tmp_path.glob("*.xlsx"))) < 1 or list(tmp_path.glob("*.part"))
+    ):
+        app.processEvents()
+        time.sleep(0.005)
 
     assert len(list(tmp_path.glob("*.csv"))) == 4
     assert len(list(tmp_path.glob("*.xlsx"))) == 1

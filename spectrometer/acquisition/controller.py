@@ -105,7 +105,10 @@ class AcquisitionController(QtCore.QObject):
         return task.request if task else None
 
     def can_modify_device(self, device_id: int) -> bool:
-        return self.device_state(device_id) is ControlState.IDLE
+        return (
+            self.device_state(device_id) is ControlState.IDLE
+            and device_id not in self._hardware_busy_device_ids()
+        )
 
     def can_remove_device(self, device_id: int) -> bool:
         return self.can_modify_device(device_id) and self._global_task_id is None
@@ -123,6 +126,10 @@ class AcquisitionController(QtCore.QObject):
             return self._reject("总控任务正在运行，请使用顶部停止")
         if self.device_state(device_id) is not ControlState.IDLE:
             return self._reject(self._busy_device_message([device_id]))
+        if device_id in self._hardware_busy_device_ids():
+            return self._reject(
+                f"设备 {device_id} 仍处于下位机采集或启动状态，请先停止"
+            )
         device = self._ready_device(device_id)
         if device is None:
             return self._reject(f"设备 {device_id} 未连接或尚未初始化")
@@ -157,6 +164,7 @@ class AcquisitionController(QtCore.QObject):
             for device_id, state in self._device_states.items()
             if state is not ControlState.IDLE
         ]
+        busy_ids = sorted(set(busy_ids) | self._hardware_busy_device_ids())
         if self._global_task_id is not None or busy_ids:
             return self._reject(
                 self._busy_device_message(busy_ids)
@@ -207,7 +215,7 @@ class AcquisitionController(QtCore.QObject):
         return self._request_stop(task)
 
     def capture_local_reference(self, device_id: int, kind: str) -> bool:
-        if self.busy:
+        if self.busy or self._hardware_busy_device_ids():
             return self._reject("系统正在采集、停止或保存，请完全停止后再采集背景或参考")
         device = self._ready_device(device_id)
         if device is None:
@@ -233,7 +241,7 @@ class AcquisitionController(QtCore.QObject):
         *,
         master_device_id: Optional[int] = None,
     ) -> bool:
-        if self.busy:
+        if self.busy or self._hardware_busy_device_ids():
             return self._reject("系统正在采集、停止或保存，请完全停止后再采集背景或参考")
         ids = tuple(int(device_id) for device_id in device_ids)
         if not ids or any(self._ready_device(device_id) is None for device_id in ids):
@@ -620,12 +628,31 @@ class AcquisitionController(QtCore.QObject):
             return device
         return None
 
+    def _hardware_busy_device_ids(self) -> set:
+        requested = set(
+            getattr(self.device_manager, "_acquisition_requested", set())
+        )
+        devices = getattr(self.device_manager, "devices", {})
+        busy = {
+            int(device_id)
+            for device_id, device in devices.items()
+            if bool(getattr(device, "acquiring", False))
+        }
+        busy.update(int(device_id) for device_id in requested)
+        return busy
+
     def _busy_device_message(self, device_ids) -> str:
         details = []
+        hardware_busy = self._hardware_busy_device_ids()
         for device_id in device_ids:
             device = self.device_manager.get_device(device_id)
             name = device.port_name if device else f"设备 {device_id}"
-            details.append(f"{name}（{control_state_label(self.device_state(device_id))}）")
+            state = self.device_state(device_id)
+            if state is ControlState.IDLE and device_id in hardware_busy:
+                label = "下位机仍在采集或启动"
+            else:
+                label = control_state_label(state)
+            details.append(f"{name}（{label}）")
         return "以下设备尚未完全空闲：" + "、".join(details)
 
     def _reject(self, message: str) -> bool:

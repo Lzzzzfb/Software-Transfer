@@ -81,6 +81,7 @@ class DeviceCard(QtWidgets.QFrame):
         labels = {
             "idle": "开始",
             "configuring": "停止",
+            "starting": "停止",
             "armed": "停止",
             "acquiring": "停止",
             "stopping": "停止中…",
