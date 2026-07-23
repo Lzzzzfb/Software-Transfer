@@ -119,6 +119,8 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self.update()
 
     def set_axis_labels(self, x_label: str, y_label: str):
+        if self.x_label == x_label and self.y_label == y_label:
+            return
         self.x_label, self.y_label = x_label, y_label
         self.update()
 
@@ -341,6 +343,10 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         for x_point, y_point in zip(px[1:], py[1:]):
             path.lineTo(float(x_point), float(y_point))
         painter.save(); painter.setClipRect(rect)
+        antialias = getattr(QtGui.QPainter, "Antialiasing", None)
+        if antialias is None:
+            antialias = QtGui.QPainter.RenderHint.Antialiasing
+        painter.setRenderHint(antialias, False)
         painter.setPen(QtGui.QPen(curve.color, self.line_width))
         painter.drawPath(path); painter.restore()
 

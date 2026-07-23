@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from main import load_stylesheet
+from spectrometer.domain.enums import ControlState
 from spectrometer.qt import QtCore, QtWidgets, application_exec
 from spectrometer.ui.main_window import MainWindow
 
@@ -36,7 +37,11 @@ class UiHardwareSmoke(QtCore.QObject):
         self.started_at = time.monotonic()
         self.events = []
         self.errors = []
-        self.storage = None
+        self.exported_files = []
+        self.storage_errors = []
+        self.stop_call_ms = None
+        self.stop_requested_at = None
+        self.heartbeat_times = []
 
         self.window = MainWindow(
             simulation=False,
@@ -44,6 +49,7 @@ class UiHardwareSmoke(QtCore.QObject):
             port_allowlist=ports,
         )
         self.window.settings["storage_path"] = str(output_dir / "exports")
+        self.window.storage_manager.set_output_directory(output_dir / "exports")
         self.window.sidebar.batch_size.setValue(5)
         self.window.sidebar.auto_store.setChecked(True)
         self.window.show()
@@ -54,9 +60,18 @@ class UiHardwareSmoke(QtCore.QObject):
         self.window.device_manager.device_connect_failed.connect(
             lambda did, message: self.errors.append(f"连接失败 {did}: {message}")
         )
+        self.window.control.task_finished.connect(self.on_task_finished)
+        self.window.control.operation_rejected.connect(
+            lambda message: self.errors.append(f"操作被拒绝: {message}")
+        )
         self.poll_timer = QtCore.QTimer(self)
         self.poll_timer.timeout.connect(self.poll_ready)
         self.poll_timer.start(100)
+        self.heartbeat_timer = QtCore.QTimer(self)
+        self.heartbeat_timer.timeout.connect(
+            lambda: self.heartbeat_times.append(time.monotonic())
+        )
+        self.heartbeat_timer.start(20)
         QtCore.QTimer.singleShot(int(timeout_seconds * 1000), lambda: self.finish("总超时"))
 
     def poll_ready(self):
@@ -70,8 +85,11 @@ class UiHardwareSmoke(QtCore.QObject):
         if self.window._initializing_devices:
             return
         self.started = True
-        self.events.append("正式主界面链路开始三机采集")
-        self.window.start_acquisition()
+        self.events.append(
+            f"正式主界面链路开始 {self.expected_devices} 台设备采集"
+        )
+        if not self.window.start_acquisition():
+            self.finish("总控启动被拒绝")
 
     def on_frame(self, frame):
         if not self.started or self.finishing:
@@ -85,23 +103,62 @@ class UiHardwareSmoke(QtCore.QObject):
         if self.finishing:
             return
         self.finishing = True
+        self.stop_requested_at = time.monotonic()
         self.poll_timer.stop()
         self.events.append(reason)
-        self.storage = self.window.storage
-        self.window.stop_acquisition()
-        QtCore.QTimer.singleShot(400, self.finalize)
+        if self.window.control.global_state is not ControlState.IDLE:
+            started = time.perf_counter()
+            self.window.stop_acquisition()
+            self.stop_call_ms = (time.perf_counter() - started) * 1000
+        self.finalize_deadline = time.monotonic() + 60.0
+        self.finalize_timer = QtCore.QTimer(self)
+        self.finalize_timer.timeout.connect(self.poll_finalization)
+        self.finalize_timer.start(25)
+        self.poll_finalization()
+
+    def on_task_finished(self, task_id, files, failed):
+        self.exported_files.extend(str(path) for path in files)
+        if failed:
+            self.storage_errors.append(f"任务 {task_id} 报告失败")
+
+    def poll_finalization(self):
+        idle = self.window.control.global_state is ControlState.IDLE
+        storage_idle = not self.window.storage_manager.active_device_ids
+        if idle and storage_idle:
+            self.finalize_timer.stop()
+            self.finalize()
+        elif time.monotonic() >= self.finalize_deadline:
+            self.storage_errors.append("停止或存储收尾超过 60 秒")
+            self.finalize_timer.stop()
+            self.finalize()
 
     def finalize(self):
+        self.heartbeat_timer.stop()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         screenshot = self.output_dir / "hardware_ui.png"
         screenshot_ok = self.window.grab().save(str(screenshot))
         devices = list(self.window.device_manager.devices.values())
+        heartbeat_gaps = [
+            (current - previous) * 1000
+            for previous, current in zip(
+                self.heartbeat_times, self.heartbeat_times[1:]
+            )
+        ]
         result = {
             "ports": self.ports,
             "elapsed_seconds": time.monotonic() - self.started_at,
             "status": self.window.status_panel.state_label.text(),
             "screenshot": str(screenshot),
             "screenshot_ok": bool(screenshot_ok),
+            "stop_call_ms": self.stop_call_ms,
+            "finalization_seconds": (
+                time.monotonic() - self.stop_requested_at
+                if self.stop_requested_at is not None
+                else None
+            ),
+            "maximum_gui_heartbeat_gap_ms": (
+                max(heartbeat_gaps) if heartbeat_gaps else None
+            ),
             "devices": {
                 str(device.device_id): {
                     "port": device.port_name,
@@ -113,8 +170,8 @@ class UiHardwareSmoke(QtCore.QObject):
                 }
                 for device in devices
             },
-            "exported_files": [str(path) for path in (self.storage.exported_files if self.storage else [])],
-            "storage_errors": list(self.storage.errors if self.storage else []),
+            "exported_files": self.exported_files,
+            "storage_errors": self.storage_errors,
             "events": self.events,
             "errors": self.errors,
         }

@@ -134,3 +134,14 @@ def test_large_full_decimal_labels_reduce_ticks_and_render_without_clipping(tmp_
     assert x_ticks < 7
     assert y_ticks <= 7
     assert plot.save_image(str(tmp_path / "full-decimal-axis.png"))
+
+
+def test_unchanged_axis_labels_do_not_schedule_redundant_repaint():
+    plot = plot_widget()
+    updates = []
+    plot.update = lambda: updates.append(True)
+
+    plot.set_axis_labels(plot.x_label, plot.y_label)
+    assert updates == []
+    plot.set_axis_labels("波长 (nm)", "吸光度")
+    assert updates == [True]
