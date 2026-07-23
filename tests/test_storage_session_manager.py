@@ -128,6 +128,7 @@ def test_two_local_sessions_route_and_close_independently(tmp_path):
 
 
 def test_slow_close_keeps_qt_event_loop_responsive(tmp_path):
+    app = application()
     FakeCoordinator.instances = []
     FakeCoordinator.close_error = None
     gate = threading.Event()
@@ -139,11 +140,11 @@ def test_slow_close_keeps_qt_event_loop_responsive(tmp_path):
     manager.start_session(acquisition, [ready_device(0)])
     ticks = []
     timer = QtCore.QTimer()
+    timer.setTimerType(QtCore.Qt.PreciseTimer)
     timer.timeout.connect(lambda: ticks.append(time.monotonic()))
     timer.start(5)
 
     manager.close_session(acquisition.task_id)
-    app = application()
     deadline = time.monotonic() + 0.08
     while time.monotonic() < deadline:
         app.processEvents()
