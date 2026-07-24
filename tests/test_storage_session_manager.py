@@ -227,10 +227,10 @@ def test_real_coordinator_exports_human_named_multi_device_files(tmp_path):
 
     names = {path.name for path in tmp_path.iterdir()}
     assert names == {
-        "20260722_153045_SN001_COM10_软件同步_B0001.csv",
-        "20260722_153045_SN002_COM11_软件同步_B0001.csv",
-        "20260722_153045_多设备_软件同步_B0001.xlsx",
+        "20260722_SN001_B0001.csv",
+        "20260722_SN002_B0001.csv",
+        "20260722_多设备_B0001.xlsx",
     }
-    workbook_path = tmp_path / "20260722_153045_多设备_软件同步_B0001.xlsx"
+    workbook_path = tmp_path / "20260722_多设备_B0001.xlsx"
     workbook = load_workbook(workbook_path, read_only=True)
     assert workbook.sheetnames == ["采集概要", "001", "002"]

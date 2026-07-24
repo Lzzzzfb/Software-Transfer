@@ -30,7 +30,7 @@ def request(owner, devices, mode, sync):
     )
 
 
-def test_global_and_device_file_stems_are_human_readable():
+def test_global_and_device_file_stems_use_date_and_serial_only():
     acquisition = request(
         AcquisitionOwner.GLOBAL,
         [0, 1],
@@ -43,14 +43,14 @@ def test_global_and_device_file_stems_are_human_readable():
         [device(0, "COM14", "003"), device(1, "COM17", "SN002")],
     )
 
-    assert workbook == "20260722_233045_多设备_软件同步"
+    assert workbook == "20260722_多设备"
     assert csv_stems == {
-        0: "20260722_233045_SN003_COM14_软件同步",
-        1: "20260722_233045_SN002_COM17_软件同步",
+        0: "20260722_SN003",
+        1: "20260722_SN002",
     }
 
 
-def test_local_file_stem_includes_device_and_acquisition_mode():
+def test_local_file_stem_excludes_time_of_day_port_and_acquisition_mode():
     acquisition = request(
         AcquisitionOwner.LOCAL,
         [0],
@@ -62,9 +62,26 @@ def test_local_file_stem_includes_device_and_acquisition_mode():
         acquisition, [device(0, "COM14", "003")]
     )
 
-    expected = "20260722_233045_SN003_COM14_单机单次"
+    expected = "20260722_SN003"
     assert workbook == expected
     assert csv_stems == {0: expected}
+
+
+def test_missing_serial_uses_device_id_without_port():
+    acquisition = request(
+        AcquisitionOwner.LOCAL,
+        [4],
+        AcquisitionMode.CONTINUOUS,
+        SyncMode.INDEPENDENT,
+    )
+
+    workbook, csv_stems = build_session_file_stems(
+        acquisition, [device(4, "COM99", "")]
+    )
+
+    assert workbook == "20260722_设备4"
+    assert csv_stems == {4: "20260722_设备4"}
+    assert "COM99" not in workbook
 
 
 def test_unique_path_never_overwrites_existing_file(tmp_path):
