@@ -31,6 +31,8 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert len(window.sidebar.cards) == 4
     assert not hasattr(window.sidebar, "port_combo")
     assert not hasattr(window.sidebar, "baud_combo")
+    assert window.display_fps == 20
+    assert window.plot_timer.interval() == 50
     assert "history" not in window.ribbon.buttons
     assert "acquisition" in window.ribbon.buttons
     context_labels = {

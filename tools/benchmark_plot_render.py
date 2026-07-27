@@ -29,7 +29,10 @@ def main(argv=None):
     x = np.arange(args.pixels, dtype=np.float64)
     y = 32000 + 28000 * np.sin(x / 100)
     plot.update_device_curve(0, x, y, "benchmark")
-    image = QtGui.QImage(plot.size(), QtGui.QImage.Format_ARGB32)
+    image_format = getattr(QtGui.QImage, "Format_ARGB32", None)
+    if image_format is None:
+        image_format = QtGui.QImage.Format.Format_ARGB32
+    image = QtGui.QImage(plot.size(), image_format)
     image.fill(QtGui.QColor("white"))
     times = []
     for _ in range(args.iterations):

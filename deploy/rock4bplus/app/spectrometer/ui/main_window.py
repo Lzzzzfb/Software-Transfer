@@ -43,6 +43,9 @@ from .settings_dialog import SettingsDialog
 from .status_panel import StatusPanel
 
 
+DISPLAY_FPS = 20
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(
         self,
@@ -62,7 +65,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = self.settings_service.load()
         self.device_manager = DeviceManager()
         self.processor = SpectrumProcessor()
-        self.acquisition = AcquisitionCoordinator(lambda frame: None, display_fps=30)
+        self.display_fps = DISPLAY_FPS
+        self.acquisition = AcquisitionCoordinator(
+            lambda frame: None, display_fps=self.display_fps
+        )
         self.reference_repository = ReferenceRepository(
             Path(self.settings["storage_path"]) / "references"
         )
@@ -82,7 +88,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui(); self._connect_signals(); self._apply_settings()
         QtCore.QTimer.singleShot(0, self._report_pending_recovery)
 
-        self.plot_timer = QtCore.QTimer(self); self.plot_timer.timeout.connect(self._plot_tick); self.plot_timer.start(33)
+        self.plot_timer = QtCore.QTimer(self)
+        self.plot_timer.timeout.connect(self._plot_tick)
+        self.plot_timer.start(round(1000 / self.display_fps))
         self.status_timer = QtCore.QTimer(self); self.status_timer.timeout.connect(self._update_status); self.status_timer.start(1000)
 
         if simulation:

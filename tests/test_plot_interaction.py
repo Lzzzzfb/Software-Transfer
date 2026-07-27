@@ -145,3 +145,8 @@ def test_unchanged_axis_labels_do_not_schedule_redundant_repaint():
     assert updates == []
     plot.set_axis_labels("波长 (nm)", "吸光度")
     assert updates == [True]
+
+
+def test_curve_rendering_uses_at_most_one_point_per_horizontal_pixel():
+    assert SpectrumPlotWidget._curve_point_limit(1400) == 1400
+    assert SpectrumPlotWidget._curve_point_limit(300) == 400

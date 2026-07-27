@@ -33,6 +33,12 @@ def _text_width(metrics, text):
     return method(text)
 
 
+def _image_format(name):
+    if hasattr(QtGui.QImage, name):
+        return getattr(QtGui.QImage, name)
+    return getattr(QtGui.QImage.Format, name)
+
+
 class SpectrumPlotWidget(QtWidgets.QWidget):
     user_zoomed = Signal()
     view_reset = Signal()
@@ -58,6 +64,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self._selection_current = None
         self._cursor_pos = None
         self._show_crosshair = True
+        self._sample_index_cache = {}
 
     def update_device_curve(self, device_id: int, x, y, label: str = ""):
         x_array = np.asarray(x, dtype=np.float64)
@@ -181,7 +188,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self.update()
 
     def save_image(self, path: str) -> bool:
-        image = QtGui.QImage(self.size(), QtGui.QImage.Format_ARGB32)
+        image = QtGui.QImage(self.size(), _image_format("Format_ARGB32"))
         image.fill(QtGui.QColor("white"))
         painter = QtGui.QPainter(image)
         self._paint(painter)
@@ -333,22 +340,33 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         x, y = curve.x[finite], curve.y[finite]
         if x.size < 2:
             return
-        max_points = max(400, int(rect.width() * 2))
+        max_points = self._curve_point_limit(rect.width())
         if x.size > max_points:
-            indices = np.linspace(0, x.size - 1, max_points, dtype=int)
+            cache_key = (x.size, max_points)
+            indices = self._sample_index_cache.get(cache_key)
+            if indices is None:
+                indices = np.linspace(0, x.size - 1, max_points, dtype=int)
+                self._sample_index_cache[cache_key] = indices
             x, y = x[indices], y[indices]
         px = rect.left() + (x - view[0]) / (view[1] - view[0]) * rect.width()
         py = rect.bottom() - (y - view[2]) / (view[3] - view[2]) * rect.height()
-        path = QtGui.QPainterPath(QtCore.QPointF(float(px[0]), float(py[0])))
-        for x_point, y_point in zip(px[1:], py[1:]):
-            path.lineTo(float(x_point), float(y_point))
+        polygon = QtGui.QPolygonF(
+            [
+                QtCore.QPointF(float(x_point), float(y_point))
+                for x_point, y_point in zip(px, py)
+            ]
+        )
         painter.save(); painter.setClipRect(rect)
         antialias = getattr(QtGui.QPainter, "Antialiasing", None)
         if antialias is None:
             antialias = QtGui.QPainter.RenderHint.Antialiasing
         painter.setRenderHint(antialias, False)
         painter.setPen(QtGui.QPen(curve.color, self.line_width))
-        painter.drawPath(path); painter.restore()
+        painter.drawPolyline(polygon); painter.restore()
+
+    @staticmethod
+    def _curve_point_limit(plot_width):
+        return max(400, int(plot_width))
 
     def _draw_legend(self, painter, rect):
         items = [curve for curve in self._all_curves() if curve.visible][:12]
