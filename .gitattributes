@@ -1,0 +1,4 @@
+deploy/rock4bplus/*.sh text eol=lf
+deploy/rock4bplus/*.rules text eol=lf
+deploy/rock4bplus/*.desktop text eol=lf
+deploy/rock4bplus/*.txt text eol=lf

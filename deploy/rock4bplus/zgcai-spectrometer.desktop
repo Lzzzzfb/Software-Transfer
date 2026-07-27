@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ZGCAI 光谱仪工作站
+Comment=CH569W 光谱仪采集、显示与数据保存
+Exec=/opt/zgcai-spectrometer/run.sh
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Science;Utility;
+StartupNotify=true

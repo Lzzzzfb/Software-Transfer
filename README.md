@@ -1,11 +1,11 @@
 # ZGCAI 光谱仪采集与分析工作站
 
-面向 Windows 64 位的多设备光谱仪上位机。产品界面使用 PySide6/Qt Widgets，支持串口采集、同步布防、实时处理、批量 CSV/Excel、断点缓存恢复、历史查看和诊断。
+面向 Radxa ROCK 4B+、Debian 12 ARM64 的 Linux 专用光谱仪上位机。产品界面使用 PyQt6/Qt Widgets，支持 CH569W 串口采集、同步布防、实时处理、批量 CSV/Excel、断点缓存恢复、历史查看和诊断。本副本与 Windows 版本分开维护。
 
 ## 已实现能力
 
 - 协议普通帧与 `0x80` 数据帧分别按正确长度拆包。
-- 自动扫描会发送版本查询进行协议握手，只有返回合法设备信息的串口才会显示并参与采集。
+- 自动扫描严格筛选 `1a86:fe0c`，再发送版本查询进行协议握手；只有返回合法设备信息的串口才会显示并参与采集。
 - `nPacketNumb` 自动兼容实机 U16LE 与函数表 U32LE，像素按 U16 大端解析。
 - 最多按当前目标同时使用约 4 台设备；显示约 30 fps，存储通道接收每一帧。
 - 顶部一个“开始/停止”按钮负责总控；每张设备卡可独立开始/停止并采集自己的背景或参考，多台单机任务可并行。
@@ -16,7 +16,7 @@
 - 默认每 500 帧一批，可设置 1–1000；自动存储每次启动默认不勾选，启用后默认同时输出 CSV 和 Excel。
 - CSV 每台设备一个文件；Excel 一个设备一个工作表。
 - 所有批量文件均为每帧一列、每像素一行。
-- 文件名包含本地开始时间、设备序列号、COM 口、采集/同步方式和批次号，重名自动追加 `_01`，不会覆盖已有数据。
+- 文件名包含本地日期、设备序列号和批次号，重名自动追加顺序后缀，不会覆盖已有数据。
 - `.part` 临时缓存包含版本、元数据和逐帧 CRC32，可恢复截断尾记录。
 - 停止命令、尾帧静默和 Excel/CSV 收尾不会阻塞 GUI；导出失败会立即释放状态并保留 `.part`。
 - 光谱图支持左键框选 X/Y 放大、滚轮缩放、左键双击复位、固定 Y 初始范围和完整十进制刻度。
@@ -24,29 +24,34 @@
 - 现代化双层工具带、设备侧栏、实时/历史/诊断页和状态栏。
 - `--simulate` 可在无光谱仪时模拟 4 台 4096 像素设备。
 
-## 环境
+## ROCK 4B+ 环境
 
-- Windows 10/11 64 位
-- Python 3.12 64 位
-- 依赖见 `requirements.txt`
+- Debian 12 Bookworm ARM64
+- Python 3.11
+- Debian 官方 PyQt6 和 QtSerialPort
+- 源码 + venv 运行
 
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python main.py --simulate
+发送 `deploy/rock4bplus` 到板子后安装：
+
+```bash
+cd rock4bplus
+sudo ./install.sh
 ```
 
-连接实机运行：
+注销并重新登录、重新插拔光谱仪后，从应用菜单或桌面快捷方式手动启动。也可运行：
 
-```powershell
-.venv\Scripts\python main.py
+```bash
+/opt/zgcai-spectrometer/run.sh
 ```
 
 排查串口问题时也可临时限制扫描范围；正常使用无需指定端口：
 
-```powershell
-.venv\Scripts\python main.py --ports COM14 COM17 COM18
+```bash
+/opt/zgcai-spectrometer/run.sh --ports ttyACM0
 ```
+
+配置位于 `~/.config/ZGCAI/Spectrometer/`，默认数据目录为
+`~/ZGCAI-Spectrometer-Data/`。第一阶段只提供手动启动，不配置开机自启。
 
 ## 自动测试
 
@@ -58,15 +63,10 @@ python -m compileall -q main.py spectrometer tools
 python tools\run_ui_control_validation.py
 ```
 
-## 64 位打包
+## 板端部署内容
 
-在安装 PySide6 和 PyInstaller 的 Python 3.12 64 位环境中：
-
-```powershell
-python -m PyInstaller --clean --noconfirm spectrometer.spec
-```
-
-输出位于 `dist/ZGCAI_Spectrometer_Workstation/`。源代码已在 Python 3.13 64 位、PySide6 6.11 环境完成自动、模拟和可用实机链路验证；正式发布包仍需在目标 Windows 环境执行打包验证。配置已显式包含 Qt SerialPort。
+`deploy/rock4bplus` 只包含运行源码、ARM64 依赖清单、安装脚本、启动脚本、udev 规则和桌面快捷方式。运行源码副本由
+`tools/build_rock4bplus_deploy.py` 生成并校验。
 
 ## 协议要点
 
