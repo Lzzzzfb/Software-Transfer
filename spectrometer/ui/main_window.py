@@ -10,7 +10,6 @@ import numpy as np
 
 from ..acquisition.coordinator import AcquisitionCoordinator
 from ..acquisition.controller import AcquisitionController
-from ..acquisition.frame_quality import FrameQualityAnalyzer
 from ..communication.serial_port import DeviceFinder
 from ..device.device_manager import DeviceManager
 from ..domain.enums import (
@@ -66,7 +65,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = self.settings_service.load()
         self.device_manager = DeviceManager()
         self.processor = SpectrumProcessor()
-        self.frame_quality = FrameQualityAnalyzer()
         self.display_fps = DISPLAY_FPS
         self.acquisition = AcquisitionCoordinator(
             lambda frame: None, display_fps=self.display_fps
@@ -390,14 +388,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
 
     def _frame_arrived(self, frame):
-        quality = self.frame_quality.inspect(frame)
-        if not quality.accepted:
-            self._log(
-                f"设备 {frame.device_id} 丢弃错误帧 "
-                f"Seq {frame.sequence:06X}：{quality.reason}",
-                "ERROR",
-            )
-            return
         self._latest_frames[frame.device_id] = frame
         try:
             self.control.on_frame(frame)
@@ -447,7 +437,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 snapshot = self._processing_by_device.get(device_id)
                 if snapshot is None:
                     snapshot = self._processing_snapshots([device])[device_id]
-                processed = self.processor.process_frame(frame, snapshot)
+                processed = self.processor.process(
+                    snapshot.wavelengths,
+                    frame.pixels,
+                    snapshot.config,
+                    intensity_calibration=snapshot.intensity_calibration or None,
+                    background=snapshot.background or None,
+                    reference=snapshot.reference or None,
+                )
             except (FormulaError, ValueError) as exc:
                 message = str(exc)
                 if message != self._last_formula_error:
