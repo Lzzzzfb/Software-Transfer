@@ -10,6 +10,7 @@ import numpy as np
 
 from ..acquisition.coordinator import AcquisitionCoordinator
 from ..acquisition.controller import AcquisitionController
+from ..acquisition.frame_quality import FrameQualityAnalyzer
 from ..communication.serial_port import DeviceFinder
 from ..device.device_manager import DeviceManager
 from ..domain.enums import (
@@ -23,7 +24,7 @@ from ..domain.enums import (
 )
 from ..domain.models import SpectrumFrame, SpectrumReference
 from ..processing.formula import FormulaError, validate_formula
-from ..processing.processor import ProcessingConfig, SpectrumProcessor
+from ..processing.processor import ProcessingSnapshot, SpectrumProcessor
 from ..processing.references import ReferenceRepository
 from ..qt import QtCore, QtWidgets, dialog_exec
 from ..services.settings_service import SettingsService
@@ -65,6 +66,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings = self.settings_service.load()
         self.device_manager = DeviceManager()
         self.processor = SpectrumProcessor()
+        self.frame_quality = FrameQualityAnalyzer()
         self.display_fps = DISPLAY_FPS
         self.acquisition = AcquisitionCoordinator(
             lambda frame: None, display_fps=self.display_fps
@@ -72,7 +74,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reference_repository = ReferenceRepository(
             Path(self.settings["storage_path"]) / "references"
         )
-        self.storage_manager = StorageSessionManager(self.settings["storage_path"])
+        self.storage_manager = StorageSessionManager(
+            self.settings["storage_path"],
+            processing_snapshot_provider=self._processing_snapshots,
+        )
         self.control = AcquisitionController(
             self.device_manager,
             self.storage_manager,
@@ -81,6 +86,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._initializing_devices = set()
         self._latest_frames = {}
         self._task_requests = {}
+        self._processing_by_device = {}
         self._sim_x = {}; self._sim_sequence = {}; self._sim_phase = 0.0
         self._shown_since_status = 0; self._last_status_time = time.monotonic()
         self._last_formula_error = ""
@@ -384,6 +390,14 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
 
     def _frame_arrived(self, frame):
+        quality = self.frame_quality.inspect(frame)
+        if not quality.accepted:
+            self._log(
+                f"设备 {frame.device_id} 丢弃错误帧 "
+                f"Seq {frame.sequence:06X}：{quality.reason}",
+                "ERROR",
+            )
+            return
         self._latest_frames[frame.device_id] = frame
         try:
             self.control.on_frame(frame)
@@ -392,27 +406,58 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"采集帧处理错误: {exc}", "ERROR")
 
+    def _processing_snapshots(self, devices):
+        mode = ProcessingMode(self.display_mode.currentData())
+        formula = self.formula_edit.text().strip()
+        snapshots = {}
+        for device in devices:
+            pixel_count = device.info.valid_pixel or device.info.pixel_count or 4096
+            calibration = (
+                device.intensity_calib
+                if device.intensity_calib is not None
+                else ()
+            )
+            background = (
+                device.background_spectrum
+                if device.background_spectrum is not None
+                else ()
+            )
+            reference = (
+                device.reference_spectrum
+                if device.reference_spectrum is not None
+                else ()
+            )
+            snapshots[device.device_id] = ProcessingSnapshot(
+                mode=mode.value,
+                custom_formula=formula,
+                wavelengths=tuple(device.get_wavelength_array(pixel_count)),
+                intensity_calibration=tuple(float(value) for value in calibration),
+                background=tuple(float(value) for value in background),
+                reference=tuple(float(value) for value in reference),
+            )
+        self._processing_by_device.update(snapshots)
+        return snapshots
+
     def _plot_tick(self):
         frames = self.acquisition.take_display_frames()
         for device_id, frame in frames.items():
             device = self.device_manager.get_device(device_id)
             if not device: continue
-            wavelengths = device.get_wavelength_array(frame.pixel_count)
-            mode = ProcessingMode(self.display_mode.currentData())
-            config = ProcessingConfig(mode=mode, custom_formula=self.formula_edit.text().strip())
             try:
-                processed = self.processor.process(
-                    wavelengths, frame.pixels, config,
-                    intensity_calibration=device.intensity_calib,
-                    background=device.background_spectrum,
-                    reference=device.reference_spectrum,
-                )
+                snapshot = self._processing_by_device.get(device_id)
+                if snapshot is None:
+                    snapshot = self._processing_snapshots([device])[device_id]
+                processed = self.processor.process_frame(frame, snapshot)
             except (FormulaError, ValueError) as exc:
                 message = str(exc)
                 if message != self._last_formula_error:
                     self._last_formula_error = message; self._log(f"处理未应用: {message}", "WARN")
                 continue
-            x = np.arange(frame.pixel_count) if self.x_axis.currentData() == "pixel" else processed.wavelengths
+            x = (
+                np.arange(frame.pixel_count)
+                if self.x_axis.currentData() == "pixel"
+                else np.asarray(snapshot.wavelengths)
+            )
             label = device.info.prod_serial or device.port_name or f"设备 {device_id}"
             self.plot_widget.update_device_curve(device_id, x, processed.values, label)
             self._shown_since_status += 1
@@ -507,12 +552,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _control_task_started(self, task_id, request):
         self._task_requests[task_id] = request
+        devices = [
+            self.device_manager.get_device(device_id)
+            for device_id in request.device_ids
+        ]
+        missing = [
+            device
+            for device in devices
+            if device is not None and device.device_id not in self._processing_by_device
+        ]
+        if missing:
+            self._processing_snapshots(missing)
         scope = "总控" if request.owner is AcquisitionOwner.GLOBAL else "单机"
         mode = "连续" if request.mode is AcquisitionMode.CONTINUOUS else "单次"
         self._log(f"{scope}{mode}采集已启动，共 {len(request.device_ids)} 台设备")
 
     def _control_task_finished(self, task_id, files, failed):
         request = self._task_requests.pop(task_id, None)
+        if request is not None:
+            for device_id in request.device_ids:
+                self._processing_by_device.pop(device_id, None)
         if files:
             self._log(f"采集存储完成，已生成 {len(files)} 个文件")
         if failed:

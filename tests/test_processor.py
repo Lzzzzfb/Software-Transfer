@@ -2,7 +2,12 @@ import numpy as np
 import pytest
 
 from spectrometer.domain.enums import ProcessingMode
-from spectrometer.processing.processor import ProcessingConfig, SpectrumProcessor
+from spectrometer.domain.models import SpectrumFrame
+from spectrometer.processing.processor import (
+    ProcessingConfig,
+    ProcessingSnapshot,
+    SpectrumProcessor,
+)
 
 
 def test_raw_calibration_dark_subtract_and_absorbance_are_separate():
@@ -46,3 +51,17 @@ def test_custom_formula_uses_reference_aliases():
         reference=[9, 18],
     )
     np.testing.assert_allclose(result.values, [0.5, 0.5])
+
+
+def test_process_frame_preserves_negative_background_subtraction():
+    snapshot = ProcessingSnapshot(
+        mode="dark_subtract",
+        wavelengths=(500.0, 501.0),
+        background=(15.0, 25.0),
+    )
+    frame = SpectrumFrame.create(0, 9 << 8, [10, 30])
+
+    processed = SpectrumProcessor().process_frame(frame, snapshot)
+
+    assert processed.sequence == 9
+    assert processed.values == (-5.0, 5.0)

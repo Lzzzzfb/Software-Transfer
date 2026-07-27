@@ -32,12 +32,14 @@ class StorageSessionManager(QtCore.QObject):
         *,
         coordinator_factory=BatchStorageCoordinator,
         max_close_workers: int = 4,
+        processing_snapshot_provider=None,
         parent=None,
     ):
         super().__init__(parent)
         self.output_directory = Path(output_directory)
         self.output_directory.mkdir(parents=True, exist_ok=True)
         self.coordinator_factory = coordinator_factory
+        self.processing_snapshot_provider = processing_snapshot_provider
         self._sessions: Dict[str, _ManagedSession] = {}
         self._device_routes: Dict[int, str] = {}
         self._executor = ThreadPoolExecutor(
@@ -117,6 +119,11 @@ class StorageSessionManager(QtCore.QObject):
             }
             for device in devices
         }
+        processing_snapshots = (
+            dict(self.processing_snapshot_provider(devices))
+            if self.processing_snapshot_provider is not None
+            else {}
+        )
         task_id = request.task_id
         coordinator = self.coordinator_factory(
             self.output_directory,
@@ -124,6 +131,7 @@ class StorageSessionManager(QtCore.QObject):
             wavelengths_by_device=wavelengths,
             device_labels=labels,
             device_metadata=metadata,
+            processing_snapshots=processing_snapshots,
             filename_stem=workbook_stem,
             device_filename_stems=device_stems,
             warning_callback=lambda message, tid=task_id:

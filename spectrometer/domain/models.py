@@ -73,6 +73,40 @@ class SpectrumFrame:
 
 
 @dataclass(frozen=True)
+class ProcessedSpectrumFrame:
+    """A storage/display frame whose values may be floating point or negative."""
+
+    device_id: int
+    packet_number: int
+    values: Tuple[float, ...]
+    monotonic_ns: int
+    timestamp_ns: int
+    sequence_bits: int = 24
+
+    def __post_init__(self):
+        if self.device_id < 0:
+            raise ValueError("device_id 不能为负数")
+        if not 0 <= self.packet_number <= 0xFFFFFFFF:
+            raise ValueError("packet_number 必须是 U32")
+        if self.sequence_bits not in (16, 24):
+            raise ValueError("序号位宽只能是 16 或 24")
+
+    @property
+    def sequence(self) -> int:
+        return (self.packet_number >> 8) & 0xFFFFFF
+
+    @property
+    def pixel_count(self) -> int:
+        return len(self.values)
+
+    @property
+    def pixels(self) -> Tuple[float, ...]:
+        """Compatibility alias used by the existing exporters."""
+
+        return self.values
+
+
+@dataclass(frozen=True)
 class DeviceInfo:
     device_id: int
     port_name: str

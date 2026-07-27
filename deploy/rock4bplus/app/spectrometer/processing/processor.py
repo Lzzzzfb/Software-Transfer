@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..domain.enums import ProcessingMode
+from ..domain.models import ProcessedSpectrumFrame, SpectrumFrame
 from .formula import evaluate_formula
 
 
@@ -29,7 +30,46 @@ class ProcessedSpectrum:
     warnings: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ProcessingSnapshot:
+    """Serializable processing inputs frozen at acquisition start."""
+
+    mode: str = ProcessingMode.RAW.value
+    custom_formula: str = ""
+    wavelengths: Tuple[float, ...] = ()
+    intensity_calibration: Tuple[float, ...] = ()
+    background: Tuple[float, ...] = ()
+    reference: Tuple[float, ...] = ()
+
+    @property
+    def config(self) -> ProcessingConfig:
+        return ProcessingConfig(
+            mode=ProcessingMode(self.mode),
+            custom_formula=self.custom_formula,
+        )
+
+
 class SpectrumProcessor:
+    def process_frame(
+        self, frame: SpectrumFrame, snapshot: ProcessingSnapshot
+    ) -> ProcessedSpectrumFrame:
+        processed = self.process(
+            snapshot.wavelengths,
+            frame.pixels,
+            snapshot.config,
+            intensity_calibration=snapshot.intensity_calibration or None,
+            background=snapshot.background or None,
+            reference=snapshot.reference or None,
+        )
+        return ProcessedSpectrumFrame(
+            device_id=frame.device_id,
+            packet_number=frame.packet_number,
+            values=tuple(float(value) for value in processed.values),
+            monotonic_ns=frame.monotonic_ns,
+            timestamp_ns=frame.timestamp_ns,
+            sequence_bits=frame.sequence_bits,
+        )
+
     def process(
         self,
         wavelengths,

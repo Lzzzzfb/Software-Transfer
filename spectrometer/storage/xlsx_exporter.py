@@ -89,9 +89,16 @@ def export_workbook(
                 sheet.write_number(row, 0, pixel_index)
                 if wavelengths:
                     sheet.write_number(row, 1, wavelengths[pixel_index], number_format)
-                for column, frame in enumerate(frames, 2):
-                    if pixel_index < frame.pixel_count:
-                        sheet.write_number(row, column, frame.pixels[pixel_index])
+                sheet.write_row(
+                    row,
+                    2,
+                    [
+                        frame.pixels[pixel_index]
+                        if pixel_index < frame.pixel_count
+                        else None
+                        for frame in frames
+                    ],
+                )
     finally:
         workbook.close()
     return target

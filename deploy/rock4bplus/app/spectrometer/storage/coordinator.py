@@ -1,6 +1,8 @@
 """有界队列、临时缓存和 CSV/Excel 批次导出的协调器。"""
 
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 import queue
 import re
 import threading
@@ -8,10 +10,10 @@ from typing import Callable, Dict, Mapping, Optional
 
 from ..domain.enums import StorageFormat
 from ..domain.models import AcquisitionSession, SpectrumFrame
-from .csv_exporter import export_device_csv
+from ..processing.processor import ProcessingSnapshot
 from .naming import unique_path
+from .process_worker import export_processed_batch
 from .spool import SpoolWriter
-from .xlsx_exporter import export_workbook
 
 
 class StorageBackpressureError(RuntimeError):
@@ -27,6 +29,7 @@ class BatchStorageCoordinator:
         wavelengths_by_device: Mapping[int, tuple] = None,
         device_labels: Mapping[int, str] = None,
         device_metadata: Mapping[int, Mapping] = None,
+        processing_snapshots: Mapping[int, ProcessingSnapshot] = None,
         filename_stem: str = "",
         device_filename_stems: Mapping[int, str] = None,
         warning_callback: Optional[Callable[[str], None]] = None,
@@ -38,6 +41,7 @@ class BatchStorageCoordinator:
         self.wavelengths_by_device = dict(wavelengths_by_device or {})
         self.device_labels = dict(device_labels or {})
         self.device_metadata = dict(device_metadata or {})
+        self.processing_snapshots = dict(processing_snapshots or {})
         self.filename_stem = str(filename_stem or "")
         self.device_filename_stems = dict(device_filename_stems or {})
         self.warning_callback = warning_callback
@@ -68,6 +72,7 @@ class BatchStorageCoordinator:
         )
         self._started = False
         self._closed = False
+        self._process_pool = None
 
     @property
     def queue_ratio(self) -> float:
@@ -114,6 +119,8 @@ class BatchStorageCoordinator:
         else:
             self._export_remaining()
         self._spool.close()
+        if self._process_pool is not None:
+            self._process_pool.shutdown(wait=True, cancel_futures=False)
         self._closed = True
         if not self.errors and self.spool_path.exists():
             self.spool_path.unlink()
@@ -171,6 +178,7 @@ class BatchStorageCoordinator:
         self._batch_index += 1
         prefix = f"{self.session.session_id}_batch_{self._batch_index:04d}"
         batch_token = f"B{self._batch_index:04d}"
+        csv_targets = {}
         if self.session.storage_format in (StorageFormat.CSV, StorageFormat.CSV_EXCEL):
             for device_id, frames in batch.items():
                 label = self._filename_token(
@@ -185,14 +193,8 @@ class BatchStorageCoordinator:
                     )
                 else:
                     path = self.output_directory / f"{prefix}_{label}.csv"
-                export_device_csv(
-                    path,
-                    device_id,
-                    frames,
-                    wavelengths=self.wavelengths_by_device.get(device_id, ()),
-                    metadata=self.device_metadata.get(device_id, {}),
-                )
-                self.exported_files.append(path)
+                csv_targets[device_id] = str(path)
+        workbook_path = None
         if self.session.storage_format in (StorageFormat.EXCEL, StorageFormat.CSV_EXCEL):
             if self.filename_stem:
                 path = unique_path(
@@ -201,18 +203,43 @@ class BatchStorageCoordinator:
                 )
             else:
                 path = self.output_directory / f"{prefix}.xlsx"
-            export_workbook(
-                path,
-                batch,
-                wavelengths_by_device=self.wavelengths_by_device,
-                device_labels=self.device_labels,
-                session_metadata={
-                    "Session ID": self.session.session_id,
-                    "Batch": self._batch_index,
-                    "Sync Mode": self.session.sync_mode.value,
-                },
+            workbook_path = str(path)
+
+        snapshots = dict(self.processing_snapshots)
+        for device_id in batch:
+            snapshots.setdefault(
+                device_id,
+                ProcessingSnapshot(
+                    wavelengths=tuple(self.wavelengths_by_device.get(device_id, ()))
+                ),
             )
-            self.exported_files.append(path)
+        if self._process_pool is None:
+            self._process_pool = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        result = self._process_pool.submit(
+            export_processed_batch,
+            batch,
+            processing_snapshots=snapshots,
+            csv_targets=csv_targets,
+            xlsx_target=workbook_path,
+            wavelengths_by_device=self.wavelengths_by_device,
+            device_labels=self.device_labels,
+            device_metadata=self.device_metadata,
+            session_metadata={
+                "Session ID": self.session.session_id,
+                "Batch": self._batch_index,
+                "Sync Mode": self.session.sync_mode.value,
+            },
+        ).result()
+        self.exported_files.extend(Path(path) for path in result["files"])
+        for device_id, rejected in result["rejected"].items():
+            for sequence, reason in rejected:
+                if self.warning_callback:
+                    self.warning_callback(
+                        f"设备 {device_id} 丢弃错误帧 Seq {sequence:06X}：{reason}"
+                    )
 
     @staticmethod
     def _filename_token(value: str) -> str:

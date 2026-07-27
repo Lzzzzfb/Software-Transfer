@@ -538,6 +538,7 @@ class AcquisitionController(QtCore.QObject):
                 self.diagnostic_event.emit(f"背景或参考提交失败：{exc}")
         if task.request.auto_store and self.storage_manager is not None:
             try:
+                self.diagnostic_event.emit("设备采集已停止，正在后台生成 CSV/Excel")
                 self.storage_manager.close_session(task.request.task_id)
                 return
             except Exception as exc:
