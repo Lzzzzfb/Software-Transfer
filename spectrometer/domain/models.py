@@ -24,6 +24,7 @@ class SpectrumFrame:
     timestamp_ns: int
     wavelengths: Tuple[float, ...] = ()
     sequence_bits: int = 24
+    intentionally_skipped: int = 0
 
     def __post_init__(self):
         if self.device_id < 0:
@@ -36,6 +37,8 @@ class SpectrumFrame:
             raise ValueError("波长与像素数量必须相同")
         if self.sequence_bits not in (16, 24):
             raise ValueError("序号位宽只能是 16 或 24")
+        if self.intentionally_skipped < 0:
+            raise ValueError("主动跳过帧数不能为负数")
 
     @property
     def sequence(self) -> int:
@@ -60,6 +63,7 @@ class SpectrumFrame:
         monotonic_ns: Optional[int] = None,
         timestamp_ns: Optional[int] = None,
         sequence_bits: int = 24,
+        intentionally_skipped: int = 0,
     ) -> "SpectrumFrame":
         return cls(
             device_id=device_id,
@@ -69,6 +73,7 @@ class SpectrumFrame:
             monotonic_ns=time.monotonic_ns() if monotonic_ns is None else monotonic_ns,
             timestamp_ns=time.time_ns() if timestamp_ns is None else timestamp_ns,
             sequence_bits=sequence_bits,
+            intentionally_skipped=intentionally_skipped,
         )
 
 

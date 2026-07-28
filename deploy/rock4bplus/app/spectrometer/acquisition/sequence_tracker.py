@@ -28,9 +28,13 @@ class SequenceTracker:
         self.out_of_order = 0
         self.wraps = 0
 
-    def observe(self, sequence: int) -> SequenceObservation:
+    def observe(
+        self, sequence: int, intentionally_skipped: int = 0
+    ) -> SequenceObservation:
         if not 0 <= sequence < self.modulus:
             raise ValueError(f"序号必须是 {self.sequence_bits} 位无符号整数")
+        if intentionally_skipped < 0:
+            raise ValueError("主动跳过帧数不能为负数")
 
         previous = self.last_sequence
         self.received += 1
@@ -50,7 +54,7 @@ class SequenceTracker:
                 sequence=sequence, previous=previous, out_of_order=True
             )
 
-        missing = delta - 1
+        missing = max(0, delta - 1 - intentionally_skipped)
         wrapped = sequence < previous
         self.missing += missing
         self.wraps += int(wrapped)

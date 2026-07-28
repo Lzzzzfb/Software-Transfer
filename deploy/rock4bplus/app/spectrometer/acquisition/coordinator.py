@@ -43,7 +43,9 @@ class AcquisitionCoordinator:
             self._trackers[frame.device_id] = tracker
         elif tracker.sequence_bits != frame.sequence_bits:
             raise ValueError("同一设备的包序号位宽在采集中发生变化")
-        observation = tracker.observe(frame.sequence)
+        observation = tracker.observe(
+            frame.sequence, frame.intentionally_skipped
+        )
 
         # 存储回调在显示合并前调用，任何帧都不会因界面节流而丢失。
         if self.storage_sink is not None:

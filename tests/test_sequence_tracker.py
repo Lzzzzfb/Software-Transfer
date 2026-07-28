@@ -36,3 +36,21 @@ def test_tracker_accepts_real_firmware_16_bit_wrap_without_false_gap():
     assert wrapped.wrapped
     assert wrapped.missing == 0
     assert tracker.wraps == 1
+
+
+def test_tracker_does_not_report_intentionally_thinned_frames_as_missing():
+    tracker = SequenceTracker()
+    tracker.observe(100)
+    thinned = tracker.observe(105, intentionally_skipped=4)
+
+    assert thinned.missing == 0
+    assert tracker.missing == 0
+
+
+def test_tracker_still_reports_gap_beyond_intentional_thinning():
+    tracker = SequenceTracker()
+    tracker.observe(100)
+    observation = tracker.observe(106, intentionally_skipped=4)
+
+    assert observation.missing == 1
+    assert tracker.missing == 1

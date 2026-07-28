@@ -1,6 +1,7 @@
 """串口通信：每台设备在独立 QThread 中完成非阻塞 I/O。"""
 
 from typing import Optional
+import time
 
 from ..qt import QtCore, QtSerialPort, Signal, Slot
 from ..domain.models import SpectrumFrame
@@ -12,6 +13,7 @@ from .protocol import CmdCode, build_packet, parse_data_packet, parse_packet
 MAX_BUFFER_SIZE = 2 * 1024 * 1024
 CH569W_VENDOR_ID = 0x1A86
 CH569W_PRODUCT_ID = 0xFE0C
+FRAME_EMIT_INTERVAL_NS = 50_000_000
 
 
 QSerialPort = QtSerialPort.QSerialPort
@@ -50,6 +52,8 @@ class SerialWorker(QtCore.QObject):
         self._n_valid_pixel = 0
         self.latest_pixels = None
         self.latest_frame_metadata = None
+        self._last_frame_emit_ns = 0
+        self._intentionally_skipped = 0
 
     @Slot()
     def do_connect(self):
@@ -84,6 +88,8 @@ class SerialWorker(QtCore.QObject):
         if self._serial and self._serial.isOpen():
             self._serial.close()
         self._decoder.reset()
+        self._last_frame_emit_ns = 0
+        self._intentionally_skipped = 0
 
     @Slot(QtCore.QByteArray)
     def do_write(self, data):
@@ -92,6 +98,9 @@ class SerialWorker(QtCore.QObject):
 
     @Slot(int, QtCore.QByteArray)
     def do_send_command(self, cmd: int, params):
+        if cmd in (int(CmdCode.START_SINGLE), int(CmdCode.START_CONTINUOUS)):
+            self._last_frame_emit_ns = 0
+            self._intentionally_skipped = 0
         self.do_write(QtCore.QByteArray(build_packet(cmd, bytes(params))))
 
     @Slot(int, int, int)
@@ -125,6 +134,14 @@ class SerialWorker(QtCore.QObject):
     def _handle_packet(self, packet_data: bytes):
         try:
             if packet_data[3] == CmdCode.DATA_TRANSMIT:
+                now_ns = time.monotonic_ns()
+                if (
+                    self._last_frame_emit_ns
+                    and now_ns - self._last_frame_emit_ns
+                    < FRAME_EMIT_INTERVAL_NS
+                ):
+                    self._intentionally_skipped += 1
+                    return
                 parsed = parse_data_packet(
                     packet_data,
                     n_pixel=self._n_pixel,
@@ -147,9 +164,12 @@ class SerialWorker(QtCore.QObject):
                         (parsed["frame_sequence"] << 8) | parsed["reserved"],
                         pixels,
                         sequence_bits=parsed["packet_number_bits"] if parsed["packet_number_bits"] == 16 else 24,
+                        intentionally_skipped=self._intentionally_skipped,
                     )
                 )
-                # 逐帧信号供无丢帧存储链路使用；显示仍可读取 latest_pixels 节流。
+                self._intentionally_skipped = 0
+                self._last_frame_emit_ns = now_ns
+                # 当前阶段统一门控到 20 FPS，避免 Qt 主线程事件队列积压。
                 self.data_received.emit(self.device_index, pixels)
             else:
                 cmd, params = parse_packet(packet_data)
