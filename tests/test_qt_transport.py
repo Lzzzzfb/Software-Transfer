@@ -22,12 +22,12 @@ class CaptureWorker(QtCore.QObject):
         super().__init__()
         self.received = []
 
-    @Slot(QtCore.QByteArray)
-    def do_write(self, payload):
-        self.received.append(bytes(payload))
+    @Slot(int, QtCore.QByteArray)
+    def do_send_command(self, cmd, params):
+        self.received.append((cmd, bytes(params)))
 
 
-def test_device_manager_queues_qbytearray_for_pyside6_and_pyqt5():
+def test_device_manager_queues_command_and_params_for_pyside6_and_pyqt5():
     app = application()
     manager = DeviceManager()
     manager.devices[0] = SpectrometerDevice(0, "COM_TEST")
@@ -37,4 +37,4 @@ def test_device_manager_queues_qbytearray_for_pyside6_and_pyqt5():
     assert manager.send_to_device(0, CmdCode.GET_VERSION)
     app.processEvents()
 
-    assert worker.received == [build_packet(CmdCode.GET_VERSION)]
+    assert worker.received == [(int(CmdCode.GET_VERSION), b"")]

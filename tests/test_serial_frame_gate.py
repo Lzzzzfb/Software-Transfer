@@ -53,3 +53,25 @@ def test_control_response_is_not_subject_to_data_frame_gate():
     worker._handle_packet(build_packet(CmdCode.GET_VERSION, b"\x01\x02"))
 
     assert responses == [(0, int(CmdCode.GET_VERSION), b"\x01\x02")]
+
+
+def test_start_command_resets_frame_gate(monkeypatch):
+    worker = SerialWorker(0, "TEST", 115200)
+    worker._last_frame_emit_ns = 123
+    worker._intentionally_skipped = 7
+    written = []
+    monkeypatch.setattr(worker, "do_write", lambda data: written.append(bytes(data)))
+
+    worker.do_send_command(int(CmdCode.START_CONTINUOUS), b"")
+
+    assert worker._last_frame_emit_ns == 0
+    assert worker._intentionally_skipped == 0
+    assert written == [build_packet(CmdCode.START_CONTINUOUS)]
+
+
+def test_pixel_info_configures_decoder_expected_data_length():
+    worker = SerialWorker(0, "TEST", 115200)
+
+    worker.set_pixel_info(3648, 0, 3648)
+
+    assert worker._decoder.expected_pixel_count == 3648

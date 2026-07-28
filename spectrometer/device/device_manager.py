@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from ..communication.protocol import CmdCode, TriggerMode, build_packet, check_status
+from ..communication.protocol import CmdCode, TriggerMode, check_status
 from ..communication.serial_port import SerialWorker
 from ..domain.models import SpectrumFrame
 from ..qt import QtCore, Signal
@@ -208,12 +208,12 @@ class DeviceManager(QtCore.QObject):
         if worker is None:
             # 模拟设备视为成功接收，便于全流程演示。
             return device_id in self.devices and self.devices[device_id].port_name.startswith("SIM")
-        packet = build_packet(cmd, params)
         QtCore.QMetaObject.invokeMethod(
             worker,
-            "do_write",
+            "do_send_command",
             QtCore.Qt.QueuedConnection,
-            QtCore.Q_ARG(QtCore.QByteArray, QtCore.QByteArray(packet)),
+            QtCore.Q_ARG(int, int(cmd)),
+            QtCore.Q_ARG(QtCore.QByteArray, QtCore.QByteArray(params)),
         )
         return True
 

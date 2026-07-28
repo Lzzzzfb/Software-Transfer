@@ -108,18 +108,31 @@ class SerialWorker(QtCore.QObject):
         self._n_pixel = n_pixel
         self._n_start_pixel = n_start_pixel
         self._n_valid_pixel = n_valid_pixel
+        self._decoder.set_expected_pixel_count(n_pixel)
 
     def _on_ready_read(self):
         data = bytes(self._serial.readAll())
         previous_overflows = self._decoder.overflow_count
         previous_invalid = self._decoder.invalid_headers
+        previous_checksums = self._decoder.checksum_failures
+        previous_lengths = self._decoder.length_failures
+        previous_resyncs = self._decoder.resync_count
         frames = self._decoder.feed(data)
 
         if self._decoder.overflow_count > previous_overflows:
             self.packet_error.emit(self.device_index, "串口缓冲区溢出，已重新同步")
-        if self._decoder.invalid_headers > previous_invalid:
+        rejected = self._decoder.invalid_headers - previous_invalid
+        checksum_failures = self._decoder.checksum_failures - previous_checksums
+        length_failures = self._decoder.length_failures - previous_lengths
+        recovered = self._decoder.resync_count - previous_resyncs
+        if rejected:
             self.packet_error.emit(
-                self.device_index, "检测到非法帧头或长度，已重新同步"
+                self.device_index,
+                (
+                    f"串口帧重新同步：拒绝 {rejected} 个候选帧"
+                    f"（校验 {checksum_failures}，长度 {length_failures}），"
+                    f"恢复 {recovered} 次"
+                ),
             )
 
         for packet_data in frames:
