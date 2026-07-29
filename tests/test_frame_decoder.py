@@ -71,12 +71,41 @@ def test_decoder_rejects_data_length_that_disagrees_with_known_pixel_count():
 
 
 def test_decoder_accepts_both_data_variants_for_known_pixel_count():
-    decoder = FrameDecoder()
-    decoder.set_expected_pixel_count(2)
+    u32_decoder = FrameDecoder()
+    legacy_decoder = FrameDecoder()
+    u32_decoder.set_expected_pixel_count(2)
+    legacy_decoder.set_expected_pixel_count(2)
     u32_frame = make_data_frame(pixels=(10, 20))
     legacy_frame = (
         b"\x24\x07\x00\x80\x01\x00"
         b"\x00\x0A\x00\x14\x00"
     )
 
-    assert decoder.feed(u32_frame + legacy_frame) == [u32_frame, legacy_frame]
+    assert u32_decoder.feed(u32_frame) == [u32_frame]
+    assert legacy_decoder.feed(legacy_frame) == [legacy_frame]
+
+
+def test_decoder_locks_first_valid_data_variant_for_connection():
+    decoder = FrameDecoder()
+    decoder.set_expected_pixel_count(2)
+    legacy_frame = (
+        b"\x24\x07\x00\x80\x01\x00"
+        b"\x00\x0A\x00\x14\x00"
+    )
+    u32_frame = make_data_frame(pixels=(10, 20))
+
+    assert decoder.feed(legacy_frame) == [legacy_frame]
+    assert decoder.data_variant == "legacy_u16"
+    assert decoder.feed(u32_frame) == []
+    assert decoder.length_failures >= 1
+
+
+def test_decoder_reset_clears_data_variant_lock():
+    decoder = FrameDecoder()
+    decoder.set_expected_pixel_count(2)
+    decoder.feed(make_data_frame(pixels=(10, 20)))
+
+    assert decoder.data_variant == "u32"
+    decoder.reset()
+
+    assert decoder.data_variant is None

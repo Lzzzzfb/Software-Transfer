@@ -82,9 +82,9 @@ class MainWindow(QtWidgets.QMainWindow):
             reference_commit=self._commit_reference_frames,
         )
         self._initializing_devices = set()
-        self._latest_frames = {}
         self._task_requests = {}
         self._processing_by_device = {}
+        self._process_diagnostics = {}
         self._sim_x = {}; self._sim_sequence = {}; self._sim_phase = 0.0
         self._shown_since_status = 0; self._last_status_time = time.monotonic()
         self._last_formula_error = ""
@@ -221,6 +221,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_manager.error_occurred.connect(lambda did, msg: self._log(f"设备 {did}: {msg}", "ERROR"))
         self.device_manager.device_connect_failed.connect(lambda did, msg: self._log(f"设备 {did} 连接失败: {msg}", "WARN"))
         self.device_manager.diagnostic_event.connect(self._log)
+        self.device_manager.acquisition_diagnostics.connect(
+            self._acquisition_diagnostics_updated
+        )
         self.control.global_state_changed.connect(self._global_control_state_changed)
         self.control.device_state_changed.connect(self._device_control_state_changed)
         self.control.operation_rejected.connect(self._operation_rejected)
@@ -388,7 +391,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
 
     def _frame_arrived(self, frame):
-        self._latest_frames[frame.device_id] = frame
         try:
             self.control.on_frame(frame)
             observation = self.acquisition.ingest(frame)
@@ -458,7 +460,10 @@ class MainWindow(QtWidgets.QMainWindow):
             label = device.info.prod_serial or device.port_name or f"设备 {device_id}"
             self.plot_widget.update_device_curve(device_id, x, processed.values, label)
             self._shown_since_status += 1
-            self.diagnostics.update_device(device_id, self.acquisition.diagnostics(device_id))
+            if device_id not in self._process_diagnostics:
+                self.diagnostics.update_device(
+                    device_id, self.acquisition.diagnostics(device_id)
+                )
         y_labels = {
             "raw": "强度（计数）",
             "dark_subtract": "扣背景强度",
@@ -661,10 +666,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _log(self, message, level="INFO"):
         self.diagnostics.append(message, level)
 
+    def _acquisition_diagnostics_updated(self, device_id, values):
+        values = dict(values or {})
+        self._process_diagnostics[device_id] = values
+        self.diagnostics.update_acquisition(device_id, values)
+
     def _update_status(self):
         now = time.monotonic(); elapsed = max(1e-6, now - self._last_status_time)
         fps = self._shown_since_status / elapsed; self._shown_since_status = 0; self._last_status_time = now
-        missing = sum(self.acquisition.diagnostics(device_id).missing for device_id in self.device_manager.devices)
+        if self._process_diagnostics:
+            missing = sum(
+                values.get("missing_frames", 0)
+                for values in self._process_diagnostics.values()
+            )
+        else:
+            missing = sum(self.acquisition.diagnostics(device_id).missing for device_id in self.device_manager.devices)
         queue_ratio = self.storage_manager.queue_ratio
         try: free_gb = shutil.disk_usage(Path(self.settings["storage_path"]).resolve()).free / (1024 ** 3)
         except OSError: free_gb = 0.0

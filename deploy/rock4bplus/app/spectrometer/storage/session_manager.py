@@ -9,6 +9,7 @@ from ..domain.models import AcquisitionSession, SpectrumFrame
 from ..qt import QtCore, Signal, Slot
 from .coordinator import BatchStorageCoordinator
 from .naming import build_session_file_stems
+from .sealed_export import SealedSpoolExporter
 
 
 @dataclass
@@ -150,6 +151,72 @@ class StorageSessionManager(QtCore.QObject):
                 self._device_routes.pop(device_id, None)
             self._sessions.pop(task_id, None)
             raise
+
+    def start_sealed_export(self, request, devices, sealed_results) -> None:
+        if request.task_id in self._sessions:
+            raise ValueError("存储任务已经存在")
+        devices = list(devices)
+        device_ids = tuple(device.device_id for device in devices)
+        if set(device_ids) != set(sealed_results):
+            raise ValueError("封存文件与采集设备集合不一致")
+        spool_paths = {
+            device_id: values["spool_path"]
+            for device_id, values in sealed_results.items()
+        }
+        expected_counts = {
+            device_id: values["persisted_frames"]
+            for device_id, values in sealed_results.items()
+        }
+        workbook_stem, device_stems = build_session_file_stems(request, devices)
+        wavelengths = {
+            device.device_id: tuple(
+                device.get_wavelength_array(
+                    device.info.valid_pixel
+                    or device.info.pixel_count
+                    or 4096
+                )
+            )
+            for device in devices
+        }
+        labels = {
+            device.device_id: (
+                device.info.prod_serial
+                or device.port_name
+                or f"设备_{device.device_id}"
+            )
+            for device in devices
+        }
+        metadata = {
+            device.device_id: {
+                "Port": device.port_name,
+                "Serial": device.info.prod_serial,
+                "Integration Time (us)": device.integration_time_us,
+                "Trigger Mode": device.trigger_mode,
+            }
+            for device in devices
+        }
+        snapshots = (
+            dict(self.processing_snapshot_provider(devices))
+            if self.processing_snapshot_provider is not None
+            else {}
+        )
+        exporter = SealedSpoolExporter(
+            self.output_directory,
+            request,
+            spool_paths,
+            expected_counts=expected_counts,
+            wavelengths_by_device=wavelengths,
+            device_labels=labels,
+            device_metadata=metadata,
+            processing_snapshots=snapshots,
+            filename_stem=workbook_stem,
+            device_filename_stems=device_stems,
+        )
+        managed = _ManagedSession(exporter, device_ids, closing=True)
+        self._sessions[request.task_id] = managed
+        managed.future = self._executor.submit(
+            self._close_worker, request.task_id, exporter
+        )
 
     def submit(self, frame: SpectrumFrame) -> bool:
         task_id = self._device_routes.get(frame.device_id)

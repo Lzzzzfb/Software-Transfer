@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from typing import Mapping
 
-from ..acquisition.frame_quality import FrameQualityAnalyzer
 from ..processing.processor import ProcessingSnapshot, SpectrumProcessor
 from .csv_exporter import export_device_csv
 from .xlsx_exporter import export_workbook
@@ -33,7 +32,6 @@ def export_processed_batch(
         except OSError:
             pass
 
-    analyzer = FrameQualityAnalyzer()
     processor = SpectrumProcessor()
     processed = {}
     rejected = {}
@@ -41,18 +39,13 @@ def export_processed_batch(
         snapshot = processing_snapshots.get(device_id)
         if snapshot is None:
             raise ValueError(f"设备 {device_id} 缺少处理上下文")
-        accepted = []
-        dropped = []
-        for frame in frames:
-            quality = analyzer.inspect(frame)
-            if not quality.accepted:
-                dropped.append((frame.sequence, quality.reason))
-                continue
-            accepted.append(processor.process_frame(frame, snapshot))
+        accepted = [
+            processor.process_frame(frame, snapshot) for frame in frames
+        ]
         if not accepted:
             raise ValueError(f"设备 {device_id} 的批次没有可导出的有效帧")
         processed[device_id] = accepted
-        rejected[device_id] = dropped
+        rejected[device_id] = []
 
     published = []
     temporary = []

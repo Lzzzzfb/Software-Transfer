@@ -1,6 +1,7 @@
 """总控、单机和背景/参考共用的采集生命周期控制器。"""
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import time
 from typing import Callable, Dict, Optional
 
@@ -33,6 +34,11 @@ class _ActiveTask:
     failed: bool = False
     stop_requested_at: float = 0.0
     last_frame_at: float = 0.0
+    process_spool_devices: set = field(default_factory=set)
+    sealed_devices: set = field(default_factory=set)
+    sealed_results: Dict[int, dict] = field(default_factory=dict)
+    seal_requested: bool = False
+    external_export_started: bool = False
 
 
 class AcquisitionController(QtCore.QObject):
@@ -78,6 +84,14 @@ class AcquisitionController(QtCore.QObject):
             self.device_manager.device_updated.connect(self._on_device_changed)
         if hasattr(self.device_manager, "device_removed"):
             self.device_manager.device_removed.connect(self._on_device_changed)
+        if hasattr(self.device_manager, "persistent_session_sealed"):
+            self.device_manager.persistent_session_sealed.connect(
+                self._on_persistent_session_sealed
+            )
+        if hasattr(self.device_manager, "acquisition_stop_requested"):
+            self.device_manager.acquisition_stop_requested.connect(
+                self._on_acquisition_stop_requested
+            )
         if storage_manager is not None:
             storage_manager.session_closed.connect(self._on_storage_closed)
             if hasattr(storage_manager, "controlled_stop_requested"):
@@ -274,7 +288,11 @@ class AcquisitionController(QtCore.QObject):
         ):
             return
         task.last_frame_at = time.monotonic()
-        if task.request.auto_store and self.storage_manager is not None:
+        if (
+            task.request.auto_store
+            and not task.process_spool_devices
+            and self.storage_manager is not None
+        ):
             try:
                 self.storage_manager.submit(frame)
             except Exception as exc:
@@ -306,7 +324,43 @@ class AcquisitionController(QtCore.QObject):
         self._tasks[task.request.task_id] = task
         for device_id in task.request.device_ids:
             self._device_tasks[device_id] = task.request.task_id
-        if task.request.auto_store:
+        output_directory = (
+            Path(self.storage_manager.output_directory)
+            if self.storage_manager is not None
+            else Path.cwd() / "data"
+        )
+        output_directory.mkdir(parents=True, exist_ok=True)
+        for device_id in task.request.device_ids:
+            device = self.device_manager.get_device(device_id)
+            if device is None or device.port_name.startswith("SIM"):
+                continue
+            path = output_directory / (
+                f"{task.request.task_id}_device_{device_id}.capture.part"
+            )
+            metadata = {
+                "session_id": task.request.task_id,
+                "device_id": device_id,
+                "port": device.port_name,
+                "started_at": task.request.started_at,
+                "storage_format": task.request.storage_format.value,
+                "auto_store": task.request.auto_store,
+                "n_pixel": device.info.pixel_count,
+                "start_pixel": device.info.start_pixel,
+                "valid_pixel": device.info.valid_pixel,
+            }
+            try:
+                if (
+                    hasattr(self.device_manager, "begin_persistent_session")
+                    and self.device_manager.begin_persistent_session(
+                    device_id, path, metadata
+                    )
+                ):
+                    task.process_spool_devices.add(device_id)
+            except Exception as exc:
+                self._release_task(task)
+                return self._reject(f"无法启动独立采集持久化：{exc}")
+
+        if task.request.auto_store and not task.process_spool_devices:
             if self.storage_manager is None:
                 self._release_task(task)
                 return self._reject("自动存储服务不可用")
@@ -520,6 +574,25 @@ class AcquisitionController(QtCore.QObject):
         if task.request.task_id not in self._tasks:
             return
         self._set_task_phase(task, ControlState.FINALIZING)
+        if task.process_spool_devices and not task.seal_requested:
+            task.seal_requested = True
+            for device_id in task.process_spool_devices:
+                try:
+                    if not self.device_manager.end_persistent_session(device_id):
+                        task.failed = True
+                        task.sealed_devices.add(device_id)
+                except Exception as exc:
+                    task.failed = True
+                    task.sealed_devices.add(device_id)
+                    self.diagnostic_event.emit(
+                        f"设备 {device_id} 采集缓存封存失败：{exc}"
+                    )
+            if task.sealed_devices != task.process_spool_devices:
+                self.diagnostic_event.emit("设备已停止，正在封存全量采集数据")
+                return
+        self._finish_finalization(task)
+
+    def _finish_finalization(self, task: _ActiveTask) -> None:
         if (
             task.request.owner is AcquisitionOwner.CALIBRATION
             and not task.failed
@@ -536,7 +609,11 @@ class AcquisitionController(QtCore.QObject):
             except Exception as exc:
                 task.failed = True
                 self.diagnostic_event.emit(f"背景或参考提交失败：{exc}")
-        if task.request.auto_store and self.storage_manager is not None:
+        if (
+            task.request.auto_store
+            and not task.process_spool_devices
+            and self.storage_manager is not None
+        ):
             try:
                 self.diagnostic_event.emit("设备采集已停止，正在后台生成 CSV/Excel")
                 self.storage_manager.close_session(task.request.task_id)
@@ -544,7 +621,66 @@ class AcquisitionController(QtCore.QObject):
             except Exception as exc:
                 task.failed = True
                 self.diagnostic_event.emit(f"存储收尾失败：{exc}")
-        self._release_task(task)
+        if (
+            task.request.auto_store
+            and task.process_spool_devices
+            and self.storage_manager is not None
+            and not task.external_export_started
+        ):
+            try:
+                devices = [
+                    self.device_manager.get_device(device_id)
+                    for device_id in task.request.device_ids
+                ]
+                if any(device is None for device in devices):
+                    raise RuntimeError("导出前设备信息不完整")
+                task.external_export_started = True
+                self.diagnostic_event.emit(
+                    "全量采集数据已封存，正在后台生成 CSV/Excel"
+                )
+                self.storage_manager.start_sealed_export(
+                    task.request, devices, task.sealed_results
+                )
+                return
+            except Exception as exc:
+                task.failed = True
+                self.diagnostic_event.emit(f"封存数据导出启动失败：{exc}")
+        files = [
+            result.get("spool_path")
+            for result in task.sealed_results.values()
+            if result.get("spool_path")
+        ]
+        self._release_task(task, files)
+
+    def _on_persistent_session_sealed(self, device_id: int, result) -> None:
+        task = self._task_for_device(device_id)
+        if task is None or device_id not in task.process_spool_devices:
+            return
+        values = dict(result or {})
+        task.sealed_devices.add(device_id)
+        task.sealed_results[device_id] = values
+        sealed = bool(values.get("sealed", False))
+        complete = values.get("raw_complete_frames", 0)
+        persisted = values.get("persisted_frames", 0)
+        if not sealed:
+            task.failed = True
+            self.diagnostic_event.emit(
+                f"设备 {device_id} 全量采集文件未完成封存，已保留 .part 文件供恢复"
+            )
+        elif complete != persisted:
+            task.failed = True
+            self.diagnostic_event.emit(
+                f"设备 {device_id} 完整帧 {complete} 与持久化帧 {persisted} 不一致"
+            )
+        else:
+            self.diagnostic_event.emit(
+                f"设备 {device_id} 已封存 {persisted} 帧全量采集数据"
+            )
+        if (
+            task.phase is ControlState.FINALIZING
+            and task.sealed_devices == task.process_spool_devices
+        ):
+            self._finish_finalization(task)
 
     def _on_storage_closed(self, task_id: str, files, errors) -> None:
         task = self._tasks.get(task_id)
@@ -562,6 +698,18 @@ class AcquisitionController(QtCore.QObject):
             return
         task.failed = True
         self.diagnostic_event.emit(message)
+        self._request_stop(task)
+
+    def _on_acquisition_stop_requested(
+        self, device_id: int, message: str
+    ) -> None:
+        task = self._task_for_device(device_id)
+        if task is None:
+            return
+        task.failed = True
+        self.diagnostic_event.emit(
+            f"设备 {device_id} 请求受控停止：{message}"
+        )
         self._request_stop(task)
 
     def _release_task(self, task: _ActiveTask, files=None) -> None:

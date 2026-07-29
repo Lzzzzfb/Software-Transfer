@@ -1,14 +1,14 @@
 """多设备连接、协议识别、状态、参数 ACK 和显示节流管理。"""
 
 import math
+import sys
 import struct
 import time
 from typing import Dict, List, Optional
 
-import numpy as np
-
 from ..communication.protocol import CmdCode, TriggerMode, check_status
 from ..communication.serial_port import SerialWorker
+from ..acquisition.process_proxy import AcquisitionProcessProxy
 from ..domain.models import SpectrumFrame
 from ..qt import QtCore, Signal
 from .spectrometer import CalibrationData, DeviceInfo, SpectrometerDevice
@@ -21,10 +21,12 @@ class DeviceManager(QtCore.QObject):
     device_connected = Signal(int)
     device_connect_failed = Signal(int, str)
     calib_ready = Signal(int, float, float, float, float)
-    data_arrived = Signal(int, object, object)
     frame_arrived = Signal(object)
     error_occurred = Signal(int, str)
     diagnostic_event = Signal(str)
+    acquisition_diagnostics = Signal(int, object)
+    persistent_session_sealed = Signal(int, object)
+    acquisition_stop_requested = Signal(int, str)
     sync_started = Signal(object)
     sync_configuration_failed = Signal(str)
     command_completed = Signal(int, int, bool, object)
@@ -35,7 +37,6 @@ class DeviceManager(QtCore.QObject):
         self._workers: Dict[int, SerialWorker] = {}
         self._threads: Dict[int, QtCore.QThread] = {}
         self._next_id = 0
-        self._latest_frames: Dict[int, SpectrumFrame] = {}
         self._pending_updates: Dict[tuple, callable] = {}
         self._acquisition_requested = set()
         self._reconnect_attempts: Dict[int, int] = {}
@@ -48,10 +49,6 @@ class DeviceManager(QtCore.QObject):
         self._probe_retry_after: Dict[str, float] = {}
         self._sync_generation = 0
         self._sync_setup = None
-
-        self._process_timer = QtCore.QTimer(self)
-        self._process_timer.timeout.connect(self._on_process_tick)
-        self._process_timer.start(33)
 
         self.global_sync_enabled = False
         self.sync_mode = "soft"
@@ -121,6 +118,27 @@ class DeviceManager(QtCore.QObject):
         self._on_frame_received(frame)
 
     def _create_worker(self, device_id: int, port_name: str, baud_rate: int) -> None:
+        if sys.platform.startswith("linux"):
+            worker = AcquisitionProcessProxy(device_id, port_name, baud_rate)
+            self._workers[device_id] = worker
+            worker.frame_received.connect(self._on_frame_received)
+            worker.packet_error.connect(self._on_error)
+            worker.response_ready.connect(self._on_response)
+            worker.connection_lost.connect(self._on_disconnect)
+            worker.open_finished.connect(self._on_open_finished)
+            worker.diagnostic_ready.connect(self.acquisition_diagnostics)
+            worker.session_sealed.connect(self.persistent_session_sealed)
+            worker.fatal_error.connect(
+                lambda did, message: self.error_occurred.emit(
+                    did, f"独立采集进程失败：{message}"
+                )
+            )
+            worker.controlled_stop_requested.connect(
+                self.acquisition_stop_requested
+            )
+            QtCore.QTimer.singleShot(0, worker.do_connect)
+            return
+
         worker = SerialWorker(device_id, port_name, baud_rate)
         thread = QtCore.QThread()
         self._workers[device_id] = worker
@@ -150,9 +168,10 @@ class DeviceManager(QtCore.QObject):
             thread.quit()
             if not thread.wait(2000):
                 self.error_occurred.emit(device_id, "串口线程未在 2 秒内结束")
+        elif worker and isinstance(worker, AcquisitionProcessProxy):
+            worker.do_close()
         self._workers.pop(device_id, None)
         self._threads.pop(device_id, None)
-        self._latest_frames.pop(device_id, None)
         self._acquisition_requested.discard(device_id)
         self.devices.pop(device_id, None)
         self._reconnect_attempts.pop(device_id, None)
@@ -216,6 +235,22 @@ class DeviceManager(QtCore.QObject):
             QtCore.Q_ARG(QtCore.QByteArray, QtCore.QByteArray(params)),
         )
         return True
+
+    def begin_persistent_session(
+        self, device_id: int, path, metadata: dict
+    ) -> bool:
+        worker = self._workers.get(device_id)
+        if isinstance(worker, AcquisitionProcessProxy):
+            worker.begin_session(path, metadata)
+            return True
+        return False
+
+    def end_persistent_session(self, device_id: int) -> bool:
+        worker = self._workers.get(device_id)
+        if isinstance(worker, AcquisitionProcessProxy):
+            worker.end_session()
+            return True
+        return False
 
     def broadcast_command(
         self, cmd: int, params: bytes = b"", device_ids: Optional[List[int]] = None
@@ -478,19 +513,7 @@ class DeviceManager(QtCore.QObject):
         device = self.devices.get(frame.device_id)
         if not device:
             return
-        self._latest_frames[frame.device_id] = frame
         self.frame_arrived.emit(frame)
-
-    def _on_process_tick(self):
-        frames = self._latest_frames
-        self._latest_frames = {}
-        for device_id, frame in frames.items():
-            device = self.devices.get(device_id)
-            if not device:
-                continue
-            device.set_latest_data(frame.pixels)
-            x = np.arange(len(frame.pixels), dtype=np.float64)
-            self.data_arrived.emit(device_id, x, device.latest_pixels.copy())
 
     def _on_response(self, device_id: int, cmd: int, params: bytes):
         device = self.devices.get(device_id)

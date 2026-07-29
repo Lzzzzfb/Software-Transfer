@@ -31,7 +31,6 @@ def _serial_enum(group_name: str, value_name: str):
 class SerialWorker(QtCore.QObject):
     """单台光谱仪的串口工作对象。"""
 
-    data_received = Signal(int, list)
     frame_received = Signal(object)
     packet_error = Signal(int, str)
     connection_lost = Signal(int)
@@ -183,7 +182,6 @@ class SerialWorker(QtCore.QObject):
                 self._intentionally_skipped = 0
                 self._last_frame_emit_ns = now_ns
                 # 当前阶段统一门控到 20 FPS，避免 Qt 主线程事件队列积压。
-                self.data_received.emit(self.device_index, pixels)
             else:
                 cmd, params = parse_packet(packet_data)
                 self.response_ready.emit(self.device_index, cmd, params)

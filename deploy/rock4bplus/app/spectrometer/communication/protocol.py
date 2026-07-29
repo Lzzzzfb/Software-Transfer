@@ -22,6 +22,8 @@ from enum import IntEnum
 import struct
 from typing import Dict, List, Tuple
 
+import numpy as np
+
 
 class CmdCode(IntEnum):
     """命令码。"""
@@ -176,13 +178,13 @@ def _get_unpack_fmt(n_pixels: int) -> str:
     return _UNPACK_FMT_CACHE[n_pixels]
 
 
-def parse_data_packet(
+def parse_data_packet_view(
     data: bytes,
     n_pixel: int = 0,
     n_start_pixel: int = 0,
     n_valid_pixel: int = 0,
 ) -> dict:
-    """解析完整的 0x80 采集帧。
+    """解析完整的 0x80 采集帧并返回零拷贝 NumPy 像素视图。
 
     自动兼容 U32 新格式与当前实机 U16 格式。像素均按 U16 大端读取。
     若设备已报告 ``n_pixel``，数据帧中的原始像素数必须与之相同，以便
@@ -219,19 +221,14 @@ def parse_data_packet(
             f"像素数量与设备信息不一致: 数据帧 {source_pixel_count}，设备 {n_pixel}"
         )
 
-    if source_pixel_count:
-        raw_pixels = struct.unpack(
-            _get_unpack_fmt(source_pixel_count), pixel_view
-        )
-    else:
-        raw_pixels = ()
+    raw_pixels = np.frombuffer(pixel_view, dtype=">u2", count=source_pixel_count)
 
     start = min(max(0, n_start_pixel), source_pixel_count)
     if n_valid_pixel > 0:
         end = min(start + n_valid_pixel, source_pixel_count)
     else:
         end = source_pixel_count
-    pixels: List[int] = list(raw_pixels[start:end])
+    pixels = raw_pixels[start:end]
 
     return {
         "packet_number": packet_number,
@@ -240,10 +237,30 @@ def parse_data_packet(
         "packet_number_bits": 16 if legacy_u16 else 32,
         "protocol_variant": protocol_variant,
         "pixels": pixels,
+        "raw_pixels": raw_pixels,
         "pixel_count": len(pixels),
         "source_pixel_count": source_pixel_count,
         "checksum": data[total_length - 1],
     }
+
+
+def parse_data_packet(
+    data: bytes,
+    n_pixel: int = 0,
+    n_start_pixel: int = 0,
+    n_valid_pixel: int = 0,
+) -> dict:
+    """兼容调用方：把零拷贝像素视图转换为现有的 Python 列表。"""
+
+    parsed = parse_data_packet_view(
+        data,
+        n_pixel=n_pixel,
+        n_start_pixel=n_start_pixel,
+        n_valid_pixel=n_valid_pixel,
+    )
+    parsed["pixels"] = parsed["pixels"].astype(np.uint16, copy=False).tolist()
+    parsed.pop("raw_pixels", None)
+    return parsed
 
 
 def build_set_integ_time(time_us: int) -> bytes:

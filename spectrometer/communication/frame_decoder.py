@@ -33,10 +33,12 @@ class FrameDecoder:
         self.length_failures = 0
         self.resync_count = 0
         self.expected_pixel_count = 0
+        self.data_variant = None
         self._resync_pending = False
 
     def reset(self) -> None:
         self.buffer.clear()
+        self.data_variant = None
         self._resync_pending = False
 
     def set_expected_pixel_count(self, pixel_count: int) -> None:
@@ -60,7 +62,7 @@ class FrameDecoder:
                 continue
 
             try:
-                _, _, total_length = inspect_frame_header(self.buffer)
+                length, _, total_length = inspect_frame_header(self.buffer)
             except ValueError:
                 self._reject_candidate("header")
                 continue
@@ -80,6 +82,10 @@ class FrameDecoder:
 
             frames.append(bytes(self.buffer[:total_length]))
             del self.buffer[:total_length]
+            if cmd == int(CmdCode.DATA_TRANSMIT) and self.data_variant is None:
+                self.data_variant = (
+                    "legacy_u16" if length % 2 else "u32"
+                )
             if self._resync_pending:
                 self.resync_count += 1
                 self._resync_pending = False
@@ -94,7 +100,13 @@ class FrameDecoder:
         if self.expected_pixel_count <= 0:
             return total_length <= 64 * 1024
         pixel_bytes = 2 * self.expected_pixel_count
-        return total_length in (7 + pixel_bytes, 9 + pixel_bytes)
+        expected = {
+            "legacy_u16": 7 + pixel_bytes,
+            "u32": 9 + pixel_bytes,
+        }
+        if self.data_variant is not None:
+            return total_length == expected[self.data_variant]
+        return total_length in expected.values()
 
     def _reject_candidate(self, reason: str) -> None:
         del self.buffer[0]

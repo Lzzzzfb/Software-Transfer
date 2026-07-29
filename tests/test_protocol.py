@@ -4,6 +4,7 @@ from spectrometer.communication.protocol import (
     CmdCode,
     build_packet,
     parse_data_packet,
+    parse_data_packet_view,
     parse_packet,
 )
 
@@ -124,3 +125,40 @@ def test_parse_real_firmware_legacy_u16_data_frame():
     assert parsed["packet_number_bits"] == 16
     assert parsed["protocol_variant"] == "legacy_u16"
     assert parsed["pixels"] == list(pixels)
+
+
+def test_real_3694_pixel_frame_matches_verified_u16_wire_format():
+    pixels = bytes(3694 * 2)
+    length = 3 + 3694 * 2
+    frame = (
+        b"\x24"
+        + length.to_bytes(2, "little")
+        + b"\x80"
+        + b"\x01\x00"
+        + pixels
+        + b"\xA5"
+    )
+
+    parsed = parse_data_packet_view(
+        frame, n_pixel=3694, n_start_pixel=32, n_valid_pixel=3648
+    )
+
+    assert frame[:4] == bytes.fromhex("24 DF 1C 80")
+    assert len(frame) == 7395
+    assert parsed["protocol_variant"] == "legacy_u16"
+    assert parsed["frame_sequence"] == 1
+    assert parsed["source_pixel_count"] == 3694
+    assert parsed["pixels"].shape == (3648,)
+    assert parsed["raw_pixels"].shape == (3694,)
+    assert parsed["pixels"].dtype.str == ">u2"
+
+
+def test_numpy_view_shares_data_until_explicit_copy():
+    frame = make_data_frame(pixels=(10, 20, 30))
+
+    parsed = parse_data_packet_view(
+        frame, n_pixel=3, n_start_pixel=1, n_valid_pixel=2
+    )
+
+    assert parsed["pixels"].tolist() == [20, 30]
+    assert parsed["pixels"].flags["OWNDATA"] is False

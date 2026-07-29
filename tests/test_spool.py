@@ -2,7 +2,12 @@ from pathlib import Path
 
 from spectrometer.domain.models import SpectrumFrame
 from spectrometer.storage.recovery import scan_pending
-from spectrometer.storage.spool import SpoolWriter, read_spool, truncate_to_valid_records
+from spectrometer.storage.spool import (
+    SpoolWriter,
+    iter_spool_frames,
+    read_spool,
+    truncate_to_valid_records,
+)
 
 
 def make_frame(sequence, device_id=0):
@@ -48,3 +53,37 @@ def test_scan_pending_ignores_non_spool_files(tmp_path):
         pass
     (tmp_path / "bad.part").write_text("bad", encoding="utf-8")
     assert list(scan_pending(tmp_path)) == [good]
+
+
+def test_v2_raw_record_keeps_full_sensor_pixels_and_returns_valid_crop(tmp_path):
+    path = tmp_path / "raw.part"
+    raw = list(range(40))
+    with SpoolWriter(path, {"session_id": "raw"}, flush_every=1) as writer:
+        writer.append_raw(
+            device_id=0,
+            packet_number=1 << 8,
+            raw_pixels=raw,
+            source_pixel_count=40,
+            start_pixel=3,
+            valid_pixel=32,
+            sequence_bits=16,
+            protocol_variant="legacy_u16",
+            monotonic_ns=123,
+            timestamp_ns=456,
+        )
+
+    frames = list(iter_spool_frames(path))
+    assert len(frames) == 1
+    assert frames[0].pixels == tuple(range(3, 35))
+    assert frames[0].sequence == 1
+    assert frames[0].sequence_bits == 16
+    assert frames[0].monotonic_ns == 123
+
+
+def test_streaming_iterator_handles_many_records(tmp_path):
+    path = tmp_path / "many.part"
+    with SpoolWriter(path, {"session_id": "many"}, flush_every=50) as writer:
+        for sequence in range(250):
+            writer.append(make_frame(sequence))
+
+    assert sum(1 for _ in iter_spool_frames(path)) == 250
