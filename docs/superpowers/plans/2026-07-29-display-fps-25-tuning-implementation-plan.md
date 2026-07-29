@@ -4,7 +4,7 @@
 
 依据：`docs/superpowers/specs/2026-07-29-display-fps-25-tuning-design.md`
 
-状态：待实现
+状态：已实现，待 ROCK 4B+ 实机验收
 
 ## 约束
 

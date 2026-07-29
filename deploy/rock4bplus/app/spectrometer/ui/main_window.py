@@ -51,7 +51,7 @@ from .settings_dialog import SettingsDialog
 from .status_panel import StatusPanel
 
 
-DISPLAY_FPS = 20
+DISPLAY_FPS = 25
 
 
 class MainWindow(QtWidgets.QMainWindow):

@@ -2,6 +2,7 @@ import queue
 
 from spectrometer.acquisition.process_worker import (
     AcquisitionStreamCore,
+    DISPLAY_INTERVAL_NS,
     _replace_latest,
 )
 from spectrometer.acquisition.sequence_tracker import SequenceTracker
@@ -42,8 +43,8 @@ def test_core_persists_every_frame_but_limits_display(tmp_path):
     assert all(frame.pixels == (1, 2, 3, 4) for frame in recovery.frames)
     assert result["raw_complete_frames"] == 10
     assert result["persisted_frames"] == 10
-    assert result["display_frames"] == 2
-    assert result["display_overwrites"] == 8
+    assert result["display_frames"] == 3
+    assert result["display_overwrites"] == 7
     assert result["sealed"] is True
     assert not path.exists()
 
@@ -115,10 +116,13 @@ def test_display_frame_reports_frames_intentionally_skipped_by_gate(tmp_path):
     core.end_session()
 
     assert event[0] == "frame"
-    assert event[-1] == 4
+    assert event[-1] == 3
     tracker = SequenceTracker(16)
     first = tracker.observe(first_event[2] >> 8)
-    second = tracker.observe(5, intentionally_skipped=event[-1])
+    second = tracker.observe(
+        event[2] >> 8,
+        intentionally_skipped=event[-1],
+    )
     assert first.missing == 0
     assert second.missing == 0
 
@@ -162,3 +166,24 @@ def test_replacing_pending_display_frame_preserves_entire_sequence_gap():
     tracker.observe(0)
     observation = tracker.observe(10, intentionally_skipped=event[-1])
     assert observation.missing == 0
+
+
+def test_25_fps_gate_persists_90_fps_input_and_publishes_about_23(tmp_path):
+    events = queue.Queue()
+    display = queue.Queue(maxsize=1)
+    core = AcquisitionStreamCore(0, events, display)
+    core.set_pixel_info(2, 0, 2)
+    core.begin_session(tmp_path / "ninety-fps.part", {"session_id": "ninety"})
+
+    for sequence in range(90):
+        core.feed(
+            legacy_frame(sequence, (1, 2)),
+            now_ns=1_000_000_000 + sequence * 11_111_111,
+        )
+    result = core.end_session()
+
+    assert DISPLAY_INTERVAL_NS == 40_000_000
+    assert result["raw_complete_frames"] == 90
+    assert result["persisted_frames"] == 90
+    assert result["display_frames"] in (22, 23)
+    assert result["missing_frames"] == 0

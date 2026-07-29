@@ -22,7 +22,7 @@ from ..storage.spool import SpoolWriter
 from .health_monitor import AcquisitionHealthMonitor
 
 
-DISPLAY_INTERVAL_NS = 50_000_000
+DISPLAY_INTERVAL_NS = 40_000_000
 DIAGNOSTIC_INTERVAL_NS = 1_000_000_000
 MINIMUM_FREE_BYTES = 256 * 1024 * 1024
 

@@ -41,8 +41,8 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert len(window.sidebar.cards) == 4
     assert not hasattr(window.sidebar, "port_combo")
     assert not hasattr(window.sidebar, "baud_combo")
-    assert window.display_fps == 20
-    assert window.plot_timer.interval() == 50
+    assert window.display_fps == 25
+    assert window.plot_timer.interval() == 40
     assert window.diagnostics.export_button.text() == "导出诊断包"
     assert not window.diagnostics.include_recent_frames.isChecked()
     assert window.diagnostics.export_button.isEnabled()
