@@ -47,3 +47,11 @@ def test_udev_rule_is_scoped_and_not_world_writable():
     assert 'MODE="0660"' in rule
     assert "0666" not in rule
     assert "SYMLINK" not in rule
+
+
+def test_install_includes_and_verifies_pyqtgraph():
+    script = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert "python3-pyqtgraph" in script
+    assert "import pyqtgraph" in script
+    assert "pyqtgraph.__version__" in script
+    assert "pyqtgraph.Qt.QT_LIB == 'PyQt6'" in script

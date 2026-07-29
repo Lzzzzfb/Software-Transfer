@@ -131,3 +131,32 @@ def test_display_thinning_does_not_create_missing_frame_warning(tmp_path):
     assert "检测到缺少" not in item.diagnostics.log.toPlainText()
     item.close()
     application().processEvents()
+
+
+def test_hidden_live_page_defers_processing_and_keeps_only_latest_frame(tmp_path):
+    item = window(tmp_path)
+    device = item.device_manager.get_device(0)
+    pixel_count = device.info.valid_pixel
+    item.tabs.setCurrentWidget(item.diagnostics)
+    item.acquisition.ingest(
+        SpectrumFrame.create(0, 1 << 8, [100] * pixel_count)
+    )
+    item._plot_tick()
+
+    assert 0 not in item.plot_widget.device_curves
+    assert item._pending_plot_frames[0].sequence == 1
+
+    item.acquisition.ingest(
+        SpectrumFrame.create(0, 2 << 8, [200] * pixel_count)
+    )
+    item._plot_tick()
+    assert item._pending_plot_frames[0].sequence == 2
+
+    item.tabs.setCurrentWidget(item.plot_widget)
+    item._plot_tick()
+
+    assert 0 in item.plot_widget.device_curves
+    assert set(item.plot_widget.device_curves[0].y) == {200.0}
+    assert item._pending_plot_frames == {}
+    item.close()
+    application().processEvents()

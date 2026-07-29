@@ -37,7 +37,7 @@ fi
 apt-get update
 apt-get install -y \
   python3 python3-venv python3-pip \
-  python3-pyqt6 python3-pyqt6.qtserialport \
+  python3-pyqt6 python3-pyqt6.qtserialport python3-pyqtgraph \
   libgl1 libegl1 libxcb-cursor0 libxkbcommon-x11-0 \
   fonts-noto-cjk
 
@@ -65,7 +65,7 @@ fi
 TARGET_GROUP="$(id -gn "${TARGET_USER}")"
 
 "${INSTALL_DIR}/.venv/bin/python" -c \
-  "from PyQt6 import QtCore, QtWidgets, QtSerialPort; import numpy, scipy, xlsxwriter, openpyxl; print('依赖自检通过', QtCore.QT_VERSION_STR)"
+  "from PyQt6 import QtCore, QtWidgets, QtSerialPort; import pyqtgraph; import numpy, scipy, xlsxwriter, openpyxl; assert pyqtgraph.Qt.QT_LIB == 'PyQt6', pyqtgraph.Qt.QT_LIB; print('依赖自检通过', 'Qt', QtCore.QT_VERSION_STR, 'PyQtGraph', pyqtgraph.__version__, pyqtgraph.Qt.QT_LIB)"
 
 install -m 0644 "${SCRIPT_DIR}/zgcai-spectrometer.desktop" "${APP_ENTRY}"
 

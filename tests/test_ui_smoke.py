@@ -25,6 +25,12 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert window.ribbon.objectName() == "mainRibbon"
     assert window.sidebar.objectName() == "deviceSidebar"
     assert window.plot_widget.objectName() == "spectrumPlot"
+    expected_backend = (
+        "pyqtgraph"
+        if os.environ.get("ZGCAI_PLOT_BACKEND") == "pyqtgraph"
+        else "legacy"
+    )
+    assert window._plot_backend_info.active == expected_backend
     assert window.sidebar.batch_size.value() == 500
     assert window.sidebar.storage_format.currentData() == "csv_excel"
     assert not window.sidebar.auto_store.isChecked()

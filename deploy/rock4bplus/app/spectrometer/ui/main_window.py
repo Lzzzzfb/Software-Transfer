@@ -45,7 +45,7 @@ from .device_parameters import DeviceParametersDialog
 from .diagnostics import DiagnosticsPanel
 from .history_viewer import HistoryViewer
 from .input_controls import DirectDoubleSpinBox, NoWheelComboBox
-from .plot_widget import SpectrumPlotWidget
+from .plot_backend import create_spectrum_plot_widget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
 from .status_panel import StatusPanel
@@ -111,6 +111,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._diagnostic_export_pending = False
         self._diagnostic_observer = AcquisitionObserver()
         self._pending_missing_logs = {}
+        self._pending_plot_frames = {}
 
         self._build_ui()
         self.diagnostic_recorder = DiagnosticRecorder(
@@ -121,6 +122,19 @@ class MainWindow(QtWidgets.QMainWindow):
             enforce_retention(self._diagnostic_root)
         except OSError as exc:
             self.diagnostics.append(f"诊断记录清理失败：{exc}", "WARN")
+        self.diagnostic_recorder.record_event(
+            "plot_backend_selected",
+            {
+                "requested": self._plot_backend_info.requested,
+                "active": self._plot_backend_info.active,
+                "fallback_reason": self._plot_backend_info.fallback_reason,
+            },
+        )
+        if self._plot_backend_info.fallback_reason:
+            self.diagnostics.append(
+                self._plot_backend_info.fallback_reason,
+                "WARN",
+            )
         self._connect_signals(); self._apply_settings()
         QtCore.QTimer.singleShot(0, self._report_pending_recovery)
 
@@ -139,7 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         layout = QtWidgets.QVBoxLayout(central); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(0)
         self.ribbon = MainRibbon(); layout.addWidget(self.ribbon)
-        self.plot_widget = SpectrumPlotWidget()
+        self.plot_widget, self._plot_backend_info = create_spectrum_plot_widget()
         self.context_bar = self._build_context_bar(); layout.addWidget(self.context_bar)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.sidebar = DeviceSidebar(); splitter.addWidget(self.sidebar)
@@ -501,7 +515,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return snapshots
 
     def _plot_tick(self):
-        frames = self.acquisition.take_latest_frames()
+        self._pending_plot_frames.update(self.acquisition.take_latest_frames())
+        if self.tabs.currentWidget() is not self.plot_widget:
+            return
+        frames = self._pending_plot_frames
+        self._pending_plot_frames = {}
         for device_id, frame in frames.items():
             device = self.device_manager.get_device(device_id)
             if not device: continue
@@ -795,6 +813,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         system_values["gui_display_fps"] = fps
         system_values["active_tab"] = self.tabs.tabText(self.tabs.currentIndex())
+        system_values["plot_backend"] = self._plot_backend_info.active
         self.diagnostic_recorder.record_sample(
             system_values,
             key="system",
@@ -805,6 +824,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "workspace_tab_changed",
             {"index": int(index), "label": self.tabs.tabText(index)},
         )
+        if self.tabs.widget(index) is self.plot_widget:
+            QtCore.QTimer.singleShot(0, self._plot_tick)
 
     def _diagnostic_frame_summary(self, _device_id, values):
         self.diagnostic_recorder.record_frame_summary(dict(values or {}))

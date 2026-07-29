@@ -7,7 +7,7 @@
 - 协议普通帧与 `0x80` 数据帧分别按正确长度拆包。
 - 自动扫描严格筛选 `1a86:fe0c`，再发送版本查询进行协议握手；只有返回合法设备信息的串口才会显示并参与采集。
 - `nPacketNumb` 自动兼容实机 U16LE 与函数表 U32LE，像素按 U16 大端解析。
-- 最多按当前目标同时使用约 4 台设备；显示约 30 fps，存储通道接收每一帧。
+- 最多按当前目标同时使用约 4 台设备；实时显示目标 20 FPS，存储通道接收每一帧。
 - 顶部一个“开始/停止”按钮负责总控；每张设备卡可独立开始/停止并采集自己的背景或参考，多台单机任务可并行。
 - 总控、单机、背景/参考共用 ACK、超时、掉线回滚、停止尾帧和异步保存状态机，冲突操作会被拒绝。
 - 实机 16 位与新格式 24 位帧序号缺口、重复、乱序和回绕诊断。
@@ -28,7 +28,7 @@
 
 - Debian 12 Bookworm ARM64
 - Python 3.11
-- Debian 官方 PyQt6 和 QtSerialPort
+- Debian 官方 PyQt6、QtSerialPort 和 PyQtGraph
 - 源码 + venv 运行
 
 发送 `deploy/rock4bplus` 到板子后安装：
@@ -43,6 +43,16 @@ sudo ./install.sh
 ```bash
 /opt/zgcai-spectrometer/run.sh
 ```
+
+Linux 默认使用 PyQtGraph 实时绘图后端。实机 A/B 排查时可以显式选择：
+
+```bash
+ZGCAI_PLOT_BACKEND=pyqtgraph /opt/zgcai-spectrometer/run.sh
+ZGCAI_PLOT_BACKEND=legacy /opt/zgcai-spectrometer/run.sh
+```
+
+未显式选择且 PyQtGraph 不可用时，程序会降级到旧绘图后端并在诊断页说明
+原因；显式强制 PyQtGraph 时缺少依赖会直接报告启动错误。
 
 排查串口问题时也可临时限制扫描范围；正常使用无需指定端口：
 

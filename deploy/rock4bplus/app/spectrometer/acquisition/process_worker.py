@@ -41,10 +41,22 @@ def _replace_latest(display_queue, event) -> None:
         return
     except queue.Full:
         pass
+    replaced = None
     try:
-        display_queue.get_nowait()
+        replaced = display_queue.get_nowait()
     except queue.Empty:
         pass
+    if (
+        isinstance(event, tuple)
+        and event
+        and event[0] == "frame"
+        and isinstance(replaced, tuple)
+        and replaced
+        and replaced[0] == "frame"
+    ):
+        values = list(event)
+        values[-1] = int(values[-1]) + int(replaced[-1]) + 1
+        event = tuple(values)
     try:
         display_queue.put_nowait(event)
     except queue.Full:

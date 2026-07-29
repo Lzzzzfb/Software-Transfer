@@ -1,6 +1,9 @@
 import queue
 
-from spectrometer.acquisition.process_worker import AcquisitionStreamCore
+from spectrometer.acquisition.process_worker import (
+    AcquisitionStreamCore,
+    _replace_latest,
+)
 from spectrometer.acquisition.sequence_tracker import SequenceTracker
 from spectrometer.communication.protocol import CmdCode, build_packet
 from spectrometer.storage.spool import read_spool
@@ -98,7 +101,12 @@ def test_display_frame_reports_frames_intentionally_skipped_by_gate(tmp_path):
     core = AcquisitionStreamCore(0, events, display)
     core.set_pixel_info(2, 0, 2)
     core.begin_session(tmp_path / "display.part", {"session_id": "display"})
-    for sequence in range(6):
+    core.feed(
+        legacy_frame(0, (1, 2)),
+        now_ns=1_000_000_000,
+    )
+    first_event = display.get_nowait()
+    for sequence in range(1, 6):
         core.feed(
             legacy_frame(sequence, (1, 2)),
             now_ns=1_000_000_000 + sequence * 10_000_000,
@@ -109,7 +117,7 @@ def test_display_frame_reports_frames_intentionally_skipped_by_gate(tmp_path):
     assert event[0] == "frame"
     assert event[-1] == 4
     tracker = SequenceTracker(16)
-    first = tracker.observe(0)
+    first = tracker.observe(first_event[2] >> 8)
     second = tracker.observe(5, intentionally_skipped=event[-1])
     assert first.missing == 0
     assert second.missing == 0
@@ -120,7 +128,12 @@ def test_display_skip_count_does_not_hide_real_packet_gap(tmp_path):
     core = AcquisitionStreamCore(0, queue.Queue(), display)
     core.set_pixel_info(2, 0, 2)
     core.begin_session(tmp_path / "gap.part", {"session_id": "gap"})
-    for index, sequence in enumerate((0, 1, 2, 4, 5)):
+    core.feed(
+        legacy_frame(0, (1, 2)),
+        now_ns=1_000_000_000,
+    )
+    first_event = display.get_nowait()
+    for index, sequence in enumerate((1, 2, 4, 5), start=1):
         core.feed(
             legacy_frame(sequence, (1, 2)),
             now_ns=1_000_000_000 + index * 13_000_000,
@@ -129,7 +142,23 @@ def test_display_skip_count_does_not_hide_real_packet_gap(tmp_path):
     core.end_session()
 
     tracker = SequenceTracker(16)
-    tracker.observe(0)
+    tracker.observe(first_event[2] >> 8)
     observation = tracker.observe(5, intentionally_skipped=event[-1])
     assert event[-1] == 3
     assert observation.missing == 1
+
+
+def test_replacing_pending_display_frame_preserves_entire_sequence_gap():
+    display = queue.Queue(maxsize=1)
+    first = ("frame", 0, 5 << 8, 16, 50, 50, b"", 0, 4)
+    second = ("frame", 0, 10 << 8, 16, 100, 100, b"", 0, 4)
+    display.put_nowait(first)
+
+    _replace_latest(display, second)
+
+    event = display.get_nowait()
+    assert event[-1] == 9
+    tracker = SequenceTracker(16)
+    tracker.observe(0)
+    observation = tracker.observe(10, intentionally_skipped=event[-1])
+    assert observation.missing == 0
