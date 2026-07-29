@@ -127,11 +127,27 @@ def validate(output_directory: Path):
         )
         csv_files = sorted(output_directory.glob("*.csv"))
         xlsx_files = sorted(output_directory.glob("*.xlsx"))
-        assert len(csv_files) >= 4
+        assert len(csv_files) == 0
         assert len(xlsx_files) >= 1
         assert not list(output_directory.glob("*.part"))
-        assert all("SIM-" in path.name and "B000" in path.name for path in csv_files)
-        assert any("多设备_独立采集_B000" in path.name for path in xlsx_files)
+        assert any("多设备_B000" in path.name for path in xlsx_files)
+
+        # The same CSV + Excel option selects CSV for a one-device task.
+        assert window._toggle_device_acquisition(0)
+        pump_events(application, 0.08)
+        assert window._toggle_device_acquisition(0)
+        wait_until(
+            application,
+            lambda: window.control.device_state(0) is ControlState.IDLE,
+            timeout=10.0,
+            message="stored local session finalization",
+        )
+        csv_files = sorted(output_directory.glob("*.csv"))
+        assert len(csv_files) >= 1
+        assert any(
+            "SNSIM-VIS-001_B000" in path.name for path in csv_files
+        )
+        assert not list(output_directory.glob("*.part"))
         window.sidebar.auto_store.setChecked(False)
 
         # Reference commands always use fresh single shots and do not enter

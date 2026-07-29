@@ -29,17 +29,26 @@ from ..domain.enums import (
     control_state_label,
 )
 from ..domain.models import SpectrumFrame, SpectrumReference
+from ..processing.calibration_repository import IntensityCalibrationRepository
+from ..processing.display_service import DisplayProcessingService
 from ..processing.formula import FormulaError, validate_formula
+from ..processing.profile_repository import ProcessingProfileRepository
+from ..processing.profiles import AirplsProfile, resolve_effective_profile
 from ..processing.processor import ProcessingSnapshot, SpectrumProcessor
 from ..processing.references import ReferenceRepository
 from ..qt import QtCore, QtWidgets, dialog_exec
 from ..services.settings_service import SettingsService
-from ..services.platform_paths import diagnostic_directory, log_directory
+from ..services.platform_paths import (
+    config_directory,
+    diagnostic_directory,
+    log_directory,
+)
 from ..storage.csv_exporter import export_device_csv
 from ..storage.recovery import scan_pending
 from ..storage.session_manager import StorageSessionManager
 from ..storage.spool import read_spool
 from ..storage.xlsx_exporter import export_workbook
+from .airpls_dialog import AirplsDialog
 from .device_sidebar import DeviceSidebar
 from .device_parameters import DeviceParametersDialog
 from .diagnostics import DiagnosticsPanel
@@ -71,6 +80,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.settings_service = SettingsService(settings_path)
         self.settings = self.settings_service.load()
+        self._configuration_root = (
+            Path(settings_path).parent
+            if settings_path is not None
+            else config_directory()
+        )
         self._diagnostic_root = (
             Path(settings_path).parent / "diagnostics"
             if settings_path is not None
@@ -78,12 +92,21 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.device_manager = DeviceManager()
         self.processor = SpectrumProcessor()
+        self.display_processing = DisplayProcessingService(self)
         self.display_fps = DISPLAY_FPS
         self.acquisition = AcquisitionCoordinator(
             lambda frame: None, display_fps=self.display_fps
         )
         self.reference_repository = ReferenceRepository(
             Path(self.settings["storage_path"]) / "references"
+        )
+        self.intensity_calibration_repository = (
+            IntensityCalibrationRepository(
+                self._configuration_root / "calibrations" / "intensity"
+            )
+        )
+        self.processing_profile_repository = ProcessingProfileRepository(
+            self._configuration_root / "processing_profiles.json"
         )
         self.storage_manager = StorageSessionManager(
             self.settings["storage_path"],
@@ -97,6 +120,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._initializing_devices = set()
         self._task_requests = {}
         self._processing_by_device = {}
+        self._processing_generation_by_device = {}
+        self._processing_profile_identity = {}
         self._process_diagnostics = {}
         self._sim_x = {}; self._sim_sequence = {}; self._sim_phase = 0.0
         self._shown_since_status = 0; self._last_status_time = time.monotonic()
@@ -180,6 +205,16 @@ class MainWindow(QtWidgets.QMainWindow):
         for label, value in [("原始强度", "raw"), ("扣背景", "dark_subtract"), ("吸光度", "absorbance"), ("自定义公式", "custom")]:
             self.display_mode.addItem(label, value)
         self.display_mode.currentIndexChanged.connect(self._display_mode_changed); layout.addWidget(self.display_mode)
+        self.airpls_enabled = QtWidgets.QCheckBox("airPLS")
+        self.airpls_enabled.setToolTip(
+            "在当前处理模式之后执行 airPLS 基线校正；"
+            "参数变更从下一次采集任务开始生效"
+        )
+        self.airpls_enabled.toggled.connect(self._airpls_enabled_changed)
+        layout.addWidget(self.airpls_enabled)
+        self.airpls_parameters = QtWidgets.QPushButton("airPLS 参数")
+        self.airpls_parameters.clicked.connect(self.open_airpls_parameters)
+        layout.addWidget(self.airpls_parameters)
         self.formula_edit = QtWidgets.QLineEdit(); self.formula_edit.setPlaceholderText("例：-log10((I-Idark)/(I0-Idark))")
         self.formula_edit.setMinimumWidth(280); self.formula_edit.setVisible(False); self.formula_edit.editingFinished.connect(self._validate_formula)
         layout.addWidget(self.formula_edit, 1)
@@ -292,6 +327,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_manager.recent_frames_ready.connect(
             self._diagnostic_recent_frames_ready
         )
+        self.display_processing.result_ready.connect(
+            self._display_processing_ready
+        )
+        self.display_processing.processing_failed.connect(
+            self._display_processing_failed
+        )
         self.tabs.currentChanged.connect(self._diagnostic_tab_changed)
 
     def _apply_settings(self):
@@ -303,6 +344,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_widget.set_line_width(self.settings["line_width"])
         index = self.display_mode.findData(self.settings["display_mode"]); self.display_mode.setCurrentIndex(max(0, index))
         index = self.x_axis.findData(self.settings["x_axis"]); self.x_axis.setCurrentIndex(max(0, index))
+        self.airpls_enabled.blockSignals(True)
+        self.airpls_enabled.setChecked(self.settings["airpls_enabled"])
+        self.airpls_enabled.blockSignals(False)
 
     def scan_devices(self):
         if self.simulation: return
@@ -315,7 +359,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _device_changed(self, device_id):
         device = self.device_manager.get_device(device_id)
-        if device: self.sidebar.add_or_update_device(device)
+        if device:
+            self.sidebar.add_or_update_device(device)
+            if (
+                device.initialized
+                and device.info.prod_serial
+                and (device.info.valid_pixel or device.info.pixel_count)
+            ):
+                self._load_device_processing_configuration(device_id)
 
     def _device_connected(self, device_id):
         self._device_changed(device_id)
@@ -325,6 +376,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 "device_connected",
                 {"device_id": device_id, "port_name": device.port_name},
             )
+        if device and device.port_name.startswith("SIM"):
+            self._load_device_processing_configuration(device_id)
         if not device or device.port_name.startswith("SIM"):
             return
         self._initializing_devices.add(device_id)
@@ -347,6 +400,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._initializing_devices.discard(device_id)
         device = self.device_manager.get_device(device_id)
         if device is not None:
+            self._load_device_processing_configuration(device_id)
             self.diagnostic_recorder.record_event(
                 "device_initialized",
                 {
@@ -367,6 +421,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _device_removed(self, device_id):
         self._initializing_devices.discard(device_id)
+        self._processing_profile_identity.pop(device_id, None)
+        self._processing_generation_by_device[device_id] = (
+            self._processing_generation_by_device.get(device_id, 0) + 1
+        )
+        self.display_processing.discard_device(device_id)
         self.diagnostic_recorder.record_event(
             "device_removed", {"device_id": device_id}
         )
@@ -489,8 +548,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _processing_snapshots(self, devices):
         mode = ProcessingMode(self.display_mode.currentData())
         formula = self.formula_edit.text().strip()
+        global_airpls = self._global_airpls_profile()
         snapshots = {}
         for device in devices:
+            existing = self._processing_by_device.get(device.device_id)
+            if existing is not None:
+                snapshots[device.device_id] = existing
+                continue
             pixel_count = device.info.valid_pixel or device.info.pixel_count or 4096
             calibration = (
                 device.intensity_calib
@@ -507,15 +571,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 if device.reference_spectrum is not None
                 else ()
             )
+            calibration_record = device.intensity_calibration_record
+            airpls = resolve_effective_profile(
+                global_airpls, device.airpls_override
+            )
             snapshots[device.device_id] = ProcessingSnapshot(
                 mode=mode.value,
                 custom_formula=formula,
                 wavelengths=tuple(device.get_wavelength_array(pixel_count)),
                 intensity_calibration=tuple(float(value) for value in calibration),
+                intensity_calibration_id=(
+                    calibration_record.calibration_id
+                    if calibration_record is not None
+                    else ""
+                ),
                 background=tuple(float(value) for value in background),
                 reference=tuple(float(value) for value in reference),
+                baseline_enabled=airpls.enabled,
+                baseline_lam=airpls.lam,
+                baseline_order=airpls.order,
+                baseline_max_iter=airpls.max_iter,
             )
-        self._processing_by_device.update(snapshots)
+        for device_id, snapshot in snapshots.items():
+            if self._processing_by_device.get(device_id) != snapshot:
+                self._processing_generation_by_device[device_id] = (
+                    self._processing_generation_by_device.get(device_id, 0)
+                    + 1
+                )
+            self._processing_by_device[device_id] = snapshot
         return snapshots
 
     def _plot_tick(self):
@@ -531,6 +614,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 snapshot = self._processing_by_device.get(device_id)
                 if snapshot is None:
                     snapshot = self._processing_snapshots([device])[device_id]
+                if snapshot.baseline_enabled:
+                    self.display_processing.submit(
+                        device_id,
+                        self._processing_generation_by_device.get(
+                            device_id, 0
+                        ),
+                        frame,
+                        snapshot,
+                    )
+                    continue
                 processed = self.processor.process(
                     snapshot.wavelengths,
                     frame.pixels,
@@ -544,17 +637,64 @@ class MainWindow(QtWidgets.QMainWindow):
                 if message != self._last_formula_error:
                     self._last_formula_error = message; self._log(f"处理未应用: {message}", "WARN")
                 continue
-            x = (
-                np.arange(frame.pixel_count)
-                if self.x_axis.currentData() == "pixel"
-                else np.asarray(snapshot.wavelengths)
+            self._render_processed_spectrum(
+                device_id, frame, snapshot, processed.values
             )
-            label = device.info.prod_serial or device.port_name or f"设备 {device_id}"
-            self.plot_widget.update_device_curve(device_id, x, processed.values, label)
-            if device_id not in self._process_diagnostics:
-                self.diagnostics.update_device(
-                    device_id, self.acquisition.diagnostics(device_id)
-                )
+        self._update_plot_axis_labels()
+
+    def _render_processed_spectrum(
+        self, device_id, frame, snapshot, values
+    ):
+        device = self.device_manager.get_device(device_id)
+        if device is None:
+            return
+        x = (
+            np.arange(frame.pixel_count)
+            if self.x_axis.currentData() == "pixel"
+            else np.asarray(snapshot.wavelengths)
+        )
+        label = (
+            device.info.prod_serial
+            or device.port_name
+            or f"设备 {device_id}"
+        )
+        self.plot_widget.update_device_curve(device_id, x, values, label)
+        if device_id not in self._process_diagnostics:
+            self.diagnostics.update_device(
+                device_id, self.acquisition.diagnostics(device_id)
+            )
+
+    def _display_processing_ready(self, result):
+        if (
+            self.tabs.currentWidget() is not self.plot_widget
+            or self._processing_generation_by_device.get(
+                result.device_id, 0
+            )
+            != result.generation
+            or self._processing_by_device.get(result.device_id)
+            != result.snapshot
+        ):
+            return
+        self._render_processed_spectrum(
+            result.device_id,
+            result.frame,
+            result.snapshot,
+            result.spectrum.values,
+        )
+
+    def _display_processing_failed(self, failure):
+        if (
+            self._processing_generation_by_device.get(
+                failure.device_id, 0
+            )
+            != failure.generation
+        ):
+            return
+        if failure.message != self._last_formula_error:
+            self._last_formula_error = failure.message
+            self._log(f"显示处理未应用: {failure.message}", "WARN")
+
+    def _update_plot_axis_labels(self):
         y_labels = {
             "raw": "强度（计数）",
             "dark_subtract": "扣背景强度",
@@ -677,6 +817,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if request is not None:
             for device_id in request.device_ids:
                 self._processing_by_device.pop(device_id, None)
+                self._processing_generation_by_device[device_id] = (
+                    self._processing_generation_by_device.get(device_id, 0)
+                    + 1
+                )
+                self.display_processing.discard_device(device_id)
         output_files = [
             path
             for path in files
@@ -719,6 +864,103 @@ class MainWindow(QtWidgets.QMainWindow):
         self.formula_edit.setVisible(self.display_mode.currentData() == "custom")
         self._last_formula_error = ""
 
+    def _global_airpls_profile(self):
+        enabled = (
+            self.airpls_enabled.isChecked()
+            if hasattr(self, "airpls_enabled")
+            else bool(self.settings["airpls_enabled"])
+        )
+        return AirplsProfile(
+            enabled=enabled,
+            lam=float(self.settings["airpls_lam"]),
+            order=int(self.settings["airpls_order"]),
+            max_iter=int(self.settings["airpls_max_iter"]),
+        )
+
+    def _airpls_enabled_changed(self, enabled):
+        self.settings["airpls_enabled"] = bool(enabled)
+        if hasattr(self, "diagnostic_recorder"):
+            state = "启用" if enabled else "停用"
+            self._log(
+                f"全局 airPLS 已{state}（下一次采集任务生效）"
+            )
+
+    def open_airpls_parameters(self):
+        dialog = AirplsDialog(self._global_airpls_profile(), self)
+        if not dialog_exec(dialog):
+            return
+        profile = dialog.profile()
+        self.settings.update(
+            {
+                "airpls_enabled": profile.enabled,
+                "airpls_lam": profile.lam,
+                "airpls_order": profile.order,
+                "airpls_max_iter": profile.max_iter,
+            }
+        )
+        self.airpls_enabled.blockSignals(True)
+        self.airpls_enabled.setChecked(profile.enabled)
+        self.airpls_enabled.blockSignals(False)
+        self.settings_service.save(self.settings)
+        self._log(
+            "全局 airPLS 参数已保存（下一次采集任务生效）："
+            f"启用={profile.enabled}，λ={profile.lam:g}，"
+            f"阶数={profile.order}，迭代={profile.max_iter}"
+        )
+
+    def _load_device_processing_configuration(self, device_id):
+        device = self.device_manager.get_device(device_id)
+        if device is None:
+            return
+        serial = str(device.info.prod_serial or "").strip()
+        pixel_count = int(
+            device.info.valid_pixel or device.info.pixel_count or 0
+        )
+        identity = (serial, pixel_count)
+        if (
+            not serial
+            or pixel_count <= 0
+            or self._processing_profile_identity.get(device_id) == identity
+        ):
+            return
+        self._processing_profile_identity[device_id] = identity
+        try:
+            calibration = self.intensity_calibration_repository.load(
+                serial, pixel_count
+            )
+            device.intensity_calibration_record = calibration
+            device.intensity_calib = (
+                None
+                if calibration is None
+                else np.asarray(calibration.coefficients, dtype=np.float64)
+            )
+            if calibration is not None:
+                self._log(
+                    f"设备 {device_id} 已自动加载强度校准 "
+                    f"{calibration.calibration_id}"
+                )
+        except Exception as exc:
+            device.intensity_calibration_record = None
+            device.intensity_calib = None
+            self._log(
+                f"设备 {device_id} 强度校准自动加载失败：{exc}",
+                "WARN",
+            )
+        try:
+            device.airpls_override = (
+                self.processing_profile_repository.load(serial)
+            )
+            if device.airpls_override is not None:
+                self._log(
+                    f"设备 {device_id} 已自动加载 airPLS 设备配置"
+                )
+        except Exception as exc:
+            device.airpls_override = None
+            self._log(
+                f"设备 {device_id} airPLS 配置自动加载失败：{exc}",
+                "WARN",
+            )
+
     def _validate_formula(self):
         if self.display_mode.currentData() != "custom": return
         try:
@@ -743,7 +985,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         device = self.device_manager.get_device(device_id)
         if device:
-            dialog_exec(DeviceParametersDialog(device, self.device_manager, self))
+            dialog_exec(
+                DeviceParametersDialog(
+                    device,
+                    self.device_manager,
+                    self,
+                    global_airpls_profile=self._global_airpls_profile(),
+                    calibration_repository=self.intensity_calibration_repository,
+                    profile_repository=self.processing_profile_repository,
+                    can_modify=lambda: self.control.can_modify_device(
+                        device_id
+                    ),
+                    diagnostic_callback=self._log,
+                )
+            )
 
     def _report_pending_recovery(self):
         pending = scan_pending(self.settings["storage_path"])
@@ -992,7 +1247,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.control.stop_local(device_id)
         self.control.finish_pending_stops()
         self.storage_manager.shutdown(timeout=10.0)
-        self.settings.update({"batch_size": self.sidebar.batch_size.value(), "storage_format": self.sidebar.storage_format.currentData(), "auto_store": False, "display_mode": self.display_mode.currentData(), "x_axis": self.x_axis.currentData()})
+        self.display_processing.shutdown(timeout=2.0)
+        self.settings.update(
+            {
+                "batch_size": self.sidebar.batch_size.value(),
+                "storage_format": self.sidebar.storage_format.currentData(),
+                "auto_store": False,
+                "display_mode": self.display_mode.currentData(),
+                "x_axis": self.x_axis.currentData(),
+                "airpls_enabled": self.airpls_enabled.isChecked(),
+            }
+        )
         try: self.settings_service.save(self.settings)
         except OSError as exc: self._log(f"设置保存失败: {exc}", "WARN")
         self.device_manager.remove_all_devices()

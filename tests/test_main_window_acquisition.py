@@ -210,3 +210,22 @@ def test_failed_storage_does_not_report_partial_outputs_as_complete(tmp_path):
     assert "采集存储完成" not in log
     item.close()
     application().processEvents()
+
+
+def test_processing_snapshot_stays_frozen_during_active_task(tmp_path):
+    item = window(tmp_path)
+    device = item.device_manager.get_device(0)
+    item.airpls_enabled.setChecked(True)
+    first = item._processing_snapshots([device])[0]
+    assert first.baseline_enabled
+
+    item.airpls_enabled.setChecked(False)
+    second = item._processing_snapshots([device])[0]
+
+    assert second is first
+    assert second.baseline_enabled
+    item._processing_by_device.pop(0)
+    third = item._processing_snapshots([device])[0]
+    assert not third.baseline_enabled
+    item.close()
+    application().processEvents()

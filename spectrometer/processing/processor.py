@@ -38,14 +38,24 @@ class ProcessingSnapshot:
     custom_formula: str = ""
     wavelengths: Tuple[float, ...] = ()
     intensity_calibration: Tuple[float, ...] = ()
+    intensity_calibration_id: str = ""
     background: Tuple[float, ...] = ()
     reference: Tuple[float, ...] = ()
+    baseline_enabled: bool = False
+    baseline_lam: float = 1e5
+    baseline_order: int = 2
+    baseline_max_iter: int = 15
+    processing_pipeline_version: int = 2
 
     @property
     def config(self) -> ProcessingConfig:
         return ProcessingConfig(
             mode=ProcessingMode(self.mode),
             custom_formula=self.custom_formula,
+            baseline_enabled=bool(self.baseline_enabled),
+            baseline_lam=float(self.baseline_lam),
+            baseline_order=int(self.baseline_order),
+            baseline_max_iter=int(self.baseline_max_iter),
         )
 
 
@@ -84,6 +94,7 @@ class SpectrumProcessor:
         raw_array = self._array("raw", raw)
         self._same_shape(x, raw_array)
 
+        calibration = None
         calibrated = raw_array.copy()
         if intensity_calibration is not None:
             calibration = self._array("intensity_calibration", intensity_calibration)
@@ -92,6 +103,11 @@ class SpectrumProcessor:
 
         background_array = self._optional_array(background, calibrated, "background")
         reference_array = self._optional_array(reference, calibrated, "reference")
+        if calibration is not None:
+            if background_array is not None:
+                background_array = background_array * calibration
+            if reference_array is not None:
+                reference_array = reference_array * calibration
         warnings = []
 
         if config.mode == ProcessingMode.RAW:
@@ -129,7 +145,7 @@ class SpectrumProcessor:
             raise ValueError(f"未知处理模式: {config.mode}")
 
         baseline = None
-        if config.baseline_enabled and config.mode != ProcessingMode.ABSORBANCE:
+        if config.baseline_enabled:
             from ..extensions.airpls import airpls
 
             baseline = airpls(

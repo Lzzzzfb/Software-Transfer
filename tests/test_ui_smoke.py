@@ -57,11 +57,51 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
         for button in window.history_viewer.findChildren(QtWidgets.QPushButton)
     }
     assert "打开文件" in context_labels
+    assert "airPLS 参数" in context_labels
+    assert hasattr(window, "airpls_enabled")
+    assert not window.airpls_enabled.isChecked()
     assert "打开历史" not in context_labels
     assert "打开 CSV / Excel" in history_labels
     assert all(card.enabled.text() == "参与总控" for card in window.sidebar.cards.values())
     assert all(card.acquisition_button.text() == "开始" for card in window.sidebar.cards.values())
     window.close(); app.processEvents()
+
+
+def test_global_airpls_settings_are_loaded_and_saved(tmp_path):
+    app = application()
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "airpls_enabled": True,
+                "airpls_lam": 250000.0,
+                "airpls_order": 3,
+                "airpls_max_iter": 21,
+            }
+        ),
+        encoding="utf-8",
+    )
+    window = MainWindow(
+        simulation=True,
+        auto_start_simulation=False,
+        settings_path=settings_path,
+    )
+    assert window.airpls_enabled.isChecked()
+    profile = window._global_airpls_profile()
+    assert profile.enabled
+    assert profile.lam == 250000.0
+    assert profile.order == 3
+    assert profile.max_iter == 21
+
+    window.airpls_enabled.setChecked(False)
+    window.close()
+    app.processEvents()
+
+    stored = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert stored["airpls_enabled"] is False
+    assert stored["airpls_lam"] == 250000.0
+    assert stored["airpls_order"] == 3
+    assert stored["airpls_max_iter"] == 21
 
 
 def test_auto_store_is_unchecked_even_if_previous_settings_enabled_it(tmp_path):

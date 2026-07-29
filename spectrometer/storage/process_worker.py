@@ -13,6 +13,25 @@ def _temporary_target(target: Path) -> Path:
     return target.with_name(f".{target.name}.{os.getpid()}.tmp")
 
 
+def _processing_metadata(snapshot):
+    return {
+        "Processing Mode": snapshot.mode,
+        "Background Applied": bool(snapshot.background),
+        "Reference Applied": bool(snapshot.reference),
+        "Intensity Calibration Applied": bool(
+            snapshot.intensity_calibration
+        ),
+        "Intensity Calibration ID": snapshot.intensity_calibration_id,
+        "airPLS Applied": bool(snapshot.baseline_enabled),
+        "airPLS Lambda": float(snapshot.baseline_lam),
+        "airPLS Order": int(snapshot.baseline_order),
+        "airPLS Max Iterations": int(snapshot.baseline_max_iter),
+        "Processing Pipeline Version": int(
+            snapshot.processing_pipeline_version
+        ),
+    }
+
+
 def export_processed_batch(
     batch,
     *,
@@ -57,9 +76,7 @@ def export_processed_batch(
             temporary.append(temp)
             metadata = dict(device_metadata.get(device_id, {}))
             snapshot = processing_snapshots[device_id]
-            metadata["Processing Mode"] = snapshot.mode
-            metadata["Background Applied"] = bool(snapshot.background)
-            metadata["Reference Applied"] = bool(snapshot.reference)
+            metadata.update(_processing_metadata(snapshot))
             metadata["Rejected Frame Count"] = len(rejected.get(device_id, ()))
             export_device_csv(
                 temp,
@@ -87,12 +104,23 @@ def export_processed_batch(
                 for snapshot in processing_snapshots.values()
             )
             workbook_metadata["Rejected Frames"] = sum(map(len, rejected.values()))
+            workbook_device_metadata = {}
+            for device_id in processed:
+                metadata = dict(device_metadata.get(device_id, {}))
+                metadata.update(
+                    _processing_metadata(processing_snapshots[device_id])
+                )
+                metadata["Rejected Frame Count"] = len(
+                    rejected.get(device_id, ())
+                )
+                workbook_device_metadata[device_id] = metadata
             export_workbook(
                 temp,
                 processed,
                 wavelengths_by_device=wavelengths_by_device,
                 device_labels=device_labels,
                 session_metadata=workbook_metadata,
+                device_metadata=workbook_device_metadata,
             )
             staged.append((temp, target))
 

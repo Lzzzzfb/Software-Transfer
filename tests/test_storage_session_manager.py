@@ -228,8 +228,6 @@ def test_real_coordinator_exports_human_named_multi_device_files(tmp_path):
 
     names = {path.name for path in tmp_path.iterdir()}
     assert names == {
-        "20260722_SN001_B0001.csv",
-        "20260722_SN002_B0001.csv",
         "20260722_多设备_B0001.xlsx",
     }
     workbook_path = tmp_path / "20260722_多设备_B0001.xlsx"

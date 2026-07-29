@@ -8,6 +8,8 @@ reweighted penalized least squares" (Analyst, 2010) 实现的基线校正算法�
 """
 
 import numpy as np
+from functools import lru_cache
+import math
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 
@@ -22,8 +24,34 @@ def _difference_matrix(n: int, order: int = 2) -> sparse.spmatrix:
     return D.tocsr()
 
 
+def validate_airpls_parameters(
+    *,
+    size: int,
+    lam: float = 1e5,
+    order: int = 2,
+    max_iter: int = 15,
+) -> None:
+    size = int(size)
+    if size <= 0:
+        raise ValueError("光谱长度必须大于 0")
+    if not math.isfinite(float(lam)) or float(lam) <= 0:
+        raise ValueError("airPLS lambda 必须是有限正数")
+    if int(order) < 1 or int(order) >= size:
+        raise ValueError("airPLS 差分阶数必须不小于 1 且小于像素数")
+    if int(max_iter) < 1:
+        raise ValueError("airPLS 最大迭代次数必须不小于 1")
+
+
+@lru_cache(maxsize=16)
+def penalty_matrix(size: int, order: int = 2) -> sparse.spmatrix:
+    validate_airpls_parameters(size=size, order=order)
+    difference = _difference_matrix(int(size), int(order))
+    return (difference.T @ difference).tocsr()
+
+
 def airpls(x: np.ndarray, lam: float = 1e5, order: int = 2,
-           max_iter: int = 15, tol: float = 1e-6) -> np.ndarray:
+           max_iter: int = 15, tol: float = 1e-6,
+           penalty=None) -> np.ndarray:
     """
     自适应迭代重加权惩罚最小二乘基线估计.
 
@@ -47,11 +75,17 @@ def airpls(x: np.ndarray, lam: float = 1e5, order: int = 2,
     """
     x = np.asarray(x, dtype=np.float64).ravel()
     n = len(x)
-    if n < 3:
-        return np.zeros_like(x)
-
-    D = _difference_matrix(n, order)
-    DTD = D.T @ D
+    validate_airpls_parameters(
+        size=n,
+        lam=lam,
+        order=order,
+        max_iter=max_iter,
+    )
+    DTD = penalty_matrix(n, order) if penalty is None else penalty
+    if DTD.shape != (n, n):
+        raise ValueError(
+            f"airPLS 惩罚矩阵形状错误：{DTD.shape}，期望 {(n, n)}"
+        )
 
     w = np.ones(n)
 
@@ -75,8 +109,13 @@ def airpls(x: np.ndarray, lam: float = 1e5, order: int = 2,
             break
 
         # 峰区域 (r >= 0) 权重接近 0; 基线区域 (r < 0) 权重按指数衰减
-        w_new = np.where(r >= 0, 0.0,
-                         np.exp(2.0 * (r - mean_neg) / std_neg))
+        w_new = np.zeros_like(w)
+        negative = r < 0
+        exponent = 2.0 * (r[negative] - mean_neg) / std_neg
+        # np.where 会同时计算两侧表达式；在峰值跨度很大时会先产生
+        # exp 溢出。只计算负残差并限制指数，既保持权重关系，也避免
+        # inf 进入下一轮稀疏求解。
+        w_new[negative] = np.exp(np.clip(exponent, -50.0, 50.0))
 
         if np.max(np.abs(w_new - w)) < tol:
             break

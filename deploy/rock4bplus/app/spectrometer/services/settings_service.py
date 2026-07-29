@@ -1,9 +1,18 @@
 """原子写入的用户设置持久化。"""
 
 import json
+import math
 from pathlib import Path
 
 from .platform_paths import config_directory, data_directory
+from ..processing.profiles import (
+    AIRPLS_ITER_MAX,
+    AIRPLS_ITER_MIN,
+    AIRPLS_LAM_MAX,
+    AIRPLS_LAM_MIN,
+    AIRPLS_ORDER_MAX,
+    AIRPLS_ORDER_MIN,
+)
 
 
 DEFAULT_SETTINGS = {
@@ -15,6 +24,10 @@ DEFAULT_SETTINGS = {
     "x_axis": "pixel",
     "line_width": 1.4,
     "window_geometry": "",
+    "airpls_enabled": False,
+    "airpls_lam": 1e5,
+    "airpls_order": 2,
+    "airpls_max_iter": 15,
 }
 
 
@@ -41,6 +54,32 @@ class SettingsService:
             settings["storage_path"] = str(self.default_storage_path)
         if settings["storage_format"] not in ("csv", "excel", "csv_excel"):
             settings["storage_format"] = "csv_excel"
+        if not isinstance(settings["airpls_enabled"], bool):
+            settings["airpls_enabled"] = DEFAULT_SETTINGS["airpls_enabled"]
+        try:
+            lam = float(settings["airpls_lam"])
+        except (TypeError, ValueError):
+            lam = DEFAULT_SETTINGS["airpls_lam"]
+        if (
+            not math.isfinite(lam)
+            or not AIRPLS_LAM_MIN <= lam <= AIRPLS_LAM_MAX
+        ):
+            lam = DEFAULT_SETTINGS["airpls_lam"]
+        settings["airpls_lam"] = lam
+        try:
+            order = int(settings["airpls_order"])
+        except (TypeError, ValueError):
+            order = DEFAULT_SETTINGS["airpls_order"]
+        if not AIRPLS_ORDER_MIN <= order <= AIRPLS_ORDER_MAX:
+            order = DEFAULT_SETTINGS["airpls_order"]
+        settings["airpls_order"] = order
+        try:
+            max_iter = int(settings["airpls_max_iter"])
+        except (TypeError, ValueError):
+            max_iter = DEFAULT_SETTINGS["airpls_max_iter"]
+        if not AIRPLS_ITER_MIN <= max_iter <= AIRPLS_ITER_MAX:
+            max_iter = DEFAULT_SETTINGS["airpls_max_iter"]
+        settings["airpls_max_iter"] = max_iter
         return settings
 
     def save(self, settings):

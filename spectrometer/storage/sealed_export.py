@@ -6,8 +6,8 @@ import multiprocessing
 from pathlib import Path
 import re
 
-from ..domain.enums import StorageFormat
 from ..processing.processor import ProcessingSnapshot
+from .export_policy import resolve_export_plan
 from .naming import unique_path
 from .process_worker import export_processed_batch
 from .spool import iter_spool_frames
@@ -126,12 +126,14 @@ class SealedSpoolExporter:
 
     def _targets(self, batch, batch_index):
         token = f"B{batch_index:04d}"
+        export_plan = resolve_export_plan(
+            self.request.storage_format, self.request.device_ids
+        )
         csv_targets = {}
-        if self.request.storage_format in (
-            StorageFormat.CSV,
-            StorageFormat.CSV_EXCEL,
-        ):
+        if export_plan.write_csv:
             for device_id in batch:
+                if device_id not in export_plan.csv_device_ids:
+                    continue
                 label = self._filename_token(
                     self.device_labels.get(device_id, f"device_{device_id}")
                 )
@@ -142,10 +144,7 @@ class SealedSpoolExporter:
                     unique_path(self.output_directory / f"{stem}_{token}.csv")
                 )
         xlsx_target = None
-        if self.request.storage_format in (
-            StorageFormat.EXCEL,
-            StorageFormat.CSV_EXCEL,
-        ):
+        if export_plan.write_excel:
             xlsx_target = str(
                 unique_path(
                     self.output_directory

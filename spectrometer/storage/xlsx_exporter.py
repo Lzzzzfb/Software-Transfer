@@ -30,6 +30,7 @@ def export_workbook(
     wavelengths_by_device: Mapping[int, Sequence[float]] = None,
     device_labels: Mapping[int, str] = None,
     session_metadata: Mapping = None,
+    device_metadata: Mapping[int, Mapping] = None,
 ) -> Path:
     batches = {device_id: list(frames) for device_id, frames in frames_by_device.items()}
     if not batches or not any(batches.values()):
@@ -40,6 +41,7 @@ def export_workbook(
     wavelengths_by_device = wavelengths_by_device or {}
     device_labels = device_labels or {}
     session_metadata = dict(session_metadata or {})
+    device_metadata = device_metadata or {}
 
     workbook = xlsxwriter.Workbook(str(target), {"constant_memory": True})
     try:
@@ -61,10 +63,25 @@ def export_workbook(
 
         used = {"采集概要".lower()}
         summary_offset = len(summary_rows) + 2
-        summary.write_row(summary_offset, 0, ["设备", "帧数", "像素数"], header_format)
+        summary_headers = [
+            "设备",
+            "帧数",
+            "像素数",
+            "端口",
+            "序列号",
+            "处理模式",
+            "强度校准",
+            "airPLS",
+            "airPLS 参数",
+        ]
+        summary.set_column(2, 8, 20)
+        summary.write_row(
+            summary_offset, 0, summary_headers, header_format
+        )
         for summary_row, device_id in enumerate(sorted(batches), summary_offset + 1):
             frames = batches[device_id]
             label = device_labels.get(device_id, f"设备_{device_id}")
+            metadata = dict(device_metadata.get(device_id, {}))
             sheet_name = _safe_sheet_name(label, used)
             sheet = workbook.add_worksheet(sheet_name)
             pixel_count = max((frame.pixel_count for frame in frames), default=0)
@@ -72,7 +89,30 @@ def export_workbook(
             if wavelengths and len(wavelengths) != pixel_count:
                 raise ValueError(f"设备 {device_id} 波长数量与像素数不一致")
 
-            summary.write_row(summary_row, 0, [sheet_name, len(frames), pixel_count])
+            calibration_id = metadata.get("Intensity Calibration ID", "")
+            airpls_enabled = bool(metadata.get("airPLS Applied", False))
+            airpls_parameters = (
+                f"λ={metadata.get('airPLS Lambda')}, "
+                f"阶数={metadata.get('airPLS Order')}, "
+                f"迭代={metadata.get('airPLS Max Iterations')}"
+                if airpls_enabled
+                else ""
+            )
+            summary.write_row(
+                summary_row,
+                0,
+                [
+                    sheet_name,
+                    len(frames),
+                    pixel_count,
+                    metadata.get("Port", ""),
+                    metadata.get("Serial", ""),
+                    metadata.get("Processing Mode", ""),
+                    calibration_id or "未启用",
+                    "启用" if airpls_enabled else "停用",
+                    airpls_parameters,
+                ],
+            )
             sheet.freeze_panes(1, 2)
             sheet.set_column(0, 0, 10)
             sheet.set_column(1, 1, 14)

@@ -35,7 +35,7 @@ def test_simulated_multi_device_session_exports_default_layout(tmp_path):
         app.processEvents()
         time.sleep(0.005)
 
-    assert len(list(tmp_path.glob("*.csv"))) == 4
+    assert len(list(tmp_path.glob("*.csv"))) == 0
     assert len(list(tmp_path.glob("*.xlsx"))) == 1
     assert not list(tmp_path.glob("*.part"))
     window.close(); app.processEvents()

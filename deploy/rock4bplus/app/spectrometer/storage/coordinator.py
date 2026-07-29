@@ -8,9 +8,9 @@ import re
 import threading
 from typing import Callable, Dict, Mapping, Optional
 
-from ..domain.enums import StorageFormat
 from ..domain.models import AcquisitionSession, SpectrumFrame
 from ..processing.processor import ProcessingSnapshot
+from .export_policy import resolve_export_plan
 from .naming import unique_path
 from .process_worker import export_processed_batch
 from .spool import SpoolWriter
@@ -178,9 +178,14 @@ class BatchStorageCoordinator:
         self._batch_index += 1
         prefix = f"{self.session.session_id}_batch_{self._batch_index:04d}"
         batch_token = f"B{self._batch_index:04d}"
+        export_plan = resolve_export_plan(
+            self.session.storage_format, self.session.device_ids
+        )
         csv_targets = {}
-        if self.session.storage_format in (StorageFormat.CSV, StorageFormat.CSV_EXCEL):
+        if export_plan.write_csv:
             for device_id, frames in batch.items():
+                if device_id not in export_plan.csv_device_ids:
+                    continue
                 label = self._filename_token(
                     self.device_labels.get(device_id, f"device_{device_id}")
                 )
@@ -195,7 +200,7 @@ class BatchStorageCoordinator:
                     path = self.output_directory / f"{prefix}_{label}.csv"
                 csv_targets[device_id] = str(path)
         workbook_path = None
-        if self.session.storage_format in (StorageFormat.EXCEL, StorageFormat.CSV_EXCEL):
+        if export_plan.write_excel:
             if self.filename_stem:
                 path = unique_path(
                     self.output_directory

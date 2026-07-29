@@ -62,6 +62,8 @@ class SpectrometerDevice:
         # 校准数据
         self.wavelength_calib = CalibrationData()
         self.intensity_calib: Optional[np.ndarray] = None  # 强度校准系数数组
+        self.intensity_calibration_record = None
+        self.airpls_override = None
 
         # 采集参数
         self.integration_time_us: int = 10000   # 积分时间(us), 默认10ms
@@ -170,7 +172,7 @@ class SpectrometerDevice:
                 return None
 
         # airPLS 基线校正 (在各显示模式之后应用)
-        if self.baseline_enabled and mode != 'absorbance':
+        if self.baseline_enabled:
             self.baseline_y, y = self._apply_baseline_correction(y)
 
         return x, y
