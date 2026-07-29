@@ -15,6 +15,7 @@ from spectrometer.domain.enums import (
 )
 from spectrometer.domain.models import AcquisitionRequest, SpectrumFrame
 from spectrometer.qt import QtCore
+from spectrometer.storage import session_manager
 from spectrometer.storage.session_manager import StorageSessionManager
 
 
@@ -234,3 +235,71 @@ def test_real_coordinator_exports_human_named_multi_device_files(tmp_path):
     workbook_path = tmp_path / "20260722_多设备_B0001.xlsx"
     workbook = load_workbook(workbook_path, read_only=True)
     assert workbook.sheetnames == ["采集概要", "001", "002"]
+
+
+def test_sealed_export_reports_outputs_recovery_files_and_cleanup_warnings(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "batch.csv"
+    recovery = tmp_path / "session.zgs"
+    recovery.write_bytes(b"recovery")
+
+    class FakeSealedExporter:
+        instances = []
+
+        def __init__(self, *args, cleanup_sources=True, **kwargs):
+            self.cleanup_sources = cleanup_sources
+            self.errors = []
+            self.exported_files = [output]
+            self.recovery_files = (recovery,)
+            self.cleanup_warnings = (
+                f"临时采集缓存清理失败，已保留 {recovery}：injected",
+            )
+            self.closed = False
+            self.__class__.instances.append(self)
+
+        @property
+        def queue_ratio(self):
+            return 0.0
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        session_manager, "SealedSpoolExporter", FakeSealedExporter
+    )
+    manager = StorageSessionManager(tmp_path)
+    acquisition = request(0)
+    closed = []
+    warnings = []
+    manager.session_closed.connect(
+        lambda task_id, files, errors: closed.append((task_id, files, errors))
+    )
+    manager.warning_event.connect(
+        lambda task_id, message: warnings.append((task_id, message))
+    )
+
+    manager.start_sealed_export(
+        acquisition,
+        [ready_device(0)],
+        {
+            0: {
+                "spool_path": str(recovery),
+                "persisted_frames": 1,
+            }
+        },
+        cleanup_sources=False,
+    )
+
+    assert wait_until(lambda: bool(closed))
+    assert FakeSealedExporter.instances[0].cleanup_sources is False
+    assert closed == [
+        (
+            acquisition.task_id,
+            [str(output), str(recovery)],
+            [],
+        )
+    ]
+    assert len(warnings) == 1
+    assert warnings[0][0] == acquisition.task_id
+    assert str(recovery) in warnings[0][1]

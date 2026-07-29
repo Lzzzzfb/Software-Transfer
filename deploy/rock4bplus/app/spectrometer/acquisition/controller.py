@@ -16,6 +16,7 @@ from ..domain.enums import (
 )
 from ..domain.models import AcquisitionRequest, SpectrumFrame
 from ..qt import QtCore, Signal
+from ..storage.spool_lifecycle import cleanup_spool_files
 
 
 @dataclass
@@ -639,18 +640,34 @@ class AcquisitionController(QtCore.QObject):
                     "全量采集数据已封存，正在后台生成 CSV/Excel"
                 )
                 self.storage_manager.start_sealed_export(
-                    task.request, devices, task.sealed_results
+                    task.request,
+                    devices,
+                    task.sealed_results,
+                    cleanup_sources=not task.failed,
                 )
                 return
             except Exception as exc:
                 task.failed = True
                 self.diagnostic_event.emit(f"封存数据导出启动失败：{exc}")
-        files = [
-            result.get("spool_path")
-            for result in task.sealed_results.values()
-            if result.get("spool_path")
-        ]
+        files = self._existing_spool_files(task)
+        if (
+            task.process_spool_devices
+            and not task.request.auto_store
+            and not task.failed
+        ):
+            cleanup = cleanup_spool_files(files)
+            for message in cleanup.warnings:
+                self.diagnostic_event.emit(message)
+            files = [str(path) for path in cleanup.retained]
         self._release_task(task, files)
+
+    @staticmethod
+    def _existing_spool_files(task: _ActiveTask):
+        return [
+            str(path)
+            for result in task.sealed_results.values()
+            if (path := result.get("spool_path")) and Path(path).exists()
+        ]
 
     def _on_persistent_session_sealed(self, device_id: int, result) -> None:
         task = self._task_for_device(device_id)

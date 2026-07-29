@@ -677,8 +677,32 @@ class MainWindow(QtWidgets.QMainWindow):
         if request is not None:
             for device_id in request.device_ids:
                 self._processing_by_device.pop(device_id, None)
-        if files:
-            self._log(f"采集存储完成，已生成 {len(files)} 个文件")
+        output_files = [
+            path
+            for path in files
+            if Path(str(path)).suffix.lower() in {".csv", ".xlsx"}
+        ]
+        recovery_files = [
+            path for path in files if path not in output_files
+        ]
+        if output_files:
+            if failed:
+                self._log(
+                    f"已生成 {len(output_files)} 个 CSV/Excel 文件，"
+                    "但存储任务未全部完成",
+                    "WARN",
+                )
+            else:
+                self._log(
+                    "采集存储完成，已生成 "
+                    f"{len(output_files)} 个 CSV/Excel 文件"
+                )
+        if recovery_files:
+            self._log(
+                f"已保留 {len(recovery_files)} 个恢复文件："
+                + "；".join(str(path) for path in recovery_files),
+                "ERROR" if failed else "WARN",
+            )
         if failed:
             self._log("采集任务结束，但存在错误，详情请查看诊断记录", "ERROR")
         elif request is not None and request.owner is not AcquisitionOwner.CALIBRATION:

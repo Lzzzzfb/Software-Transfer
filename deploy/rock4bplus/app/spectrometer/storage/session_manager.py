@@ -25,7 +25,7 @@ class StorageSessionManager(QtCore.QObject):
     warning_event = Signal(str, str)
     controlled_stop_requested = Signal(str, str)
     diagnostic_event = Signal(str)
-    _worker_closed = Signal(str, object, object)
+    _worker_closed = Signal(str, object, object, object)
 
     def __init__(
         self,
@@ -152,7 +152,14 @@ class StorageSessionManager(QtCore.QObject):
             self._sessions.pop(task_id, None)
             raise
 
-    def start_sealed_export(self, request, devices, sealed_results) -> None:
+    def start_sealed_export(
+        self,
+        request,
+        devices,
+        sealed_results,
+        *,
+        cleanup_sources=True,
+    ) -> None:
         if request.task_id in self._sessions:
             raise ValueError("存储任务已经存在")
         devices = list(devices)
@@ -211,6 +218,7 @@ class StorageSessionManager(QtCore.QObject):
             processing_snapshots=snapshots,
             filename_stem=workbook_stem,
             device_filename_stems=device_stems,
+            cleanup_sources=cleanup_sources,
         )
         managed = _ManagedSession(exporter, device_ids, closing=True)
         self._sessions[request.task_id] = managed
@@ -266,10 +274,18 @@ class StorageSessionManager(QtCore.QObject):
         except Exception as exc:
             errors.append(str(exc))
         errors.extend(str(error) for error in coordinator.errors)
-        files = [str(path) for path in coordinator.exported_files]
-        self._worker_closed.emit(task_id, files, errors)
+        paths = list(coordinator.exported_files)
+        paths.extend(getattr(coordinator, "recovery_files", ()))
+        files = [str(path) for path in dict.fromkeys(paths)]
+        warnings = [
+            str(message)
+            for message in getattr(coordinator, "cleanup_warnings", ())
+        ]
+        self._worker_closed.emit(task_id, files, errors, warnings)
 
-    @Slot(str, object, object)
-    def _complete_close(self, task_id: str, files, errors) -> None:
+    @Slot(str, object, object, object)
+    def _complete_close(self, task_id: str, files, errors, warnings) -> None:
         self._sessions.pop(task_id, None)
+        for message in warnings:
+            self.warning_event.emit(task_id, str(message))
         self.session_closed.emit(task_id, list(files), list(errors))

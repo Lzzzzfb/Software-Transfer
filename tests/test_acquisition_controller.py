@@ -1,7 +1,9 @@
 import os
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from spectrometer.acquisition import controller as controller_module
 from spectrometer.acquisition.controller import AcquisitionController
 from spectrometer.communication.protocol import CmdCode, TriggerMode
 from spectrometer.device.spectrometer import SpectrometerDevice
@@ -12,6 +14,7 @@ from spectrometer.domain.enums import (
 )
 from spectrometer.domain.models import SpectrumFrame
 from spectrometer.qt import QtCore, Signal
+from spectrometer.storage.spool_lifecycle import SpoolCleanupResult
 
 
 class FakeDeviceManager(QtCore.QObject):
@@ -64,11 +67,13 @@ class FakeDeviceManager(QtCore.QObject):
 class FakeStorageManager(QtCore.QObject):
     session_closed = Signal(str, object, object)
 
-    def __init__(self):
+    def __init__(self, output_directory=None):
         super().__init__()
+        self.output_directory = Path(output_directory or ".")
         self.started = []
         self.frames = []
         self.closed = []
+        self.sealed_exports = []
 
     def start_session(self, request, devices):
         self.started.append((request, tuple(device.device_id for device in devices)))
@@ -79,6 +84,65 @@ class FakeStorageManager(QtCore.QObject):
     def close_session(self, task_id):
         self.closed.append(task_id)
         self.session_closed.emit(task_id, [], [])
+
+    def start_sealed_export(
+        self,
+        request,
+        devices,
+        sealed_results,
+        *,
+        cleanup_sources=True,
+    ):
+        self.sealed_exports.append(
+            (
+                request.task_id,
+                tuple(device.device_id for device in devices),
+                dict(sealed_results),
+                bool(cleanup_sources),
+            )
+        )
+
+
+class FakeProcessDeviceManager(FakeDeviceManager):
+    persistent_session_sealed = Signal(int, object)
+    acquisition_stop_requested = Signal(int, str)
+
+    def __init__(self, count=1):
+        super().__init__(count=count)
+        self.spool_paths = {}
+
+    def begin_persistent_session(self, device_id, path, metadata):
+        path = Path(path)
+        path.write_bytes(b"capture")
+        self.spool_paths[device_id] = path
+        return True
+
+    def end_persistent_session(self, device_id):
+        source = self.spool_paths[device_id]
+        target = source.with_suffix(".zgs")
+        source.replace(target)
+        self.spool_paths[device_id] = target
+        return True
+
+    def complete_persistent_session(
+        self,
+        device_id=0,
+        *,
+        complete=1,
+        persisted=1,
+        sealed=True,
+    ):
+        path = self.spool_paths[device_id]
+        self.persistent_session_sealed.emit(
+            device_id,
+            {
+                "raw_complete_frames": complete,
+                "persisted_frames": persisted,
+                "spool_path": str(path),
+                "sealed": sealed,
+            },
+        )
+        return path
 
 
 def frame(device_id, sequence=1):
@@ -365,3 +429,133 @@ def test_device_disconnect_finishes_local_task_without_waiting_for_stop_ack():
     controller.finish_pending_stops()
 
     assert controller.device_state(0) is ControlState.IDLE
+
+
+def test_unchecked_clean_process_session_removes_temporary_spool(tmp_path):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    finished = []
+    controller.task_finished.connect(
+        lambda task_id, files, failed:
+            finished.append((task_id, list(files), bool(failed)))
+    )
+
+    assert controller.start_local(0, auto_store=False)
+    task_id = controller.active_task_for_device(0).task_id
+    acknowledge_local_start(manager)
+    assert controller.stop_local(0)
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    spool = manager.spool_paths[0]
+    assert spool.exists()
+
+    manager.complete_persistent_session()
+
+    assert not spool.exists()
+    assert finished == [(task_id, [], False)]
+
+
+def test_unchecked_mismatched_process_session_preserves_recovery_spool(
+    tmp_path,
+):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    finished = []
+    controller.task_finished.connect(
+        lambda task_id, files, failed:
+            finished.append((task_id, list(files), bool(failed)))
+    )
+
+    assert controller.start_local(0, auto_store=False)
+    task_id = controller.active_task_for_device(0).task_id
+    acknowledge_local_start(manager)
+    assert controller.stop_local(0)
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    spool = manager.complete_persistent_session(complete=2, persisted=1)
+
+    assert spool.exists()
+    assert finished == [(task_id, [str(spool)], True)]
+
+
+def test_failed_auto_store_exports_without_cleaning_recovery_spool(tmp_path):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+
+    assert controller.start_local(0, auto_store=True)
+    task_id = controller.active_task_for_device(0).task_id
+    acknowledge_local_start(manager)
+    assert controller.stop_local(0)
+    manager.ack(0, CmdCode.STOP_ACQUISITION, success=False)
+    spool = manager.complete_persistent_session()
+
+    assert spool.exists()
+    assert storage.sealed_exports
+    assert storage.sealed_exports[0][0] == task_id
+    assert storage.sealed_exports[0][3] is False
+
+
+def test_reference_commit_failure_preserves_recovery_spool(tmp_path):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+
+    def fail_reference_commit(kind, frames):
+        raise RuntimeError("injected reference failure")
+
+    controller = AcquisitionController(
+        manager,
+        storage,
+        tail_quiet_ms=0,
+        reference_commit=fail_reference_commit,
+    )
+    finished = []
+    controller.task_finished.connect(
+        lambda task_id, files, failed:
+            finished.append((task_id, list(files), bool(failed)))
+    )
+
+    assert controller.capture_local_reference(0, "background")
+    task_id = controller.active_task_for_device(0).task_id
+    manager.ack(0, CmdCode.SET_TRIG_MODE)
+    manager.ack(0, CmdCode.START_SINGLE)
+    controller.on_frame(frame(0))
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    spool = manager.complete_persistent_session()
+
+    assert spool.exists()
+    assert finished == [(task_id, [str(spool)], True)]
+
+
+def test_unchecked_cleanup_failure_is_warned_without_failing_capture(
+    tmp_path, monkeypatch
+):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    finished = []
+    diagnostics = []
+    controller.task_finished.connect(
+        lambda task_id, files, failed:
+            finished.append((task_id, list(files), bool(failed)))
+    )
+    controller.diagnostic_event.connect(diagnostics.append)
+
+    assert controller.start_local(0, auto_store=False)
+    task_id = controller.active_task_for_device(0).task_id
+    acknowledge_local_start(manager)
+    assert controller.stop_local(0)
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    spool = manager.spool_paths[0]
+    warning = f"临时采集缓存清理失败，已保留 {spool}：injected"
+    monkeypatch.setattr(
+        controller_module,
+        "cleanup_spool_files",
+        lambda paths: SpoolCleanupResult((), (spool,), (warning,)),
+    )
+
+    manager.complete_persistent_session()
+
+    assert spool.exists()
+    assert warning in diagnostics
+    assert finished == [(task_id, [str(spool)], False)]

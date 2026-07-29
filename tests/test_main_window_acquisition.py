@@ -3,8 +3,8 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from spectrometer.domain.enums import ControlState
-from spectrometer.domain.models import SpectrumFrame
+from spectrometer.domain.enums import AcquisitionOwner, ControlState
+from spectrometer.domain.models import AcquisitionRequest, SpectrumFrame
 from spectrometer.processing.references import ReferenceRepository
 from spectrometer.qt import QtWidgets
 from spectrometer.ui.main_window import MainWindow
@@ -158,5 +158,55 @@ def test_hidden_live_page_defers_processing_and_keeps_only_latest_frame(tmp_path
     assert 0 in item.plot_widget.device_curves
     assert set(item.plot_widget.device_curves[0].y) == {200.0}
     assert item._pending_plot_frames == {}
+    item.close()
+    application().processEvents()
+
+
+def test_finished_task_reports_outputs_and_recovery_files_separately(
+    tmp_path,
+):
+    item = window(tmp_path)
+    task_id = "task-with-recovery"
+    item._task_requests[task_id] = AcquisitionRequest.create(
+        AcquisitionOwner.LOCAL,
+        [0],
+        auto_store=True,
+    )
+    output = tmp_path / "batch.csv"
+    recovery = tmp_path / "capture.zgs"
+
+    item._control_task_finished(
+        task_id,
+        [str(output), str(recovery)],
+        False,
+    )
+
+    log = item.diagnostics.log.toPlainText()
+    assert "已生成 1 个 CSV/Excel 文件" in log
+    assert "已保留 1 个恢复文件" in log
+    assert str(recovery) in log
+    assert "已生成 2 个文件" not in log
+    item.close()
+    application().processEvents()
+
+
+def test_failed_storage_does_not_report_partial_outputs_as_complete(tmp_path):
+    item = window(tmp_path)
+    task_id = "failed-task-with-recovery"
+    item._task_requests[task_id] = AcquisitionRequest.create(
+        AcquisitionOwner.LOCAL,
+        [0],
+        auto_store=True,
+    )
+
+    item._control_task_finished(
+        task_id,
+        [str(tmp_path / "partial.csv"), str(tmp_path / "capture.zgs")],
+        True,
+    )
+
+    log = item.diagnostics.log.toPlainText()
+    assert "已生成 1 个 CSV/Excel 文件，但存储任务未全部完成" in log
+    assert "采集存储完成" not in log
     item.close()
     application().processEvents()

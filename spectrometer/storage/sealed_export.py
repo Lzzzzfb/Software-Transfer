@@ -11,6 +11,7 @@ from ..processing.processor import ProcessingSnapshot
 from .naming import unique_path
 from .process_worker import export_processed_batch
 from .spool import iter_spool_frames
+from .spool_lifecycle import cleanup_spool_files
 
 
 class SealedSpoolExporter:
@@ -27,6 +28,7 @@ class SealedSpoolExporter:
         processing_snapshots,
         filename_stem,
         device_filename_stems,
+        cleanup_sources=True,
     ):
         self.output_directory = Path(output_directory)
         self.request = request
@@ -44,12 +46,20 @@ class SealedSpoolExporter:
         self.processing_snapshots = dict(processing_snapshots)
         self.filename_stem = str(filename_stem)
         self.device_filename_stems = dict(device_filename_stems)
+        self.cleanup_sources = bool(cleanup_sources)
         self.errors = []
         self.exported_files = []
+        self.cleanup_warnings = ()
 
     @property
     def queue_ratio(self) -> float:
         return 0.0
+
+    @property
+    def recovery_files(self):
+        return tuple(
+            path for path in self.spool_paths.values() if path.exists()
+        )
 
     def close(self) -> None:
         iterators = {
@@ -110,6 +120,9 @@ class SealedSpoolExporter:
                 f"封存帧数与导出帧数不一致："
                 f"expected={self.expected_counts}, actual={exported_counts}"
             )
+        if self.cleanup_sources:
+            cleanup = cleanup_spool_files(self.spool_paths.values())
+            self.cleanup_warnings = cleanup.warnings
 
     def _targets(self, batch, batch_index):
         token = f"B{batch_index:04d}"
