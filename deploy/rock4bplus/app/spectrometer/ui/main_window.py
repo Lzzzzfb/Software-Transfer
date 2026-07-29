@@ -130,6 +130,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "fallback_reason": self._plot_backend_info.fallback_reason,
             },
         )
+        self.diagnostics.append(
+            f"实时绘图后端：{self._plot_backend_info.active}",
+            "INFO",
+        )
         if self._plot_backend_info.fallback_reason:
             self.diagnostics.append(
                 self._plot_backend_info.fallback_reason,

@@ -31,6 +31,10 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
         else "legacy"
     )
     assert window._plot_backend_info.active == expected_backend
+    assert (
+        f"实时绘图后端：{expected_backend}"
+        in window.diagnostics.log.toPlainText()
+    )
     assert window.sidebar.batch_size.value() == 500
     assert window.sidebar.storage_format.currentData() == "csv_excel"
     assert not window.sidebar.auto_store.isChecked()
