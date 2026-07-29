@@ -4,6 +4,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from spectrometer.domain.enums import ControlState
+from spectrometer.domain.models import SpectrumFrame
 from spectrometer.processing.references import ReferenceRepository
 from spectrometer.qt import QtWidgets
 from spectrometer.ui.main_window import MainWindow
@@ -108,5 +109,25 @@ def test_background_is_rejected_while_any_local_device_is_active(tmp_path):
     assert item.control.device_state(2) is ControlState.ACQUIRING
     item._toggle_device_acquisition(2)
     assert wait_until(lambda: item.control.device_state(2) is ControlState.IDLE)
+    item.close()
+    application().processEvents()
+
+
+def test_display_thinning_does_not_create_missing_frame_warning(tmp_path):
+    item = window(tmp_path)
+    item._frame_arrived(
+        SpectrumFrame.create(
+            0, 0 << 8, [1, 2], sequence_bits=16, intentionally_skipped=0
+        )
+    )
+    item._frame_arrived(
+        SpectrumFrame.create(
+            0, 5 << 8, [1, 2], sequence_bits=16, intentionally_skipped=4
+        )
+    )
+
+    assert item.acquisition.diagnostics(0).missing == 0
+    assert item._pending_missing_logs == {}
+    assert "检测到缺少" not in item.diagnostics.log.toPlainText()
     item.close()
     application().processEvents()

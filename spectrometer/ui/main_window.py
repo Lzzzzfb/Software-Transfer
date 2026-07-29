@@ -110,6 +110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._diagnostic_recent_expected = set()
         self._diagnostic_export_pending = False
         self._diagnostic_observer = AcquisitionObserver()
+        self._pending_missing_logs = {}
 
         self._build_ui()
         self.diagnostic_recorder = DiagnosticRecorder(
@@ -170,6 +171,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_range.toggled.connect(self.plot_widget.enable_auto_range); layout.addWidget(self.auto_range)
         self.plot_widget.user_zoomed.connect(self._plot_user_zoomed)
         self.plot_widget.view_reset.connect(self._plot_view_reset)
+        self.plot_widget.data_frame_painted.connect(self._plot_data_painted)
         self.fixed_y = QtWidgets.QCheckBox("固定 Y 轴")
         self.fixed_y.toggled.connect(self._fixed_y_toggled)
         layout.addWidget(self.fixed_y)
@@ -195,6 +197,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_range.blockSignals(True)
         self.auto_range.setChecked(True)
         self.auto_range.blockSignals(False)
+
+    def _plot_data_painted(self):
+        self._shown_since_status += 1
 
     def _fixed_y_toggled(self, enabled):
         if enabled:
@@ -269,6 +274,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_manager.recent_frames_ready.connect(
             self._diagnostic_recent_frames_ready
         )
+        self.tabs.currentChanged.connect(self._diagnostic_tab_changed)
 
     def _apply_settings(self):
         self.sidebar.batch_size.setValue(self.settings["batch_size"])
@@ -454,7 +460,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.control.on_frame(frame)
             observation = self.acquisition.ingest(frame)
-            if observation.missing: self._log(f"设备 {frame.device_id} 检测到缺少 {observation.missing} 帧", "WARN")
+            if observation.missing:
+                self._pending_missing_logs[frame.device_id] = (
+                    self._pending_missing_logs.get(frame.device_id, 0)
+                    + observation.missing
+                )
         except Exception as exc:
             self._log(f"采集帧处理错误: {exc}", "ERROR")
 
@@ -491,7 +501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return snapshots
 
     def _plot_tick(self):
-        frames = self.acquisition.take_display_frames()
+        frames = self.acquisition.take_latest_frames()
         for device_id, frame in frames.items():
             device = self.device_manager.get_device(device_id)
             if not device: continue
@@ -519,7 +529,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             label = device.info.prod_serial or device.port_name or f"设备 {device_id}"
             self.plot_widget.update_device_curve(device_id, x, processed.values, label)
-            self._shown_since_status += 1
             if device_id not in self._process_diagnostics:
                 self.diagnostics.update_device(
                     device_id, self.acquisition.diagnostics(device_id)
@@ -760,6 +769,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_status(self):
         now = time.monotonic(); elapsed = max(1e-6, now - self._last_status_time)
         fps = self._shown_since_status / elapsed; self._shown_since_status = 0; self._last_status_time = now
+        pending_missing = self._pending_missing_logs
+        self._pending_missing_logs = {}
+        for device_id, count in pending_missing.items():
+            self._log(
+                f"设备 {device_id} 在最近 1 秒检测到缺少 {count} 帧", "WARN"
+            )
         if self._process_diagnostics:
             missing = sum(
                 values.get("missing_frames", 0)
@@ -771,15 +786,24 @@ class MainWindow(QtWidgets.QMainWindow):
         try: free_gb = shutil.disk_usage(Path(self.settings["storage_path"]).resolve()).free / (1024 ** 3)
         except OSError: free_gb = 0.0
         self.status_panel.update_metrics(len(self.device_manager.get_connected_devices()), fps, missing, queue_ratio, free_gb)
+        system_values = sample_system(
+            child_pids=self.device_manager.acquisition_process_ids(),
+            paths=[
+                Path(self.settings["storage_path"]),
+                self._diagnostic_root,
+            ],
+        )
+        system_values["gui_display_fps"] = fps
+        system_values["active_tab"] = self.tabs.tabText(self.tabs.currentIndex())
         self.diagnostic_recorder.record_sample(
-            sample_system(
-                child_pids=self.device_manager.acquisition_process_ids(),
-                paths=[
-                    Path(self.settings["storage_path"]),
-                    self._diagnostic_root,
-                ],
-            ),
+            system_values,
             key="system",
+        )
+
+    def _diagnostic_tab_changed(self, index):
+        self.diagnostic_recorder.record_event(
+            "workspace_tab_changed",
+            {"index": int(index), "label": self.tabs.tabText(index)},
         )
 
     def _diagnostic_frame_summary(self, _device_id, values):

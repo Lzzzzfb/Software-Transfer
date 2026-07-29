@@ -64,6 +64,14 @@ class AcquisitionCoordinator:
             self._last_display_ns = now
         return frames
 
+    def take_latest_frames(self) -> Dict[int, SpectrumFrame]:
+        """返回最新待显示帧，不叠加第二个时间门。"""
+
+        with self._lock:
+            frames = dict(self._latest)
+            self._latest.clear()
+        return frames
+
     def diagnostics(self, device_id: int) -> AcquisitionDiagnostics:
         tracker = self._trackers.get(device_id, SequenceTracker())
         return AcquisitionDiagnostics(

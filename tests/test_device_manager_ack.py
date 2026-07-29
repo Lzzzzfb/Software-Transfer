@@ -106,3 +106,24 @@ def test_simulated_control_commands_emit_the_same_completion_events():
         (device_id, int(CmdCode.START_CONTINUOUS), True),
         (device_id, int(CmdCode.STOP_ACQUISITION), True),
     ]
+
+
+def test_sealed_session_publishes_final_diagnostics_before_completion():
+    manager = DeviceManager()
+    events = []
+    manager.acquisition_diagnostics.connect(
+        lambda device_id, values: events.append(("diagnostics", device_id, values))
+    )
+    manager.persistent_session_sealed.connect(
+        lambda device_id, values: events.append(("sealed", device_id, values))
+    )
+    result = {
+        "raw_complete_frames": 10622,
+        "persisted_frames": 10622,
+        "sealed": True,
+    }
+
+    manager._on_process_session_sealed(0, result)
+
+    assert [item[0] for item in events] == ["diagnostics", "sealed"]
+    assert events[0][2]["persisted_frames"] == 10622

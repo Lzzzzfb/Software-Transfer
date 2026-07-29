@@ -42,6 +42,7 @@ def _image_format(name):
 class SpectrumPlotWidget(QtWidgets.QWidget):
     user_zoomed = Signal()
     view_reset = Signal()
+    data_frame_painted = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,6 +66,8 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self._cursor_pos = None
         self._show_crosshair = True
         self._sample_index_cache = {}
+        self._data_generation = 0
+        self._painted_generation = 0
 
     def update_device_curve(self, device_id: int, x, y, label: str = ""):
         x_array = np.asarray(x, dtype=np.float64)
@@ -79,6 +82,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         )
         if self.auto_range_enabled:
             self._view_range = self._initial_view_range()
+        self._data_generation += 1
         self.update()
 
     update_spectrum = update_device_curve
@@ -274,6 +278,10 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         self._paint(painter)
+        painter.end()
+        if self._painted_generation != self._data_generation:
+            self._painted_generation = self._data_generation
+            self.data_frame_painted.emit()
 
     def _paint(self, painter):
         antialias = getattr(QtGui.QPainter, "Antialiasing", None)

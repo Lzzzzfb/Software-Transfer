@@ -75,6 +75,7 @@ class AcquisitionStreamCore:
         self.health = AcquisitionHealthMonitor()
         self.health_stop_sent = False
         self.recent_raw_frames = deque(maxlen=10)
+        self.intentionally_skipped = 0
 
     def set_pixel_info(self, n_pixel: int, start: int, valid: int) -> None:
         self.n_pixel = int(n_pixel)
@@ -96,6 +97,7 @@ class AcquisitionStreamCore:
         self.missing_frames = 0
         self.last_sequence = None
         self.recent_raw_frames.clear()
+        self.intentionally_skipped = 0
 
     def end_session(self, seal: bool = True) -> dict:
         if self.spool is not None:
@@ -212,12 +214,15 @@ class AcquisitionStreamCore:
                     timestamp,
                     pixels,
                     parsed["pixel_count"],
+                    self.intentionally_skipped,
                 ),
             )
             self.display_frames += 1
             self.last_display_ns = now
+            self.intentionally_skipped = 0
         else:
             self.display_overwrites += 1
+            self.intentionally_skipped += 1
 
         if now - self.last_diagnostic_ns >= DIAGNOSTIC_INTERVAL_NS:
             if (

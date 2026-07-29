@@ -4,7 +4,7 @@
 
 依据：`docs/superpowers/specs/2026-07-29-display-throttle-missing-frame-fix-design.md`
 
-状态：执行中
+状态：已实现，待 ROCK 4B+ 实机验收
 
 ## 约束
 
@@ -86,4 +86,3 @@ git diff --check
 - 子进程发布约 18～20 FPS。
 - GUI 实际绘图目标不低于 15 FPS。
 - 最终诊断摘要等于 `.zgs` 封存帧数。
-

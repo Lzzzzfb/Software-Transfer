@@ -37,6 +37,14 @@ def test_diagnostics_follow_packet_sequence():
     assert diagnostics.missing == 2
 
 
+def test_take_latest_frames_has_no_second_time_gate():
+    coordinator = AcquisitionCoordinator(display_fps=20)
+    coordinator.ingest(frame(1))
+    assert coordinator.take_latest_frames()[0].sequence == 1
+    coordinator.ingest(frame(2))
+    assert coordinator.take_latest_frames()[0].sequence == 2
+
+
 def test_new_session_reset_does_not_treat_packet_counter_restart_as_out_of_order():
     coordinator = AcquisitionCoordinator()
     coordinator.ingest(frame(100))

@@ -76,3 +76,16 @@ def test_custom_plot_runs_without_pyqtgraph_and_preserves_manual_range():
     plot.set_view_range(10, 30, -1, 1)
     assert plot._effective_range() == (10, 30, -1, 1)
     assert plot.add_reference_curve(x, np.cos(x / 10), "参考")
+
+
+def test_plot_reports_completed_new_data_paint():
+    app = application()
+    plot = SpectrumPlotWidget()
+    plot.resize(800, 500)
+    painted = []
+    plot.data_frame_painted.connect(lambda: painted.append(True))
+    plot.show()
+    plot.update_device_curve(0, np.arange(100), np.arange(100), "device")
+    app.processEvents()
+    assert painted == [True]
+    plot.close()

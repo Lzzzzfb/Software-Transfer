@@ -176,6 +176,7 @@ class AcquisitionProcessProxy(QtCore.QObject):
             timestamp_ns,
             pixel_bytes,
             pixel_count,
+            intentionally_skipped,
         ) = event
         pixels = np.frombuffer(pixel_bytes, dtype="<u2", count=pixel_count)
         frame = SpectrumFrame.create(
@@ -185,5 +186,6 @@ class AcquisitionProcessProxy(QtCore.QObject):
             monotonic_ns=monotonic_ns,
             timestamp_ns=timestamp_ns,
             sequence_bits=sequence_bits,
+            intentionally_skipped=intentionally_skipped,
         )
         self.frame_received.emit(frame)

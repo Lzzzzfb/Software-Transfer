@@ -129,7 +129,7 @@ class DeviceManager(QtCore.QObject):
             worker.connection_lost.connect(self._on_disconnect)
             worker.open_finished.connect(self._on_open_finished)
             worker.diagnostic_ready.connect(self.acquisition_diagnostics)
-            worker.session_sealed.connect(self.persistent_session_sealed)
+            worker.session_sealed.connect(self._on_process_session_sealed)
             worker.fatal_error.connect(
                 lambda did, message: self.error_occurred.emit(
                     did, f"独立采集进程失败：{message}"
@@ -157,6 +157,11 @@ class DeviceManager(QtCore.QObject):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.start()
+
+    def _on_process_session_sealed(self, device_id: int, result) -> None:
+        values = dict(result or {})
+        self.acquisition_diagnostics.emit(device_id, values)
+        self.persistent_session_sealed.emit(device_id, values)
 
     def acquisition_process_ids(self):
         return [
