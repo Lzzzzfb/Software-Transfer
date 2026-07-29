@@ -70,3 +70,22 @@ def test_core_detects_missing_sequence_but_continues_persisting(tmp_path):
 
     assert result["missing_frames"] == 1
     assert result["persisted_frames"] == 2
+
+
+def test_core_keeps_only_last_ten_complete_raw_frames(tmp_path):
+    core = AcquisitionStreamCore(
+        0, queue.Queue(), queue.Queue(maxsize=1)
+    )
+    core.set_pixel_info(2, 0, 2)
+    core.begin_session(tmp_path / "recent.part", {"session_id": "recent"})
+    for sequence in range(12):
+        core.feed(
+            legacy_frame(sequence, (sequence, sequence + 1)),
+            now_ns=1_000_000_000 + sequence * 100_000_000,
+        )
+    frames = list(core.recent_raw_frames)
+    core.end_session()
+    assert len(frames) == 10
+    assert frames[0]["packet_number"] == 2 << 8
+    assert frames[-1]["packet_number"] == 11 << 8
+    assert frames[-1]["pixel_bytes"] == b"\x00\x0b\x00\x0c"

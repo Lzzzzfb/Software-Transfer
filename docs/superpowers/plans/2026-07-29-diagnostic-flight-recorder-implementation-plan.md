@@ -4,7 +4,7 @@
 
 依据：`docs/superpowers/specs/2026-07-29-diagnostic-flight-recorder-design.md`
 
-状态：待执行
+状态：已实现，待 ROCK 4B+ 实机验收
 
 ## 执行约束
 

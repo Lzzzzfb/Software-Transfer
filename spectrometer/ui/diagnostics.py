@@ -1,9 +1,11 @@
 from datetime import datetime
 
-from ..qt import QtWidgets
+from ..qt import QtWidgets, Signal
 
 
 class DiagnosticsPanel(QtWidgets.QWidget):
+    export_requested = Signal(bool)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
@@ -24,8 +26,28 @@ class DiagnosticsPanel(QtWidgets.QWidget):
         )
         self.summary.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.summary)
+        controls = QtWidgets.QHBoxLayout()
+        self.export_button = QtWidgets.QPushButton("导出诊断包")
+        self.include_recent_frames = QtWidgets.QCheckBox(
+            "包含最近 10 个完整原始帧"
+        )
+        self.export_status = QtWidgets.QLabel("")
+        controls.addWidget(self.export_button)
+        controls.addWidget(self.include_recent_frames)
+        controls.addWidget(self.export_status, 1)
+        layout.addLayout(controls)
+        self.export_button.clicked.connect(
+            lambda: self.export_requested.emit(
+                self.include_recent_frames.isChecked()
+            )
+        )
         self.log = QtWidgets.QPlainTextEdit(); self.log.setReadOnly(True); self.log.setMaximumBlockCount(3000)
         layout.addWidget(self.log, 1)
+
+    def set_export_state(self, busy: bool, message: str = ""):
+        self.export_button.setEnabled(not busy)
+        self.include_recent_frames.setEnabled(not busy)
+        self.export_status.setText(message)
 
     def append(self, message: str, level: str = "INFO"):
         self.log.appendPlainText(f"{datetime.now():%H:%M:%S.%f}"[:-3] + f" [{level}] {message}")

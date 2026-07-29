@@ -33,6 +33,9 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert not hasattr(window.sidebar, "baud_combo")
     assert window.display_fps == 20
     assert window.plot_timer.interval() == 50
+    assert window.diagnostics.export_button.text() == "导出诊断包"
+    assert not window.diagnostics.include_recent_frames.isChecked()
+    assert window.diagnostics.export_button.isEnabled()
     assert "history" not in window.ribbon.buttons
     assert "acquisition" in window.ribbon.buttons
     context_labels = {

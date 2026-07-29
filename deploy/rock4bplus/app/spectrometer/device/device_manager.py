@@ -27,6 +27,8 @@ class DeviceManager(QtCore.QObject):
     acquisition_diagnostics = Signal(int, object)
     persistent_session_sealed = Signal(int, object)
     acquisition_stop_requested = Signal(int, str)
+    acquisition_frame_summary = Signal(int, object)
+    recent_frames_ready = Signal(int, object)
     sync_started = Signal(object)
     sync_configuration_failed = Signal(str)
     command_completed = Signal(int, int, bool, object)
@@ -136,6 +138,8 @@ class DeviceManager(QtCore.QObject):
             worker.controlled_stop_requested.connect(
                 self.acquisition_stop_requested
             )
+            worker.frame_summary_ready.connect(self.acquisition_frame_summary)
+            worker.recent_frames_ready.connect(self.recent_frames_ready)
             QtCore.QTimer.singleShot(0, worker.do_connect)
             return
 
@@ -153,6 +157,21 @@ class DeviceManager(QtCore.QObject):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.start()
+
+    def acquisition_process_ids(self):
+        return [
+            worker.process_id
+            for worker in self._workers.values()
+            if isinstance(worker, AcquisitionProcessProxy) and worker.process_id
+        ]
+
+    def request_recent_frames(self) -> bool:
+        requested = False
+        for worker in self._workers.values():
+            if isinstance(worker, AcquisitionProcessProxy):
+                worker.request_recent_frames()
+                requested = True
+        return requested
 
     def remove_device(self, device_id: int, preserve_probe_backoff: bool = False):
         device = self.devices.get(device_id)

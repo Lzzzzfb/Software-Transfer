@@ -21,6 +21,8 @@ class AcquisitionProcessProxy(QtCore.QObject):
     session_sealed = Signal(int, object)
     fatal_error = Signal(int, str)
     controlled_stop_requested = Signal(int, str)
+    frame_summary_ready = Signal(int, object)
+    recent_frames_ready = Signal(int, object)
 
     def __init__(self, device_index: int, port_name: str, baud_rate: int):
         super().__init__()
@@ -95,6 +97,13 @@ class AcquisitionProcessProxy(QtCore.QObject):
     def end_session(self) -> None:
         self._send(("end_session",))
 
+    def request_recent_frames(self) -> None:
+        self._send(("recent_frames",))
+
+    @property
+    def process_id(self):
+        return self._process.pid if self._process is not None else None
+
     def _send(self, message) -> None:
         if self._control is None:
             raise RuntimeError("采集进程尚未连接")
@@ -152,6 +161,10 @@ class AcquisitionProcessProxy(QtCore.QObject):
             self.packet_error.emit(event[1], event[2])
         elif kind == "controlled_stop":
             self.controlled_stop_requested.emit(event[1], event[2])
+        elif kind == "frame_summary":
+            self.frame_summary_ready.emit(event[1], event[2])
+        elif kind == "recent_frames":
+            self.recent_frames_ready.emit(event[1], event[2])
 
     def _dispatch_display(self, event) -> None:
         (

@@ -1,5 +1,7 @@
 """Linux 串口采集子进程：控制、全量落盘与低频显示分流。"""
 
+from collections import deque
+import hashlib
 import queue
 import os
 from pathlib import Path
@@ -72,6 +74,7 @@ class AcquisitionStreamCore:
         self.last_diagnostic_ns = 0
         self.health = AcquisitionHealthMonitor()
         self.health_stop_sent = False
+        self.recent_raw_frames = deque(maxlen=10)
 
     def set_pixel_info(self, n_pixel: int, start: int, valid: int) -> None:
         self.n_pixel = int(n_pixel)
@@ -92,6 +95,7 @@ class AcquisitionStreamCore:
         self.raw_complete_frames = 0
         self.missing_frames = 0
         self.last_sequence = None
+        self.recent_raw_frames.clear()
 
     def end_session(self, seal: bool = True) -> dict:
         if self.spool is not None:
@@ -179,6 +183,21 @@ class AcquisitionStreamCore:
             timestamp_ns=timestamp,
         )
         self.persisted_frames += 1
+        raw_bytes = np.asarray(parsed["raw_pixels"], dtype=">u2").tobytes()
+        self.recent_raw_frames.append(
+            {
+                "device_id": self.device_id,
+                "packet_number": model_packet_number,
+                "sequence_bits": sequence_bits,
+                "monotonic_ns": now,
+                "timestamp_ns": timestamp,
+                "source_pixel_count": parsed["source_pixel_count"],
+                "start_pixel": self.n_start_pixel,
+                "valid_pixel": parsed["pixel_count"],
+                "protocol_variant": parsed["protocol_variant"],
+                "pixel_bytes": raw_bytes,
+            }
+        )
 
         if not self.last_display_ns or now - self.last_display_ns >= DISPLAY_INTERVAL_NS:
             pixels = np.asarray(parsed["pixels"], dtype="<u2").tobytes()
@@ -219,6 +238,29 @@ class AcquisitionStreamCore:
             _put_event(
                 self.event_queue,
                 ("diagnostics", self.device_id, self.diagnostics()),
+            )
+            pixels64 = np.asarray(parsed["raw_pixels"], dtype=np.float64)
+            _put_event(
+                self.event_queue,
+                (
+                    "frame_summary",
+                    self.device_id,
+                    {
+                        "device_id": self.device_id,
+                        "packet_number": model_packet_number,
+                        "sequence_bits": sequence_bits,
+                        "frame_length": len(packet),
+                        "source_pixel_count": parsed["source_pixel_count"],
+                        "start_pixel": self.n_start_pixel,
+                        "valid_pixel": parsed["pixel_count"],
+                        "protocol_variant": parsed["protocol_variant"],
+                        "minimum": float(pixels64.min()),
+                        "maximum": float(pixels64.max()),
+                        "mean": float(pixels64.mean()),
+                        "standard_deviation": float(pixels64.std()),
+                        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                    },
+                ),
             )
             self.last_diagnostic_ns = now
 
@@ -315,6 +357,11 @@ def acquisition_process_main(
                     _put_event(
                         event_queue,
                         ("session_sealed", device_id, core.end_session()),
+                    )
+                elif kind == "recent_frames":
+                    _put_event(
+                        event_queue,
+                        ("recent_frames", device_id, list(core.recent_raw_frames)),
                     )
                 elif kind == "close":
                     running = False

@@ -18,3 +18,7 @@ def log_directory() -> Path:
     root = os.environ.get("XDG_STATE_HOME")
     base = Path(root).expanduser() if root else Path.home() / ".local" / "state"
     return base / "ZGCAI" / "Spectrometer"
+
+
+def diagnostic_directory() -> Path:
+    return log_directory() / "diagnostics"

@@ -1,5 +1,6 @@
 """ZGCAI 光谱仪工作站主界面。"""
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import math
 from pathlib import Path
@@ -12,6 +13,12 @@ from ..acquisition.coordinator import AcquisitionCoordinator
 from ..acquisition.controller import AcquisitionController
 from ..communication.serial_port import DeviceFinder
 from ..device.device_manager import DeviceManager
+from ..diagnostics.bundle_exporter import export_diagnostic_bundle
+from ..diagnostics.acquisition_observer import AcquisitionObserver
+from ..diagnostics.recorder import DiagnosticRecorder
+from ..diagnostics.paths import latest_run_with_acquisition
+from ..diagnostics.retention import enforce_retention
+from ..diagnostics.system_sampler import sample_system
 from ..domain.enums import (
     AcquisitionMode,
     AcquisitionOwner,
@@ -27,6 +34,7 @@ from ..processing.processor import ProcessingSnapshot, SpectrumProcessor
 from ..processing.references import ReferenceRepository
 from ..qt import QtCore, QtWidgets, dialog_exec
 from ..services.settings_service import SettingsService
+from ..services.platform_paths import diagnostic_directory, log_directory
 from ..storage.csv_exporter import export_device_csv
 from ..storage.recovery import scan_pending
 from ..storage.session_manager import StorageSessionManager
@@ -63,6 +71,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.settings_service = SettingsService(settings_path)
         self.settings = self.settings_service.load()
+        self._diagnostic_root = (
+            Path(settings_path).parent / "diagnostics"
+            if settings_path is not None
+            else diagnostic_directory()
+        )
         self.device_manager = DeviceManager()
         self.processor = SpectrumProcessor()
         self.display_fps = DISPLAY_FPS
@@ -88,8 +101,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sim_x = {}; self._sim_sequence = {}; self._sim_phase = 0.0
         self._shown_since_status = 0; self._last_status_time = time.monotonic()
         self._last_formula_error = ""
+        self._diagnostic_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="diagnostic-export"
+        )
+        self._diagnostic_future = None
+        self._diagnostic_export_target = None
+        self._diagnostic_recent_by_device = {}
+        self._diagnostic_recent_expected = set()
+        self._diagnostic_export_pending = False
+        self._diagnostic_observer = AcquisitionObserver()
 
-        self._build_ui(); self._connect_signals(); self._apply_settings()
+        self._build_ui()
+        self.diagnostic_recorder = DiagnosticRecorder(
+            self._diagnostic_root,
+            warning=lambda message: self.diagnostics.append(message, "WARN")
+        )
+        try:
+            enforce_retention(self._diagnostic_root)
+        except OSError as exc:
+            self.diagnostics.append(f"诊断记录清理失败：{exc}", "WARN")
+        self._connect_signals(); self._apply_settings()
         QtCore.QTimer.singleShot(0, self._report_pending_recovery)
 
         self.plot_timer = QtCore.QTimer(self)
@@ -231,6 +262,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control.task_started.connect(self._control_task_started)
         self.control.task_finished.connect(self._control_task_finished)
         self.control.reference_captured.connect(self._reference_captured)
+        self.diagnostics.export_requested.connect(self._export_diagnostic_bundle)
+        self.device_manager.acquisition_frame_summary.connect(
+            self._diagnostic_frame_summary
+        )
+        self.device_manager.recent_frames_ready.connect(
+            self._diagnostic_recent_frames_ready
+        )
 
     def _apply_settings(self):
         self.sidebar.batch_size.setValue(self.settings["batch_size"])
@@ -258,6 +296,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _device_connected(self, device_id):
         self._device_changed(device_id)
         device = self.device_manager.get_device(device_id)
+        if device is not None:
+            self.diagnostic_recorder.record_event(
+                "device_connected",
+                {"device_id": device_id, "port_name": device.port_name},
+            )
         if not device or device.port_name.startswith("SIM"):
             return
         self._initializing_devices.add(device_id)
@@ -278,6 +321,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _finish_device_initialization(self, device_id):
         self._initializing_devices.discard(device_id)
+        device = self.device_manager.get_device(device_id)
+        if device is not None:
+            self.diagnostic_recorder.record_event(
+                "device_initialized",
+                {
+                    **device.to_dict(),
+                    "serial_number": device.info.prod_serial,
+                    "hardware_version": device.info.hw_ver,
+                    "firmware_version": device.info.fw_ver,
+                    "pixel_count": device.info.pixel_count,
+                    "start_pixel": device.info.start_pixel,
+                    "valid_pixel": device.info.valid_pixel,
+                },
+            )
         if not self._initializing_devices and not any(
             device.acquiring for device in self.device_manager.get_connected_devices()
         ):
@@ -286,6 +343,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _device_removed(self, device_id):
         self._initializing_devices.discard(device_id)
+        self.diagnostic_recorder.record_event(
+            "device_removed", {"device_id": device_id}
+        )
         self.sidebar.remove_device(device_id); self.plot_widget.remove_device_curve(device_id)
 
     def _device_enabled_changed(self, device_id, enabled):
@@ -554,6 +614,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _control_task_started(self, task_id, request):
         self._task_requests[task_id] = request
+        self.diagnostic_recorder.start_acquisition(
+            task_id,
+            {
+                "device_ids": list(request.device_ids),
+                "owner": request.owner.value,
+                "mode": request.mode.value,
+                "sync_mode": request.sync_mode.value,
+                "auto_store": request.auto_store,
+            },
+        )
+        for device_id in request.device_ids:
+            self._diagnostic_observer.reset(device_id)
         devices = [
             self.device_manager.get_device(device_id)
             for device_id in request.device_ids
@@ -580,6 +652,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("采集任务结束，但存在错误，详情请查看诊断记录", "ERROR")
         elif request is not None and request.owner is not AcquisitionOwner.CALIBRATION:
             self._log("采集任务已完全停止")
+        self.diagnostic_recorder.finish_acquisition(
+            task_id,
+            failed=bool(failed),
+            files=[str(path) for path in files],
+            diagnostics=dict(self._process_diagnostics),
+        )
         self._refresh_control_status()
 
     def _display_mode_changed(self):
@@ -665,11 +743,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _log(self, message, level="INFO"):
         self.diagnostics.append(message, level)
+        if hasattr(self, "diagnostic_recorder"):
+            self.diagnostic_recorder.record_event(
+                "application_log", {"message": str(message)}, level=level
+            )
 
     def _acquisition_diagnostics_updated(self, device_id, values):
         values = dict(values or {})
         self._process_diagnostics[device_id] = values
         self.diagnostics.update_acquisition(device_id, values)
+        self.diagnostic_recorder.record_sample(
+            self._diagnostic_observer.observe(device_id, values),
+            key=f"acquisition-{device_id}",
+        )
 
     def _update_status(self):
         now = time.monotonic(); elapsed = max(1e-6, now - self._last_status_time)
@@ -685,6 +771,115 @@ class MainWindow(QtWidgets.QMainWindow):
         try: free_gb = shutil.disk_usage(Path(self.settings["storage_path"]).resolve()).free / (1024 ** 3)
         except OSError: free_gb = 0.0
         self.status_panel.update_metrics(len(self.device_manager.get_connected_devices()), fps, missing, queue_ratio, free_gb)
+        self.diagnostic_recorder.record_sample(
+            sample_system(
+                child_pids=self.device_manager.acquisition_process_ids(),
+                paths=[
+                    Path(self.settings["storage_path"]),
+                    self._diagnostic_root,
+                ],
+            ),
+            key="system",
+        )
+
+    def _diagnostic_frame_summary(self, _device_id, values):
+        self.diagnostic_recorder.record_frame_summary(dict(values or {}))
+
+    def _export_diagnostic_bundle(self, include_recent_frames):
+        if self._diagnostic_future is not None:
+            return
+        default = (
+            f"zgcai-diagnostic-{datetime.now():%Y%m%d-%H%M%S}-"
+            f"{self.diagnostic_recorder.run_id[-8:]}.zip"
+        )
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出诊断包", str(Path.home() / default), "ZIP (*.zip)"
+        )
+        if not path:
+            return
+        self._diagnostic_export_target = Path(path)
+        self._diagnostic_recent_by_device = {}
+        self._diagnostic_export_pending = bool(include_recent_frames)
+        self.diagnostics.set_export_state(True, "正在准备诊断快照…")
+        if include_recent_frames and self.device_manager.request_recent_frames():
+            self._diagnostic_recent_expected = set(self.device_manager.devices)
+            QtCore.QTimer.singleShot(1000, self._start_diagnostic_export)
+        else:
+            self._diagnostic_recent_expected = set()
+            self._start_diagnostic_export()
+
+    def _diagnostic_recent_frames_ready(self, device_id, frames):
+        self._diagnostic_recent_by_device[int(device_id)] = list(frames or [])
+        if (
+            self._diagnostic_export_pending
+            and self._diagnostic_recent_expected
+            and self._diagnostic_recent_expected.issubset(
+                self._diagnostic_recent_by_device
+            )
+        ):
+            self._start_diagnostic_export()
+
+    def _start_diagnostic_export(self):
+        if self._diagnostic_future is not None or self._diagnostic_export_target is None:
+            return
+        self._diagnostic_export_pending = False
+        frames = []
+        for values in self._diagnostic_recent_by_device.values():
+            frames.extend(values)
+        frames.sort(key=lambda item: item.get("monotonic_ns", 0))
+        frames = frames[-10:]
+        devices = {}
+        for device_id, device in self.device_manager.devices.items():
+            devices[device_id] = {
+                **device.to_dict(),
+                "serial_number": device.info.prod_serial,
+                "hardware_version": device.info.hw_ver,
+                "firmware_version": device.info.fw_ver,
+                "pixel_count": device.info.pixel_count,
+                "start_pixel": device.info.start_pixel,
+                "valid_pixel": device.info.valid_pixel,
+            }
+        include = self.diagnostics.include_recent_frames.isChecked()
+        self.diagnostics.set_export_state(True, "正在生成并校验 ZIP…")
+        run_dir = self.diagnostic_recorder.run_dir
+        acquisition_id = self.diagnostic_recorder.latest_acquisition_id
+        if not acquisition_id:
+            previous = latest_run_with_acquisition(
+                self._diagnostic_root, exclude=run_dir
+            )
+            if previous is not None:
+                run_dir, acquisition_id = previous
+        self._diagnostic_future = self._diagnostic_executor.submit(
+            export_diagnostic_bundle,
+            run_dir,
+            self._diagnostic_export_target,
+            acquisition_id=acquisition_id,
+            include_recent_frames=include,
+            recent_frames=frames,
+            startup_log=log_directory() / "startup.log",
+            live_snapshot=bool(self.diagnostic_recorder.active_acquisition_id),
+            device_snapshot=devices,
+            acquisition_summary=dict(self._process_diagnostics),
+        )
+        QtCore.QTimer.singleShot(50, self._poll_diagnostic_export)
+
+    def _poll_diagnostic_export(self):
+        future = self._diagnostic_future
+        if future is None:
+            return
+        if not future.done():
+            QtCore.QTimer.singleShot(50, self._poll_diagnostic_export)
+            return
+        self._diagnostic_future = None
+        try:
+            path = future.result()
+            self.diagnostics.set_export_state(False, f"已生成：{path}")
+            self._log(f"诊断包已生成：{path}")
+        except Exception as exc:
+            self.diagnostics.set_export_state(False, f"导出失败：{exc}")
+            self._log(f"诊断包导出失败：{exc}", "ERROR")
+        finally:
+            self._diagnostic_export_target = None
 
     def _setup_simulation(self, auto_start):
         configurations = [("SIM1", "SIM-VIS-001", 350.0, 0.12), ("SIM2", "SIM-VIS-002", 500.0, 0.14), ("SIM3", "SIM-NIR-001", 850.0, 0.18), ("SIM4", "SIM-NIR-002", 1000.0, 0.20)]
@@ -727,4 +922,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.update({"batch_size": self.sidebar.batch_size.value(), "storage_format": self.sidebar.storage_format.currentData(), "auto_store": False, "display_mode": self.display_mode.currentData(), "x_axis": self.x_axis.currentData()})
         try: self.settings_service.save(self.settings)
         except OSError as exc: self._log(f"设置保存失败: {exc}", "WARN")
-        self.device_manager.remove_all_devices(); event.accept()
+        self.device_manager.remove_all_devices()
+        self.diagnostic_recorder.close(timeout=2.0)
+        self._diagnostic_executor.shutdown(wait=False, cancel_futures=True)
+        event.accept()
