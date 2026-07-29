@@ -48,7 +48,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("spectrumPlot")
         self.setMinimumSize(500, 360)
-        self.setToolTip("左键拖动框选放大；左键双击恢复初始视图；滚轮以光标为中心缩放")
+        self.setToolTip("左键拖动框选放大；左键双击恢复初始视图")
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.device_curves: Dict[int, _Curve] = {}
@@ -432,12 +432,18 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self.update()
 
     def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton and self._plot_rect().contains(_event_position(event)):
+        if event.button() != QtCore.Qt.LeftButton:
+            event.accept()
+            return
+        if self._plot_rect().contains(_event_position(event)):
             self._selection_origin = QtCore.QPointF(_event_position(event))
             self._selection_current = QtCore.QPointF(_event_position(event))
 
     def mouseReleaseEvent(self, event):
-        if event.button() == QtCore.Qt.LeftButton and self._selection_origin is not None:
+        if event.button() != QtCore.Qt.LeftButton:
+            event.accept()
+            return
+        if self._selection_origin is not None:
             current = self._selection_current or QtCore.QPointF(_event_position(event))
             self._apply_selection_zoom(self._selection_origin, current)
         self._selection_origin = None
@@ -483,23 +489,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
             self.reset_initial_view()
 
     def wheelEvent(self, event):
-        position = _event_position(event)
-        rect = self._plot_rect()
-        if not rect.contains(position):
-            return
-        factor = 0.85 if event.angleDelta().y() > 0 else 1.18
-        x_min, x_max, y_min, y_max = self._effective_range()
-        x_ratio = (position.x() - rect.left()) / rect.width()
-        y_ratio = (rect.bottom() - position.y()) / rect.height()
-        x_anchor = x_min + x_ratio * (x_max - x_min)
-        y_anchor = y_min + y_ratio * (y_max - y_min)
-        self._view_range = (
-            x_anchor + (x_min - x_anchor) * factor,
-            x_anchor + (x_max - x_anchor) * factor,
-            y_anchor + (y_min - y_anchor) * factor,
-            y_anchor + (y_max - y_anchor) * factor,
-        )
-        self.auto_range_enabled = False; self.user_zoomed.emit(); self.update()
+        event.accept()
 
 
 class HistoryPlotWidget(SpectrumPlotWidget):

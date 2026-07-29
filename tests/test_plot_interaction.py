@@ -30,6 +30,7 @@ class MouseEvent:
         self._position = position
         self._button = button
         self._wheel = wheel
+        self.accepted = False
 
     def pos(self):
         return self._position.toPoint()
@@ -39,6 +40,9 @@ class MouseEvent:
 
     def angleDelta(self):
         return QtCore.QPoint(0, self._wheel)
+
+    def accept(self):
+        self.accepted = True
 
 
 def test_left_drag_selection_zooms_both_axes():
@@ -99,18 +103,38 @@ def test_disabling_fixed_y_restores_live_auto_range():
     assert plot._effective_range()[3] > 800
 
 
-def test_fixed_y_still_allows_wheel_zoom_and_double_click_restores_base():
+def test_wheel_is_ignored_and_double_click_still_restores_base():
     plot = plot_widget()
     plot.set_fixed_y_range(0, 1000)
     rect = plot._plot_rect()
-    plot.wheelEvent(MouseEvent(rect.center(), wheel=120))
-    zoomed = plot._effective_range()
-    assert zoomed[2:] != (0, 1000)
+    before = plot._effective_range()
+    wheel = MouseEvent(rect.center(), wheel=120)
+    plot.wheelEvent(wheel)
+    assert wheel.accepted
+    assert plot._effective_range() == before
 
+    plot.set_view_range(10, 30, 100, 200)
     plot.update_device_curve(0, np.arange(101), np.linspace(-1e6, 1e6, 101), "设备")
-    assert plot._effective_range() == zoomed
     plot.mouseDoubleClickEvent(MouseEvent(rect.center()))
     assert plot._effective_range()[2:] == (0, 1000)
+
+
+def test_right_button_is_ignored_without_starting_selection():
+    plot = plot_widget()
+    before = plot._effective_range()
+    right_button = getattr(QtCore.Qt, "RightButton", None)
+    if right_button is None:
+        right_button = QtCore.Qt.MouseButton.RightButton
+    event = MouseEvent(
+        plot._plot_rect().center(), button=right_button
+    )
+
+    plot.mousePressEvent(event)
+    plot.mouseReleaseEvent(event)
+
+    assert event.accepted
+    assert plot._selection_origin is None
+    assert plot._effective_range() == before
 
 
 def test_axis_formatter_never_uses_scientific_notation_or_negative_zero():

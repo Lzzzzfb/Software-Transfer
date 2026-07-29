@@ -8,6 +8,7 @@ from typing import Dict, Mapping, Sequence
 import xlsxwriter
 
 from ..domain.models import SpectrumFrame
+from .localization import localize_metadata_label, localize_metadata_value
 
 
 def _safe_sheet_name(name: str, used: set) -> str:
@@ -56,7 +57,13 @@ def export_workbook(
         summary_rows = [
             ("导出时间", datetime.now(timezone.utc).isoformat()),
             ("设备数量", len(batches)),
-        ] + list(session_metadata.items())
+        ] + [
+            (
+                localize_metadata_label(key),
+                localize_metadata_value(key, value),
+            )
+            for key, value in session_metadata.items()
+        ]
         for row, (key, value) in enumerate(summary_rows, 1):
             summary.write(row, 0, str(key))
             summary.write(row, 1, str(value))
@@ -107,7 +114,10 @@ def export_workbook(
                     pixel_count,
                     metadata.get("Port", ""),
                     metadata.get("Serial", ""),
-                    metadata.get("Processing Mode", ""),
+                    localize_metadata_value(
+                        "Processing Mode",
+                        metadata.get("Processing Mode", ""),
+                    ),
                     calibration_id or "未启用",
                     "启用" if airpls_enabled else "停用",
                     airpls_parameters,
@@ -117,10 +127,10 @@ def export_workbook(
             sheet.set_column(0, 0, 10)
             sheet.set_column(1, 1, 14)
             sheet.set_column(2, 1 + len(frames), 22)
-            sheet.write(0, 0, "Pixel", header_format)
-            sheet.write(0, 1, "Wavelength", header_format)
+            sheet.write(0, 0, "像素序号", header_format)
+            sheet.write(0, 1, "波长 (nm)", header_format)
             for column, frame in enumerate(frames, 2):
-                title = f"Frame_{column - 1:04d}_Seq_{frame.sequence:06X}"
+                title = f"第 {column - 1:04d} 帧_序号_{frame.sequence:06X}"
                 sheet.write(0, column, title, header_format)
 
             # constant_memory 要求严格按行写入。

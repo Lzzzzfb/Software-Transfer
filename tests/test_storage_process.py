@@ -52,19 +52,19 @@ def test_worker_exports_only_final_calibrated_airpls_values(tmp_path):
     header_row = next(
         index
         for index, row in enumerate(rows)
-        if row[:2] == ["Pixel", "Wavelength"]
+        if row[:2] == ["像素序号", "波长 (nm)"]
     )
     metadata = {
         row[0][2:]: row[1]
         for row in rows[:header_row]
         if len(row) >= 2 and row[0].startswith("# ")
     }
-    assert metadata["Intensity Calibration ID"] == "cal-003"
-    assert metadata["airPLS Applied"] == "True"
-    assert metadata["airPLS Lambda"] == "300000.0"
-    assert metadata["airPLS Order"] == "3"
-    assert metadata["airPLS Max Iterations"] == "12"
-    assert metadata["Processing Pipeline Version"] == "2"
+    assert metadata["强度校准 ID"] == "cal-003"
+    assert metadata["已应用 airPLS"] == "是"
+    assert metadata["airPLS λ"] == "300000.0"
+    assert metadata["airPLS 差分阶数"] == "3"
+    assert metadata["airPLS 最大迭代次数"] == "12"
+    assert metadata["处理管线版本"] == "2"
     csv_values = [
         float(rows[header_row + index + 1][2])
         for index in range(pixel_count)

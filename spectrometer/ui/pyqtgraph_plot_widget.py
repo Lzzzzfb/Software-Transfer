@@ -44,13 +44,21 @@ class _SpectrumViewBox(pg.ViewBox):
         self.setMouseMode(self.RectMode)
 
     def mouseDragEvent(self, event, axis=None):
+        if event.button() != QtCore.Qt.LeftButton:
+            event.accept()
+            return
         super().mouseDragEvent(event, axis=axis)
         if event.isFinish() and event.button() == QtCore.Qt.LeftButton:
             self.user_zoomed.emit()
 
     def wheelEvent(self, event, axis=None):
-        super().wheelEvent(event, axis=axis)
-        self.user_zoomed.emit()
+        event.accept()
+
+    def mouseClickEvent(self, event):
+        if event.button() != QtCore.Qt.LeftButton:
+            event.accept()
+            return
+        super().mouseClickEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
@@ -95,7 +103,7 @@ class PyQtGraphSpectrumPlotWidget(pg.PlotWidget):
         self.setObjectName("spectrumPlot")
         self.setMinimumSize(500, 360)
         self.setToolTip(
-            "左键拖动框选放大；左键双击恢复初始视图；滚轮以光标为中心缩放"
+            "左键拖动框选放大；左键双击恢复初始视图"
         )
         self.setMouseTracking(True)
 

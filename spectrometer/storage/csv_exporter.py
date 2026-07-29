@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from ..domain.models import SpectrumFrame
+from .localization import localize_metadata_label, localize_metadata_value
 
 
 def export_device_csv(
@@ -29,17 +30,22 @@ def export_device_csv(
     details = dict(metadata or {})
     with target.open("w", newline="", encoding="utf-8-sig") as file:
         writer = csv.writer(file)
-        writer.writerow(["# ZGCAI Batch Spectrum"])
-        writer.writerow(["# Device ID", device_id])
-        writer.writerow(["# Frame Count", len(frames)])
-        writer.writerow(["# Export Time", datetime.now(timezone.utc).isoformat()])
+        writer.writerow(["# ZGCAI 批量光谱数据"])
+        writer.writerow(["# 设备编号", device_id])
+        writer.writerow(["# 帧数", len(frames)])
+        writer.writerow(["# 导出时间", datetime.now(timezone.utc).isoformat()])
         for key, value in details.items():
-            writer.writerow([f"# {key}", value])
+            writer.writerow(
+                [
+                    f"# {localize_metadata_label(key)}",
+                    localize_metadata_value(key, value),
+                ]
+            )
         writer.writerow([])
 
-        header = ["Pixel", "Wavelength"]
+        header = ["像素序号", "波长 (nm)"]
         header.extend(
-            f"Frame_{index:04d}_Seq_{frame.sequence:06X}_Time_{frame.timestamp_ns}"
+            f"第 {index:04d} 帧_序号_{frame.sequence:06X}_时间_{frame.timestamp_ns}"
             for index, frame in enumerate(frames, 1)
         )
         writer.writerow(header)

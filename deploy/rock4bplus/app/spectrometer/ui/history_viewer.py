@@ -10,6 +10,10 @@ from ..qt import QtWidgets
 from .plot_widget import HistoryPlotWidget
 
 
+PIXEL_HEADERS = {"Pixel", "像素序号"}
+WAVELENGTH_HEADERS = {"Wavelength", "波长", "波长 (nm)"}
+
+
 class HistoryViewer(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -63,11 +67,22 @@ class HistoryViewer(QtWidgets.QWidget):
     def _load_csv(path, plot):
         with path.open(encoding="utf-8-sig", newline="") as file:
             rows = list(csv.reader(file))
-        header_index = next((index for index, row in enumerate(rows) if row and row[0] == "Pixel"), None)
+        header_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if row and row[0] in PIXEL_HEADERS
+            ),
+            None,
+        )
         if header_index is None:
-            raise ValueError("CSV 中未找到 Pixel 表头")
+            raise ValueError("CSV 中未找到像素序号表头")
         header = rows[header_index]; data = rows[header_index + 1:]
-        x_column = 1 if len(header) > 1 and header[1] == "Wavelength" else 0
+        x_column = (
+            1
+            if len(header) > 1 and header[1] in WAVELENGTH_HEADERS
+            else 0
+        )
         x = np.array([float(row[x_column] or row[0]) for row in data if row and len(row) > x_column])
         for column in range(2, len(header)):
             values = []
@@ -82,7 +97,7 @@ class HistoryViewer(QtWidgets.QWidget):
             if sheet.title == "采集概要": continue
             rows = sheet.iter_rows(values_only=True)
             header = next(rows, None)
-            if not header or header[0] != "Pixel": continue
+            if not header or header[0] not in PIXEL_HEADERS: continue
             data = list(rows); x = np.array([row[1] if row[1] is not None else row[0] for row in data], dtype=float)
             for column in range(2, len(header)):
                 values = np.array([row[column] if len(row) > column and row[column] is not None else np.nan for row in data], dtype=float)

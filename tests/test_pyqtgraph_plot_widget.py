@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("pyqtgraph")
 
-from spectrometer.qt import QtWidgets
+from spectrometer.qt import QtCore, QtWidgets
 from spectrometer.ui.pyqtgraph_plot_widget import PyQtGraphSpectrumPlotWidget
 
 
@@ -105,3 +105,32 @@ def test_reports_completed_new_data_paint(plot):
     application().processEvents()
 
     assert painted == [True]
+
+
+class IgnoredPointerEvent:
+    def __init__(self, button=None):
+        self._button = button
+        self.accepted = False
+
+    def button(self):
+        return self._button
+
+    def accept(self):
+        self.accepted = True
+
+
+def test_view_box_ignores_wheel_and_right_drag(plot):
+    wheel = IgnoredPointerEvent()
+    plot._view_box.wheelEvent(wheel)
+    assert wheel.accepted
+
+    right_button = getattr(QtCore.Qt, "RightButton", None)
+    if right_button is None:
+        right_button = QtCore.Qt.MouseButton.RightButton
+    drag = IgnoredPointerEvent(right_button)
+    plot._view_box.mouseDragEvent(drag)
+    assert drag.accepted
+
+    click = IgnoredPointerEvent(right_button)
+    plot._view_box.mouseClickEvent(click)
+    assert click.accepted
