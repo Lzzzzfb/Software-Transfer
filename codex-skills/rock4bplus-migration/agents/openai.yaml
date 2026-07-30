@@ -1,0 +1,4 @@
+interface:
+  display_name: "ROCK 4B+ 软件迁移"
+  short_description: "将 Python/Qt 等软件可靠迁移到 ROCK 4B+"
+  default_prompt: "Use $rock4bplus-migration to assess and plan this software migration to Radxa ROCK 4B+."
