@@ -6,8 +6,10 @@ from pathlib import Path
 from typing import Dict
 
 from ..domain.models import AcquisitionSession, SpectrumFrame
+from ..processing.processor import ProcessingSnapshot
 from ..qt import QtCore, Signal, Slot
 from .coordinator import BatchStorageCoordinator
+from .export_context import FrozenDeviceExport, SealedExportContext
 from .naming import build_session_file_stems
 from .sealed_export import SealedSpoolExporter
 
@@ -160,22 +162,31 @@ class StorageSessionManager(QtCore.QObject):
         *,
         cleanup_sources=True,
     ) -> None:
-        if request.task_id in self._sessions:
-            raise ValueError("存储任务已经存在")
+        context = self.prepare_sealed_export(
+            request,
+            devices,
+            sealed_results,
+        )
+        self.start_prepared_export(
+            context,
+            cleanup_sources=cleanup_sources,
+        )
+
+    def prepare_sealed_export(
+        self,
+        request,
+        devices,
+        sealed_results,
+        *,
+        output_directory=None,
+        processing_snapshots=None,
+    ) -> SealedExportContext:
         devices = list(devices)
         device_ids = tuple(device.device_id for device in devices)
         if set(device_ids) != set(sealed_results):
             raise ValueError("封存文件与采集设备集合不一致")
-        spool_paths = {
-            device_id: values["spool_path"]
-            for device_id, values in sealed_results.items()
-        }
-        expected_counts = {
-            device_id: values["persisted_frames"]
-            for device_id, values in sealed_results.items()
-        }
         workbook_stem, device_stems = build_session_file_stems(request, devices)
-        wavelengths = {
+        wavelengths_by_device = {
             device.device_id: tuple(
                 device.get_wavelength_array(
                     device.info.valid_pixel
@@ -202,25 +213,71 @@ class StorageSessionManager(QtCore.QObject):
             }
             for device in devices
         }
-        snapshots = (
-            dict(self.processing_snapshot_provider(devices))
-            if self.processing_snapshot_provider is not None
-            else {}
+        if processing_snapshots is None:
+            snapshots = (
+                dict(self.processing_snapshot_provider(devices))
+                if self.processing_snapshot_provider is not None
+                else {}
+            )
+        else:
+            snapshots = dict(processing_snapshots)
+        frozen_devices = []
+        for device in devices:
+            device_id = device.device_id
+            wavelengths = wavelengths_by_device[device_id]
+            snapshot = snapshots.get(
+                device_id,
+                ProcessingSnapshot(wavelengths=wavelengths),
+            )
+            values = sealed_results[device_id]
+            frozen_devices.append(
+                FrozenDeviceExport(
+                    device_id=device_id,
+                    spool_path=Path(values["spool_path"]),
+                    expected_count=int(values["persisted_frames"]),
+                    wavelengths=tuple(float(value) for value in wavelengths),
+                    label=str(labels[device_id]),
+                    metadata_items=tuple(metadata[device_id].items()),
+                    processing_snapshot=snapshot,
+                    filename_stem=str(device_stems[device_id]),
+                )
+            )
+        return SealedExportContext(
+            request=request,
+            output_directory=Path(
+                self.output_directory
+                if output_directory is None
+                else output_directory
+            ),
+            filename_stem=str(workbook_stem),
+            devices=tuple(frozen_devices),
         )
+
+    def start_prepared_export(
+        self,
+        context: SealedExportContext,
+        *,
+        cleanup_sources=True,
+    ) -> None:
+        request = context.request
+        if request.task_id in self._sessions:
+            raise ValueError("存储任务已经存在")
         exporter = SealedSpoolExporter(
-            self.output_directory,
+            context.output_directory,
             request,
-            spool_paths,
-            expected_counts=expected_counts,
-            wavelengths_by_device=wavelengths,
-            device_labels=labels,
-            device_metadata=metadata,
-            processing_snapshots=snapshots,
-            filename_stem=workbook_stem,
-            device_filename_stems=device_stems,
+            context.spool_paths,
+            expected_counts=context.expected_counts,
+            wavelengths_by_device=context.wavelengths_by_device,
+            device_labels=context.device_labels,
+            device_metadata=context.device_metadata,
+            processing_snapshots=context.processing_snapshots,
+            filename_stem=context.filename_stem,
+            device_filename_stems=context.device_filename_stems,
             cleanup_sources=cleanup_sources,
         )
-        managed = _ManagedSession(exporter, device_ids, closing=True)
+        managed = _ManagedSession(
+            exporter, tuple(request.device_ids), closing=True
+        )
         self._sessions[request.task_id] = managed
         managed.future = self._executor.submit(
             self._close_worker, request.task_id, exporter

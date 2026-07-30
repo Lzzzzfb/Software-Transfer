@@ -53,11 +53,12 @@ from .device_sidebar import DeviceSidebar
 from .device_parameters import DeviceParametersDialog
 from .diagnostics import DiagnosticsPanel
 from .history_viewer import HistoryViewer
-from .input_controls import DirectDoubleSpinBox, NoWheelComboBox
+from .input_controls import NoWheelComboBox
 from .plot_backend import create_spectrum_plot_widget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
 from .status_panel import StatusPanel
+from .y_axis_dialog import YAxisDialog, YAxisSettings
 
 
 DISPLAY_FPS = 25
@@ -80,6 +81,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.settings_service = SettingsService(settings_path)
         self.settings = self.settings_service.load()
+        # 自动存储是一次运行中的主动选择，不继承上次启动状态。
+        self.settings["auto_store"] = False
         self._configuration_root = (
             Path(settings_path).parent
             if settings_path is not None
@@ -137,6 +140,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._diagnostic_observer = AcquisitionObserver()
         self._pending_missing_logs = {}
         self._pending_plot_frames = {}
+        self._y_axis_settings = YAxisSettings()
 
         self._build_ui()
         self.diagnostic_recorder = DiagnosticRecorder(
@@ -199,7 +203,20 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(bar); layout.setContentsMargins(12, 5, 12, 5)
         open_button = QtWidgets.QPushButton("打开文件"); open_button.clicked.connect(self.history_viewer_open); layout.addWidget(open_button)
         recover_button = QtWidgets.QPushButton("恢复缓存"); recover_button.clicked.connect(self.recover_spool); layout.addWidget(recover_button)
+        self.save_spectrum_button = QtWidgets.QPushButton("保存光谱")
+        self.save_spectrum_button.setEnabled(False)
+        self.save_spectrum_button.setToolTip(
+            "保存最近一次未自动存储的正常采集；新采集会覆盖未保存缓存"
+        )
+        self.save_spectrum_button.clicked.connect(
+            self._save_pending_spectrum
+        )
+        layout.addWidget(self.save_spectrum_button)
         save_image = QtWidgets.QPushButton("保存图片"); save_image.clicked.connect(self.save_plot_image); layout.addWidget(save_image)
+        layout.addWidget(QtWidgets.QLabel("采集方式"))
+        self.acquisition_mode = NoWheelComboBox()
+        self.acquisition_mode.addItems(["连续采集", "单次采集"])
+        layout.addWidget(self.acquisition_mode)
         layout.addSpacing(16); layout.addWidget(QtWidgets.QLabel("处理"))
         self.display_mode = NoWheelComboBox()
         for label, value in [("原始强度", "raw"), ("扣背景", "dark_subtract"), ("吸光度", "absorbance"), ("自定义公式", "custom")]:
@@ -225,19 +242,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_widget.user_zoomed.connect(self._plot_user_zoomed)
         self.plot_widget.view_reset.connect(self._plot_view_reset)
         self.plot_widget.data_frame_painted.connect(self._plot_data_painted)
-        self.fixed_y = QtWidgets.QCheckBox("固定 Y 轴")
-        self.fixed_y.toggled.connect(self._fixed_y_toggled)
-        layout.addWidget(self.fixed_y)
-        layout.addWidget(QtWidgets.QLabel("最小"))
-        self.y_minimum = DirectDoubleSpinBox(); self.y_minimum.setDecimals(6)
-        self.y_minimum.setRange(-1e12, 1e12); self.y_minimum.setValue(0)
-        self.y_minimum.setMaximumWidth(105); layout.addWidget(self.y_minimum)
-        layout.addWidget(QtWidgets.QLabel("最大"))
-        self.y_maximum = DirectDoubleSpinBox(); self.y_maximum.setDecimals(6)
-        self.y_maximum.setRange(-1e12, 1e12); self.y_maximum.setValue(65535)
-        self.y_maximum.setMaximumWidth(105); layout.addWidget(self.y_maximum)
-        apply_y = QtWidgets.QPushButton("应用 Y 轴")
-        apply_y.clicked.connect(self._apply_fixed_y_axis); layout.addWidget(apply_y)
+        y_axis = QtWidgets.QPushButton("Y 轴设置…")
+        y_axis.clicked.connect(self.open_y_axis_settings)
+        layout.addWidget(y_axis)
         clear = QtWidgets.QPushButton("清除对比"); clear.clicked.connect(self.plot_widget.clear_reference_curves); layout.addWidget(clear)
         return bar
 
@@ -254,31 +261,32 @@ class MainWindow(QtWidgets.QMainWindow):
     def _plot_data_painted(self):
         self._shown_since_status += 1
 
-    def _fixed_y_toggled(self, enabled):
-        if enabled:
-            self._apply_fixed_y_axis()
-        else:
-            self.plot_widget.disable_fixed_y()
+    def open_y_axis_settings(self):
+        dialog = YAxisDialog(self._y_axis_settings, self)
+        if not dialog_exec(dialog):
+            return False
+        return self._apply_y_axis_settings(dialog.values())
 
-    def _apply_fixed_y_axis(self):
-        if not self.fixed_y.isChecked():
+    def _apply_y_axis_settings(self, settings):
+        self._y_axis_settings = settings
+        if not settings.fixed:
             self.plot_widget.disable_fixed_y()
             return True
-        minimum = self.y_minimum.value()
-        maximum = self.y_maximum.value()
         try:
-            self.plot_widget.set_fixed_y_range(minimum, maximum)
+            self.plot_widget.set_fixed_y_range(
+                settings.minimum, settings.maximum
+            )
         except ValueError as exc:
-            self.fixed_y.blockSignals(True)
-            self.fixed_y.setChecked(False)
-            self.fixed_y.blockSignals(False)
+            self._y_axis_settings = YAxisSettings(
+                False, settings.minimum, settings.maximum
+            )
             self.plot_widget.disable_fixed_y()
             self._operation_rejected(str(exc))
             return False
         self.status_panel.state_label.setText(
             "固定 Y 轴初始范围："
-            f"{self.plot_widget.format_axis_value(minimum)} 至 "
-            f"{self.plot_widget.format_axis_value(maximum)}"
+            f"{self.plot_widget.format_axis_value(settings.minimum)} 至 "
+            f"{self.plot_widget.format_axis_value(settings.maximum)}"
         )
         return True
 
@@ -320,6 +328,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control.task_started.connect(self._control_task_started)
         self.control.task_finished.connect(self._control_task_finished)
         self.control.reference_captured.connect(self._reference_captured)
+        self.control.manual_capture_changed.connect(
+            self._manual_capture_changed
+        )
+        self.control.manual_export_started.connect(
+            self._manual_export_started
+        )
+        self.control.manual_export_finished.connect(
+            self._manual_export_finished
+        )
         self.diagnostics.export_requested.connect(self._export_diagnostic_bundle)
         self.device_manager.acquisition_frame_summary.connect(
             self._diagnostic_frame_summary
@@ -336,11 +353,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.currentChanged.connect(self._diagnostic_tab_changed)
 
     def _apply_settings(self):
-        self.sidebar.batch_size.setValue(self.settings["batch_size"])
-        index = self.sidebar.storage_format.findData(self.settings["storage_format"])
-        self.sidebar.storage_format.setCurrentIndex(max(0, index))
-        # 自动存储是一次采集的主动选择，每次启动均保持未勾选。
-        self.sidebar.auto_store.setChecked(False)
         self.plot_widget.set_line_width(self.settings["line_width"])
         index = self.display_mode.findData(self.settings["display_mode"]); self.display_mode.setCurrentIndex(max(0, index))
         index = self.x_axis.findData(self.settings["x_axis"]); self.x_axis.setCurrentIndex(max(0, index))
@@ -513,18 +525,63 @@ class MainWindow(QtWidgets.QMainWindow):
     def _selected_acquisition_mode(self):
         return (
             AcquisitionMode.CONTINUOUS
-            if self.sidebar.acquisition_mode.currentIndex() == 0
+            if self.acquisition_mode.currentIndex() == 0
             else AcquisitionMode.SINGLE
         )
 
     def _storage_options(self):
         return {
-            "auto_store": self.sidebar.auto_store.isChecked(),
+            "auto_store": bool(self.settings["auto_store"]),
             "storage_format": StorageFormat(
-                self.sidebar.storage_format.currentData()
+                self.settings["storage_format"]
             ),
-            "batch_size": self.sidebar.batch_size.value(),
+            "batch_size": int(self.settings["batch_size"]),
         }
+
+    def _save_pending_spectrum(self):
+        result = self.control.save_pending_capture()
+        self._refresh_save_spectrum_state()
+        return result
+
+    def _manual_capture_changed(self, pending):
+        self._refresh_save_spectrum_state()
+
+    def _manual_export_started(self, task_id):
+        self.save_spectrum_button.setText("保存中…")
+        self.save_spectrum_button.setEnabled(False)
+        self.status_panel.state_label.setText("正在保存光谱…")
+
+    def _manual_export_finished(self, task_id, files, failed):
+        output_files = [
+            str(path)
+            for path in files
+            if Path(str(path)).suffix.lower() in {".csv", ".xlsx"}
+        ]
+        recovery_files = [
+            str(path) for path in files if str(path) not in output_files
+        ]
+        if failed:
+            message = "光谱保存失败"
+            if recovery_files:
+                message += "，缓存已保留，可重试：" + "；".join(
+                    recovery_files
+                )
+            self._log(message, "ERROR")
+        else:
+            self._log(
+                f"光谱保存完成，生成 {len(output_files)} 个文件"
+            )
+        self._refresh_save_spectrum_state()
+
+    def _refresh_save_spectrum_state(self):
+        if self.control.manual_export_active:
+            self.save_spectrum_button.setText("保存中…")
+            self.save_spectrum_button.setEnabled(False)
+            return
+        self.save_spectrum_button.setText("保存光谱")
+        self.save_spectrum_button.setEnabled(
+            self.control.can_save_pending_capture
+        )
 
     def _global_devices(self):
         return [
@@ -757,6 +814,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_control_status()
 
     def _refresh_control_status(self):
+        self._refresh_save_spectrum_state()
+        if self.control.manual_export_active:
+            self.status_panel.state_label.setText("正在保存光谱…")
+            return
         if self.control.global_state is not ControlState.IDLE:
             self.status_panel.state_label.setText(
                 f"总控：{control_state_label(self.control.global_state)}"
@@ -1246,12 +1307,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 if task is not None and task.owner is AcquisitionOwner.LOCAL:
                     self.control.stop_local(device_id)
         self.control.finish_pending_stops()
+        if not self.control.manual_export_active:
+            self.control.discard_pending_capture("shutdown")
         self.storage_manager.shutdown(timeout=10.0)
+        if not self.control.manual_export_active:
+            self.control.discard_pending_capture("shutdown")
         self.display_processing.shutdown(timeout=2.0)
         self.settings.update(
             {
-                "batch_size": self.sidebar.batch_size.value(),
-                "storage_format": self.sidebar.storage_format.currentData(),
                 "auto_store": False,
                 "display_mode": self.display_mode.currentData(),
                 "x_axis": self.x_axis.currentData(),

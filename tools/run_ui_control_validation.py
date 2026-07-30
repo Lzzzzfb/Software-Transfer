@@ -51,7 +51,7 @@ def validate(output_directory: Path):
     window.control.operation_rejected.connect(rejected.append)
     stop_call_ms = []
     try:
-        assert not window.sidebar.auto_store.isChecked()
+        assert window.settings["auto_store"] is False
 
         # Repeated global lifecycle: stop must return immediately while tail
         # quiet time and file finalization continue through Qt/background work.
@@ -98,7 +98,7 @@ def validate(output_directory: Path):
         )
 
         # Global and local single-shot tasks stop after their fresh frame(s).
-        window.sidebar.acquisition_mode.setCurrentIndex(1)
+        window.acquisition_mode.setCurrentIndex(1)
         assert window.start_acquisition()
         wait_until(
             application,
@@ -113,9 +113,9 @@ def validate(output_directory: Path):
         )
 
         # One stored multi-device session validates human names and cleanup.
-        window.sidebar.acquisition_mode.setCurrentIndex(0)
-        window.sidebar.batch_size.setValue(3)
-        window.sidebar.auto_store.setChecked(True)
+        window.acquisition_mode.setCurrentIndex(0)
+        window.settings["batch_size"] = 3
+        window.settings["auto_store"] = True
         assert window.start_acquisition()
         pump_events(application, 0.12)
         assert window.stop_acquisition()
@@ -148,7 +148,7 @@ def validate(output_directory: Path):
             "SNSIM-VIS-001_B000" in path.name for path in csv_files
         )
         assert not list(output_directory.glob("*.part"))
-        window.sidebar.auto_store.setChecked(False)
+        window.settings["auto_store"] = False
 
         # Reference commands always use fresh single shots and do not enter
         # normal batch storage.

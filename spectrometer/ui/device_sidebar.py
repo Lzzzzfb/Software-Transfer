@@ -1,7 +1,7 @@
 """左侧总控和设备卡片。"""
 
 from ..qt import QtCore, QtWidgets, Signal
-from .input_controls import DirectSpinBox, NoWheelComboBox
+from .input_controls import DirectSpinBox
 
 
 class DeviceCard(QtWidgets.QFrame):
@@ -106,20 +106,9 @@ class DeviceSidebar(QtWidgets.QWidget):
         self.setObjectName("deviceSidebar"); self.setMinimumWidth(290); self.setMaximumWidth(370)
         self.cards = {}; self.selected_device_id = None
         layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(8, 8, 8, 8)
-        title = QtWidgets.QLabel("设备与批量存储"); title.setObjectName("sectionTitle"); layout.addWidget(title)
-        storage_box = QtWidgets.QFrame(); storage_box.setObjectName("storageBox")
-        form = QtWidgets.QFormLayout(storage_box); form.setContentsMargins(10, 8, 10, 8)
-        self.acquisition_mode = NoWheelComboBox(); self.acquisition_mode.addItems(["连续采集", "单次采集"])
-        form.addRow("采集方式", self.acquisition_mode)
-        self.batch_size = DirectSpinBox(); self.batch_size.setRange(1, 1000); self.batch_size.setValue(500)
-        form.addRow("每批帧数", self.batch_size)
-        self.storage_format = NoWheelComboBox()
-        self.storage_format.addItem("CSV + Excel", "csv_excel")
-        self.storage_format.addItem("仅 CSV", "csv")
-        self.storage_format.addItem("仅 Excel", "excel")
-        form.addRow("存储格式", self.storage_format)
-        self.auto_store = QtWidgets.QCheckBox("采集时自动批量存储"); self.auto_store.setChecked(False)
-        form.addRow(self.auto_store); layout.addWidget(storage_box)
+        title = QtWidgets.QLabel("设备")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
         self.scroll = QtWidgets.QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         container = QtWidgets.QWidget(); self.card_layout = QtWidgets.QVBoxLayout(container)
         self.card_layout.setContentsMargins(0, 4, 0, 4); self.card_layout.setSpacing(7); self.card_layout.addStretch(1)

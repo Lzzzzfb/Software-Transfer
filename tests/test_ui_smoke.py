@@ -35,9 +35,15 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
         f"实时绘图后端：{expected_backend}"
         in window.diagnostics.log.toPlainText()
     )
-    assert window.sidebar.batch_size.value() == 500
-    assert window.sidebar.storage_format.currentData() == "csv_excel"
-    assert not window.sidebar.auto_store.isChecked()
+    assert window.sidebar.findChild(QtWidgets.QLabel, "sectionTitle").text() == "设备"
+    assert not hasattr(window.sidebar, "acquisition_mode")
+    assert not hasattr(window.sidebar, "batch_size")
+    assert not hasattr(window.sidebar, "storage_format")
+    assert not hasattr(window.sidebar, "auto_store")
+    assert window.acquisition_mode.currentText() == "连续采集"
+    assert window.settings["batch_size"] == 500
+    assert window.settings["storage_format"] == "csv_excel"
+    assert window.settings["auto_store"] is False
     assert len(window.sidebar.cards) == 4
     assert not hasattr(window.sidebar, "port_combo")
     assert not hasattr(window.sidebar, "baud_combo")
@@ -57,6 +63,14 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
         for button in window.history_viewer.findChildren(QtWidgets.QPushButton)
     }
     assert "打开文件" in context_labels
+    assert "保存光谱" in context_labels
+    assert not window.save_spectrum_button.isEnabled()
+    assert "保存图片" in context_labels
+    assert "Y 轴设置…" in context_labels
+    assert "应用 Y 轴" not in context_labels
+    assert not hasattr(window, "fixed_y")
+    assert not hasattr(window, "y_minimum")
+    assert not hasattr(window, "y_maximum")
     assert "airPLS 参数" in context_labels
     assert hasattr(window, "airpls_enabled")
     assert not window.airpls_enabled.isChecked()
@@ -113,10 +127,38 @@ def test_auto_store_is_unchecked_even_if_previous_settings_enabled_it(tmp_path):
         auto_start_simulation=False,
         settings_path=settings_path,
     )
-    assert not window.sidebar.auto_store.isChecked()
+    assert window.settings["auto_store"] is False
     window.close(); app.processEvents()
     stored = json.loads(settings_path.read_text(encoding="utf-8"))
     assert stored["auto_store"] is False
+
+
+def test_settings_dialog_contains_moved_storage_controls(tmp_path):
+    app = application()
+    from spectrometer.ui.settings_dialog import SettingsDialog
+
+    dialog = SettingsDialog(
+        {
+            "storage_path": str(tmp_path),
+            "line_width": 1.6,
+            "batch_size": 321,
+            "storage_format": "csv",
+            "auto_store": True,
+        }
+    )
+
+    assert dialog.batch_size.value() == 321
+    assert dialog.storage_format.currentData() == "csv"
+    assert dialog.auto_store.isChecked()
+    assert dialog.values() == {
+        "storage_path": str(tmp_path),
+        "line_width": 1.6,
+        "batch_size": 321,
+        "storage_format": "csv",
+        "auto_store": True,
+    }
+    dialog.close()
+    app.processEvents()
 
 
 def test_custom_plot_runs_without_pyqtgraph_and_preserves_manual_range():

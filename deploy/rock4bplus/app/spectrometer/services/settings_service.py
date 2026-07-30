@@ -85,7 +85,11 @@ class SettingsService:
     def save(self, settings):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        values = dict(settings)
+        # 自动存储需要用户在每次运行中主动选择，禁止成为启动默认值。
+        values["auto_store"] = False
         temporary.write_text(
-            json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(values, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         temporary.replace(self.path)

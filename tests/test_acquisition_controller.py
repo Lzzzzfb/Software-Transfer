@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -74,6 +75,8 @@ class FakeStorageManager(QtCore.QObject):
         self.frames = []
         self.closed = []
         self.sealed_exports = []
+        self.prepared_contexts = []
+        self.prepared_exports = []
 
     def start_session(self, request, devices):
         self.started.append((request, tuple(device.device_id for device in devices)))
@@ -101,6 +104,30 @@ class FakeStorageManager(QtCore.QObject):
                 bool(cleanup_sources),
             )
         )
+
+    def prepare_sealed_export(
+        self,
+        request,
+        devices,
+        sealed_results,
+        **kwargs,
+    ):
+        context = SimpleNamespace(
+            request=request,
+            spool_paths={
+                device_id: Path(values["spool_path"])
+                for device_id, values in sealed_results.items()
+            },
+            expected_counts={
+                device_id: int(values["persisted_frames"])
+                for device_id, values in sealed_results.items()
+            },
+        )
+        self.prepared_contexts.append(context)
+        return context
+
+    def start_prepared_export(self, context, *, cleanup_sources=True):
+        self.prepared_exports.append((context, bool(cleanup_sources)))
 
 
 class FakeProcessDeviceManager(FakeDeviceManager):
@@ -431,7 +458,9 @@ def test_device_disconnect_finishes_local_task_without_waiting_for_stop_ack():
     assert controller.device_state(0) is ControlState.IDLE
 
 
-def test_unchecked_clean_process_session_removes_temporary_spool(tmp_path):
+def test_unchecked_clean_process_session_becomes_pending_manual_capture(
+    tmp_path,
+):
     manager = FakeProcessDeviceManager()
     storage = FakeStorageManager(tmp_path)
     controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
@@ -440,6 +469,8 @@ def test_unchecked_clean_process_session_removes_temporary_spool(tmp_path):
         lambda task_id, files, failed:
             finished.append((task_id, list(files), bool(failed)))
     )
+    pending = []
+    controller.manual_capture_changed.connect(pending.append)
 
     assert controller.start_local(0, auto_store=False)
     task_id = controller.active_task_for_device(0).task_id
@@ -451,8 +482,79 @@ def test_unchecked_clean_process_session_removes_temporary_spool(tmp_path):
 
     manager.complete_persistent_session()
 
-    assert not spool.exists()
+    assert spool.exists()
     assert finished == [(task_id, [], False)]
+    assert controller.pending_manual_capture is not None
+    assert controller.pending_manual_capture.task_id == task_id
+    assert controller.pending_manual_capture.frame_count == 1
+    assert pending[-1] is controller.pending_manual_capture
+
+
+def test_pending_manual_capture_exports_and_clears_after_success(tmp_path):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    completed = []
+    controller.manual_export_finished.connect(
+        lambda task_id, files, failed:
+            completed.append((task_id, list(files), bool(failed)))
+    )
+
+    assert controller.start_local(0, auto_store=False)
+    task_id = controller.active_task_for_device(0).task_id
+    acknowledge_local_start(manager)
+    assert controller.stop_local(0)
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    manager.complete_persistent_session()
+
+    assert controller.save_pending_capture()
+    assert controller.manual_export_active
+    assert storage.prepared_exports == [
+        (controller.pending_manual_capture.context, True)
+    ]
+
+    output = tmp_path / "saved.csv"
+    storage.session_closed.emit(task_id, [str(output)], [])
+
+    assert not controller.manual_export_active
+    assert controller.pending_manual_capture is None
+    assert completed == [(task_id, [str(output)], False)]
+
+
+def test_starting_next_capture_discards_unsaved_pending_capture(tmp_path):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    diagnostics = []
+    controller.diagnostic_event.connect(diagnostics.append)
+
+    assert controller.start_local(0, auto_store=False)
+    acknowledge_local_start(manager)
+    assert controller.stop_local(0)
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    spool = manager.complete_persistent_session()
+    assert spool.exists()
+
+    assert controller.start_local(0, auto_store=False)
+
+    assert not spool.exists()
+    assert controller.pending_manual_capture is None
+    assert any("未保存数据已被新采集覆盖" in item for item in diagnostics)
+
+
+def test_zero_frame_capture_does_not_create_pending_manual_capture(tmp_path):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+
+    assert controller.start_local(0, auto_store=False)
+    acknowledge_local_start(manager)
+    assert controller.stop_local(0)
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    spool = manager.complete_persistent_session(complete=0, persisted=0)
+
+    assert not spool.exists()
+    assert controller.pending_manual_capture is None
 
 
 def test_unchecked_mismatched_process_session_preserves_recovery_spool(
@@ -557,5 +659,7 @@ def test_unchecked_cleanup_failure_is_warned_without_failing_capture(
     manager.complete_persistent_session()
 
     assert spool.exists()
+    assert not controller.discard_pending_capture("new_acquisition")
     assert warning in diagnostics
-    assert finished == [(task_id, [str(spool)], False)]
+    assert controller.pending_manual_capture is not None
+    assert finished == [(task_id, [], False)]

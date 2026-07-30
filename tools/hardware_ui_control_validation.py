@@ -19,6 +19,7 @@ from spectrometer.domain.enums import ControlState
 from spectrometer.processing.references import ReferenceRepository
 from spectrometer.qt import QT_API, QtCore, QtWidgets
 from spectrometer.ui.main_window import MainWindow
+from spectrometer.ui.y_axis_dialog import YAxisSettings
 
 
 def wait_until(application, predicate, timeout, description):
@@ -55,7 +56,7 @@ class HardwareValidation:
         self.window.reference_repository = ReferenceRepository(
             output_directory / "references"
         )
-        self.window.sidebar.batch_size.setValue(5)
+        self.window.settings["batch_size"] = 5
         self.window.device_manager.frame_arrived.connect(self.on_frame)
         self.window.device_manager.error_occurred.connect(
             lambda device_id, message: self.errors.append(
@@ -137,7 +138,7 @@ class HardwareValidation:
     def run(self, cycles):
         self.stage = "device_initialization"
         self.wait_ready()
-        if self.window.sidebar.auto_store.isChecked():
+        if self.window.settings["auto_store"]:
             raise AssertionError("自动存储启动默认值不是未勾选")
         self.events.append(f"识别完成：{len(self.devices)} 台")
 
@@ -155,7 +156,9 @@ class HardwareValidation:
 
         # Real incoming frames must not move a manually zoomed fixed-Y view.
         self.stage = "fixed_y"
-        self.window.fixed_y.setChecked(True)
+        self.window._apply_y_axis_settings(
+            YAxisSettings(True, 0, 65535)
+        )
         before = dict(self.counts)
         if not self.window.start_acquisition():
             raise AssertionError("固定 Y 场景总控启动失败")
@@ -171,7 +174,9 @@ class HardwareValidation:
         if self.window.plot_widget._effective_range()[2:] != (0, 65535):
             raise AssertionError("双击复位模型未恢复固定 Y 初始范围")
         self.stop_global()
-        self.window.fixed_y.setChecked(False)
+        self.window._apply_y_axis_settings(
+            YAxisSettings(False, 0, 65535)
+        )
 
         # Multiple local tasks overlap even while the top selection is sync.
         self.stage = "parallel_local"
@@ -217,6 +222,33 @@ class HardwareValidation:
             raise AssertionError("总控期间错误接受了参考采集")
         self.stop_global()
 
+        # A non-auto ordinary task must remain available for direct manual export.
+        self.stage = "manual_spectrum_save"
+        pending = self.window.control.pending_manual_capture
+        if pending is None or not self.window.save_spectrum_button.isEnabled():
+            raise AssertionError("普通采集停止后未生成可手动保存的上一任务缓存")
+        previous_exports = set((self.output_directory / "exports").glob("*"))
+        if not self.window._save_pending_spectrum():
+            raise AssertionError("保存光谱请求被拒绝")
+        wait_until(
+            self.application,
+            lambda: (
+                not self.window.control.manual_export_active
+                and self.window.control.pending_manual_capture is None
+            ),
+            60.0,
+            "上一任务光谱后台导出",
+        )
+        new_exports = (
+            set((self.output_directory / "exports").glob("*"))
+            - previous_exports
+        )
+        if not any(
+            path.suffix.lower() in {".csv", ".xlsx"}
+            for path in new_exports
+        ):
+            raise AssertionError("保存光谱完成后未生成 CSV/Excel")
+
         # Fresh global background and per-device reference frames.
         self.stage = "references"
         if not self.window.capture_background():
@@ -245,9 +277,9 @@ class HardwareValidation:
         self.window.ribbon.sync_combo.setCurrentIndex(
             self.window.ribbon.sync_combo.findData("independent")
         )
-        self.window.sidebar.auto_store.setChecked(True)
+        self.window.settings["auto_store"] = True
         self.global_cycle(frames_per_device=8)
-        self.window.sidebar.auto_store.setChecked(False)
+        self.window.settings["auto_store"] = False
 
     def report(self, failure=None):
         self.stage = "report"

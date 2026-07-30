@@ -14,6 +14,7 @@ from spectrometer.domain.enums import (
     SyncMode,
 )
 from spectrometer.domain.models import AcquisitionRequest, SpectrumFrame
+from spectrometer.processing.processor import ProcessingSnapshot
 from spectrometer.qt import QtCore
 from spectrometer.storage import session_manager
 from spectrometer.storage.session_manager import StorageSessionManager
@@ -301,3 +302,46 @@ def test_sealed_export_reports_outputs_recovery_files_and_cleanup_warnings(
     assert len(warnings) == 1
     assert warnings[0][0] == acquisition.task_id
     assert str(recovery) in warnings[0][1]
+
+
+def test_prepared_sealed_export_freezes_device_processing_and_directory(
+    tmp_path,
+):
+    first_directory = tmp_path / "first"
+    second_directory = tmp_path / "second"
+    snapshot = ProcessingSnapshot(
+        mode="dark_subtract",
+        wavelengths=(400.0, 401.0),
+        background=(1.0, 2.0),
+    )
+    manager = StorageSessionManager(
+        first_directory,
+        processing_snapshot_provider=lambda devices: {0: snapshot},
+    )
+    acquisition = request(0)
+    device = ready_device(0)
+    recovery = tmp_path / "capture.zgs"
+    recovery.write_bytes(b"capture")
+
+    context = manager.prepare_sealed_export(
+        acquisition,
+        [device],
+        {
+            0: {
+                "spool_path": str(recovery),
+                "persisted_frames": 7,
+            }
+        },
+    )
+
+    device.port_name = "CHANGED"
+    device.info.prod_serial = "CHANGED"
+    manager.set_output_directory(second_directory)
+
+    assert context.output_directory == first_directory
+    assert context.spool_paths == {0: recovery}
+    assert context.expected_counts == {0: 7}
+    assert context.device_labels == {0: "001"}
+    assert context.device_metadata[0]["Port"] == "COM10"
+    assert context.processing_snapshots == {0: snapshot}
+    assert context.processing_snapshots[0].background == (1.0, 2.0)

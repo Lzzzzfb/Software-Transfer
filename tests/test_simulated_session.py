@@ -23,8 +23,8 @@ def test_simulated_multi_device_session_exports_default_layout(tmp_path):
     window.settings["storage_path"] = str(tmp_path)
     window.storage_manager.set_output_directory(tmp_path)
     window.reference_repository = ReferenceRepository(tmp_path / "references")
-    window.sidebar.batch_size.setValue(2)
-    window.sidebar.auto_store.setChecked(True)
+    window.settings["batch_size"] = 2
+    window.settings["auto_store"] = True
     window.start_acquisition()
     window._simulation_tick(); window._simulation_tick()
     window.stop_acquisition()

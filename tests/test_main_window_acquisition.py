@@ -1,5 +1,7 @@
 import os
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -227,5 +229,59 @@ def test_processing_snapshot_stays_frozen_during_active_task(tmp_path):
     item._processing_by_device.pop(0)
     third = item._processing_snapshots([device])[0]
     assert not third.baseline_enabled
+    item.close()
+    application().processEvents()
+
+
+def test_pending_manual_capture_enables_save_button_and_clicks_controller(
+    tmp_path, monkeypatch
+):
+    item = window(tmp_path)
+    pending = SimpleNamespace(
+        task_id="pending-task",
+        frame_count=12,
+        spool_paths=(Path(tmp_path / "capture.zgs"),),
+    )
+    item.control._pending_manual_capture = pending
+    item._manual_capture_changed(pending)
+
+    assert item.save_spectrum_button.isEnabled()
+    called = []
+    monkeypatch.setattr(
+        item.control,
+        "save_pending_capture",
+        lambda: called.append(True) or True,
+    )
+
+    item.save_spectrum_button.click()
+
+    assert called == [True]
+    item.control._pending_manual_capture = None
+    item.close()
+    application().processEvents()
+
+
+def test_manual_export_button_and_log_follow_async_result(tmp_path):
+    item = window(tmp_path)
+    item.control._manual_export_task_id = "pending-task"
+
+    item._manual_export_started("pending-task")
+
+    assert item.save_spectrum_button.text() == "保存中…"
+    assert not item.save_spectrum_button.isEnabled()
+    assert item.status_panel.state_label.text() == "正在保存光谱…"
+    item._refresh_control_status()
+    assert item.status_panel.state_label.text() == "正在保存光谱…"
+
+    item.control._manual_export_task_id = None
+    item.control._pending_manual_capture = None
+    output = tmp_path / "saved.csv"
+    item._manual_export_finished("pending-task", [str(output)], False)
+
+    assert item.save_spectrum_button.text() == "保存光谱"
+    assert not item.save_spectrum_button.isEnabled()
+    assert "光谱保存完成，生成 1 个文件" in (
+        item.diagnostics.log.toPlainText()
+    )
     item.close()
     application().processEvents()

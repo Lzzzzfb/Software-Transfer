@@ -50,8 +50,8 @@ class UiHardwareSmoke(QtCore.QObject):
         )
         self.window.settings["storage_path"] = str(output_dir / "exports")
         self.window.storage_manager.set_output_directory(output_dir / "exports")
-        self.window.sidebar.batch_size.setValue(5)
-        self.window.sidebar.auto_store.setChecked(True)
+        self.window.settings["batch_size"] = 5
+        self.window.settings["auto_store"] = True
         self.window.show()
         self.window.device_manager.frame_arrived.connect(self.on_frame)
         self.window.device_manager.error_occurred.connect(

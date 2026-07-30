@@ -16,6 +16,7 @@ from ..domain.enums import (
 )
 from ..domain.models import AcquisitionRequest, SpectrumFrame
 from ..qt import QtCore, Signal
+from ..storage.manual_capture import PendingManualCapture
 from ..storage.spool_lifecycle import cleanup_spool_files
 
 
@@ -52,6 +53,9 @@ class AcquisitionController(QtCore.QObject):
     task_started = Signal(str, object)
     task_finished = Signal(str, object, object)
     reference_captured = Signal(str, object)
+    manual_capture_changed = Signal(object)
+    manual_export_started = Signal(str)
+    manual_export_finished = Signal(str, object, bool)
 
     def __init__(
         self,
@@ -79,6 +83,8 @@ class AcquisitionController(QtCore.QObject):
         self._expected_commands: Dict[int, tuple] = {}
         self._global_task_id: Optional[str] = None
         self._global_state = ControlState.IDLE
+        self._pending_manual_capture = None
+        self._manual_export_task_id = None
 
         self.device_manager.command_completed.connect(self._on_command_completed)
         if hasattr(self.device_manager, "device_updated"):
@@ -110,7 +116,23 @@ class AcquisitionController(QtCore.QObject):
 
     @property
     def busy(self) -> bool:
-        return bool(self._tasks)
+        return bool(self._tasks) or self.manual_export_active
+
+    @property
+    def pending_manual_capture(self):
+        return self._pending_manual_capture
+
+    @property
+    def manual_export_active(self) -> bool:
+        return self._manual_export_task_id is not None
+
+    @property
+    def can_save_pending_capture(self) -> bool:
+        return (
+            self._pending_manual_capture is not None
+            and not self._tasks
+            and not self.manual_export_active
+        )
 
     def device_state(self, device_id: int) -> ControlState:
         return self._device_states.get(device_id, ControlState.IDLE)
@@ -137,6 +159,8 @@ class AcquisitionController(QtCore.QObject):
         storage_format=StorageFormat.CSV_EXCEL,
         batch_size: int = 500,
     ) -> bool:
+        if self.manual_export_active:
+            return self._reject("光谱正在保存，请等待完成后再开始采集")
         if self._global_task_id is not None:
             return self._reject("总控任务正在运行，请使用顶部停止")
         if self.device_state(device_id) is not ControlState.IDLE:
@@ -148,6 +172,10 @@ class AcquisitionController(QtCore.QObject):
         device = self._ready_device(device_id)
         if device is None:
             return self._reject(f"设备 {device_id} 未连接或尚未初始化")
+        if not self.discard_pending_capture("new_acquisition"):
+            return self._reject(
+                "上一任务缓存无法清理，已取消新的采集"
+            )
         request = AcquisitionRequest.create(
             AcquisitionOwner.LOCAL,
             [device_id],
@@ -174,6 +202,8 @@ class AcquisitionController(QtCore.QObject):
         storage_format=StorageFormat.CSV_EXCEL,
         batch_size: int = 500,
     ) -> bool:
+        if self.manual_export_active:
+            return self._reject("光谱正在保存，请等待完成后再开始采集")
         busy_ids = [
             device_id
             for device_id, state in self._device_states.items()
@@ -194,6 +224,10 @@ class AcquisitionController(QtCore.QObject):
         sync = SyncMode(sync_mode)
         if sync is SyncMode.HARD_INTERNAL and master_device_id not in ids:
             return self._reject("内部硬同步需要选择参与总控的主设备")
+        if not self.discard_pending_capture("new_acquisition"):
+            return self._reject(
+                "上一任务缓存无法清理，已取消新的采集"
+            )
         request = AcquisitionRequest.create(
             AcquisitionOwner.GLOBAL,
             ids,
@@ -313,6 +347,70 @@ class AcquisitionController(QtCore.QObject):
         for task in list(self._tasks.values()):
             if task.phase is ControlState.STOPPING:
                 self._finalize_task(task)
+
+    def save_pending_capture(self) -> bool:
+        if self._tasks:
+            return self._reject("采集任务未完全结束，暂时不能保存光谱")
+        if self.manual_export_active:
+            return self._reject("光谱正在保存，请勿重复操作")
+        pending = self._pending_manual_capture
+        if pending is None:
+            return self._reject("没有可保存的上一任务光谱")
+        if self.storage_manager is None:
+            return self._reject("存储服务不可用")
+        try:
+            self.storage_manager.start_prepared_export(
+                pending.context,
+                cleanup_sources=True,
+            )
+        except Exception as exc:
+            self.diagnostic_event.emit(f"手动保存启动失败：{exc}")
+            return self._reject("光谱保存启动失败，缓存已保留")
+        self._manual_export_task_id = pending.task_id
+        self.manual_export_started.emit(pending.task_id)
+        self.diagnostic_event.emit("正在后台保存上一任务光谱")
+        return True
+
+    def discard_pending_capture(self, reason: str) -> bool:
+        pending = self._pending_manual_capture
+        if pending is None:
+            return True
+        if self.manual_export_active:
+            self.diagnostic_event.emit("光谱正在保存，不能清理待保存缓存")
+            return False
+        cleanup = cleanup_spool_files(pending.spool_paths)
+        for message in cleanup.warnings:
+            self.diagnostic_event.emit(message)
+        if cleanup.retained:
+            self.diagnostic_event.emit(
+                "上一任务缓存清理失败："
+                + "；".join(str(path) for path in cleanup.retained)
+            )
+            return False
+        self._pending_manual_capture = None
+        self.manual_capture_changed.emit(None)
+        if reason == "new_acquisition":
+            self.diagnostic_event.emit(
+                "上一任务未保存数据已被新采集覆盖"
+            )
+        elif reason == "shutdown":
+            self.diagnostic_event.emit(
+                "正常退出，未保存的上一任务缓存已清除"
+            )
+        return True
+
+    def _replace_pending_capture(self, context) -> bool:
+        if self._pending_manual_capture is not None:
+            if not self.discard_pending_capture("replaced"):
+                return False
+        pending = PendingManualCapture.create(context)
+        self._pending_manual_capture = pending
+        self.manual_capture_changed.emit(pending)
+        self.diagnostic_event.emit(
+            f"上一任务已保留 {pending.frame_count} 帧，"
+            "可点击“保存光谱”导出"
+        )
+        return True
 
     def _claim_task(self, task: _ActiveTask) -> bool:
         for device_id in task.request.device_ids:
@@ -655,10 +753,58 @@ class AcquisitionController(QtCore.QObject):
             and not task.request.auto_store
             and not task.failed
         ):
-            cleanup = cleanup_spool_files(files)
-            for message in cleanup.warnings:
-                self.diagnostic_event.emit(message)
-            files = [str(path) for path in cleanup.retained]
+            if task.request.owner is AcquisitionOwner.CALIBRATION:
+                cleanup = cleanup_spool_files(files)
+                for message in cleanup.warnings:
+                    self.diagnostic_event.emit(message)
+                files = [str(path) for path in cleanup.retained]
+            else:
+                counts = [
+                    int(values.get("persisted_frames", 0))
+                    for values in task.sealed_results.values()
+                ]
+                if counts and all(count == 0 for count in counts):
+                    cleanup = cleanup_spool_files(files)
+                    for message in cleanup.warnings:
+                        self.diagnostic_event.emit(message)
+                    files = [str(path) for path in cleanup.retained]
+                    self.diagnostic_event.emit("本次采集没有可保存的数据")
+                elif not counts or any(count <= 0 for count in counts):
+                    task.failed = True
+                    self.diagnostic_event.emit(
+                        "各设备持久化帧数不完整，缓存已保留供恢复"
+                    )
+                elif self.storage_manager is None:
+                    task.failed = True
+                    self.diagnostic_event.emit(
+                        "存储服务不可用，缓存已保留供恢复"
+                    )
+                else:
+                    try:
+                        devices = [
+                            self.device_manager.get_device(device_id)
+                            for device_id in task.request.device_ids
+                        ]
+                        if any(device is None for device in devices):
+                            raise RuntimeError("待保存设备信息不完整")
+                        context = self.storage_manager.prepare_sealed_export(
+                            task.request,
+                            devices,
+                            task.sealed_results,
+                        )
+                        if self._replace_pending_capture(context):
+                            files = []
+                        else:
+                            task.failed = True
+                            self.diagnostic_event.emit(
+                                "无法替换上一任务缓存，"
+                                "本次缓存已保留供恢复"
+                            )
+                    except Exception as exc:
+                        task.failed = True
+                        self.diagnostic_event.emit(
+                            f"待保存光谱准备失败：{exc}"
+                        )
         self._release_task(task, files)
 
     @staticmethod
@@ -700,6 +846,24 @@ class AcquisitionController(QtCore.QObject):
             self._finish_finalization(task)
 
     def _on_storage_closed(self, task_id: str, files, errors) -> None:
+        if task_id == self._manual_export_task_id:
+            self._manual_export_task_id = None
+            failed = bool(errors)
+            for error in errors:
+                self.diagnostic_event.emit(f"手动保存错误：{error}")
+            pending = self._pending_manual_capture
+            if not failed:
+                self._pending_manual_capture = None
+                self.manual_capture_changed.emit(None)
+            elif pending is not None and not any(
+                path.exists() for path in pending.spool_paths
+            ):
+                self._pending_manual_capture = None
+                self.manual_capture_changed.emit(None)
+            self.manual_export_finished.emit(
+                task_id, list(files), failed
+            )
+            return
         task = self._tasks.get(task_id)
         if task is None:
             return
