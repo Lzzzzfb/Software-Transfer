@@ -9,6 +9,13 @@ venv/
 build/
 dist/
 
+# Imported STM32/Keil firmware build outputs
+/firmware/TMC2209/.vscode/
+/firmware/TMC2209/MDK-ARM/*.uvguix.*
+/firmware/TMC2209/MDK-ARM/TMC2209/*
+!/firmware/TMC2209/MDK-ARM/TMC2209/TMC2209.hex
+/firmware/TMC2209/MDK-ARM/*.lst
+
 # Runtime acquisition data
 data/
 *.part
