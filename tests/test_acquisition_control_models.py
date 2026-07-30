@@ -55,9 +55,21 @@ def test_calibration_request_requires_supported_reference_kind():
     assert request.reference_kind == "background"
 
 
+def test_scan_request_is_a_distinct_continuous_owner():
+    request = AcquisitionRequest.create(
+        AcquisitionOwner.SCAN,
+        [1, 2],
+        mode=AcquisitionMode.CONTINUOUS,
+        auto_store=True,
+    )
+
+    assert request.owner is AcquisitionOwner.SCAN
+    assert request.mode is AcquisitionMode.CONTINUOUS
+    assert request.auto_store is True
+
+
 def test_control_state_labels_cover_every_state():
     labels = [control_state_label(state) for state in ControlState]
     assert all(labels)
     assert len(labels) == len(set(labels))
     assert control_state_label(ControlState.FINALIZING) == "正在保存"
-
