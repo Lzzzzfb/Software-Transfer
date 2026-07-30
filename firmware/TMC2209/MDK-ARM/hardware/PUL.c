@@ -1,251 +1,924 @@
 #include "PUL.h"
-#include "stm32f1xx_hal.h"
-#include "tim.h"
-#include "USB_Command.h"
-#include "TMC2209.h"
 
-// UART 句柄（用于 USART1 TX）
+#include "main.h"
+#include "tim.h"
+#include "TMC2209.h"
+#include <stddef.h>
+#include <string.h>
+
+#define MOTOR_TIMER_CLOCK_HZ       1000000UL
+#define MOTOR_POSITION_EPSILON_MM  0.001f
+#define LIMIT_DEBOUNCE_MS          8U
+#define MOTOR_HOME_BACKOFF_MM      0.5f
+#define MOTOR_HOME_SLOW_SEARCH_MM  1.0f
+#define MOTOR_HOME_FAST_HZ         2000U
+#define MOTOR_HOME_SLOW_HZ         500U
+#define MOTOR_HOME_TIMEOUT_MS      15000U
+
 extern UART_HandleTypeDef huart1;
 
-// 定义四个电机设备
-Motor_Device motor1, motor2, motor3;
+Motor_Device motor1;
+Motor_Device motor2;
+Motor_Device motor3;
 
-// 外部触发状态变量
-static uint8_t trigger_sent = 0;     // 触发命令发送标志
+static uint8_t home_all_active = 0U;
+static uint8_t home_all_index = 0U;
 
-// 私有函数声明
 static void PUL_GPIO_Configuration(void);
+static void Motor_Init(
+    Motor_Device *motor,
+    Motor_Axis axis,
+    char axis_name,
+    GPIO_TypeDef *pulse_port,
+    uint16_t pulse_pin,
+    GPIO_TypeDef *dir_port,
+    uint16_t dir_pin,
+    TIM_HandleTypeDef *htim,
+    uint16_t limit_pin
+);
+static void Motor_HardwareStop(Motor_Device *motor);
+static void Motor_StopWithReason(
+    Motor_Device *motor,
+    Motor_StopReason reason,
+    uint8_t invalidate_position
+);
+static Motor_Result Motor_StartSteps(
+    Motor_Device *motor,
+    uint8_t direction,
+    uint32_t steps,
+    uint8_t enforce_position
+);
+static void Motor_FinalizeMotion(Motor_Device *motor);
+static void Motor_UpdateLimit(Motor_Device *motor);
+static void Motor_HandleStableLimit(Motor_Device *motor);
+static void Motor_UpdateHome(Motor_Device *motor);
+static Motor_Result Motor_StartHomeInternal(Motor_Device *motor);
+static void Motor_FailHome(Motor_Device *motor, Motor_StopReason reason);
+static void Motor_RestoreHomeSpeed(Motor_Device *motor);
+static uint8_t Motor_ReadLimit(Motor_Device *motor);
+static void Motor_StartHomeMove(
+    Motor_Device *motor,
+    uint8_t direction,
+    float distance_mm,
+    uint16_t speed_hz
+);
+static void Motor_UpdateHomeAll(void);
+static uint8_t Motor_HomeInProgress(Motor_Device *motor);
 
-// 电机初始化
-void Motor_Init(Motor_Device* motor, 
-               GPIO_TypeDef* pulse_port, uint16_t pulse_pin,
-               GPIO_TypeDef* dir_port, uint16_t dir_pin,
-               TIM_HandleTypeDef* htim, Motor_Params params) {
+static uint8_t Motor_HomeInProgress(Motor_Device *motor) {
+    if (motor == NULL) {
+        return 0U;
+    }
+    return (
+        motor->home_state == HOME_LEAVE_SWITCH
+        || motor->home_state == HOME_FAST_APPROACH
+        || motor->home_state == HOME_BACKOFF
+        || motor->home_state == HOME_SLOW_APPROACH
+    ) ? 1U : 0U;
+}
+
+static void Motor_Init(
+    Motor_Device *motor,
+    Motor_Axis axis,
+    char axis_name,
+    GPIO_TypeDef *pulse_port,
+    uint16_t pulse_pin,
+    GPIO_TypeDef *dir_port,
+    uint16_t dir_pin,
+    TIM_HandleTypeDef *htim,
+    uint16_t limit_pin
+) {
+    motor->axis = axis;
+    motor->axis_name = axis_name;
     motor->pulse_port = pulse_port;
     motor->pulse_pin = pulse_pin;
     motor->dir_port = dir_port;
     motor->dir_pin = dir_pin;
     motor->htim = htim;
-    motor->params = params;
-    motor->pulse_count = 0;
-    motor->current_pos = 0.0f;
-    motor->target_pulses = 0;
+    motor->params.default_speed = MOTOR_SPEED_DEFAULT_HZ;
+    motor->params.pulses_per_mm = MOTOR_PULSES_PER_MM;
+    motor->params.max_steps = MOTOR_MAX_TRAVEL_PULSES;
+    motor->params.max_travel_mm = MOTOR_TRAVEL_MM;
+    motor->home_direction = DIR_CCW;
+    motor->limit_pin = limit_pin;
+
+    motor->pulse_count = 0U;
+    motor->target_pulses = 0U;
     motor->direction = DIR_CW;
-    motor->is_moving = 0;
+    motor->is_moving = 0U;
+    motor->finalize_pending = 0U;
+
+    motor->current_pos = 0.0f;
+    motor->motion_start_pos = 0.0f;
+    motor->target_position = 0.0f;
+    motor->motion_start_valid = 0U;
+    motor->target_position_valid = 0U;
+    motor->position_valid = 0U;
+
+    motor->limit_irq_pending = 0U;
+    motor->limit_raw = 0U;
+    motor->limit_active = 0U;
+    motor->limit_changed_at = 0U;
+
+    motor->fault_latched = 0U;
+    motor->stop_reason = MOTOR_STOP_NONE;
+    motor->home_state = HOME_IDLE;
+    motor->saved_speed = MOTOR_SPEED_DEFAULT_HZ;
+    motor->home_started_at = 0U;
 }
 
-// 设置电机速度
-void Motor_SetSpeed(Motor_Device* motor, uint16_t speed) {
-    if (speed > 0) {
-        motor->params.default_speed = speed;
+Motor_Device *Motor_GetByNumber(uint8_t motor_num) {
+    if (motor_num == 1U) {
+        return &motor1;
     }
+    if (motor_num == 2U) {
+        return &motor2;
+    }
+    if (motor_num == 3U) {
+        return &motor3;
+    }
+    return NULL;
 }
 
-// 停止电机
-void Motor_Stop(Motor_Device* motor) {
+Motor_Device *Motor_GetByAxis(char axis) {
+    if (axis == 'X' || axis == 'x') {
+        return &motor1;
+    }
+    if (axis == 'Y' || axis == 'y') {
+        return &motor2;
+    }
+    if (axis == 'Z' || axis == 'z') {
+        return &motor3;
+    }
+    return NULL;
+}
+
+Motor_Result Motor_SetSpeed(Motor_Device *motor, uint16_t speed) {
+    if (motor == NULL) {
+        return MOTOR_ERR_AXIS;
+    }
+    if (speed < MOTOR_SPEED_MIN_HZ || speed > MOTOR_SPEED_MAX_HZ) {
+        return MOTOR_ERR_SPEED_RANGE;
+    }
+    if (motor->is_moving || Motor_HomeInProgress(motor)) {
+        return MOTOR_ERR_BUSY;
+    }
+    if (motor->home_state == HOME_DONE) {
+        motor->home_state = HOME_IDLE;
+    }
+    motor->params.default_speed = speed;
+    return MOTOR_OK;
+}
+
+static void Motor_HardwareStop(Motor_Device *motor) {
+    if (motor == NULL) {
+        return;
+    }
     HAL_TIM_PWM_Stop(motor->htim, TIM_CHANNEL_1);
 }
 
-// 按步数移动
-void Motor_MoveSteps(Motor_Device* motor, uint8_t direction, uint32_t steps) {
-    // 检查是否超过最大行程
-    if (steps > motor->params.max_steps) {
-        steps = motor->params.max_steps;
+static void Motor_StopWithReason(
+    Motor_Device *motor,
+    Motor_StopReason reason,
+    uint8_t invalidate_position
+) {
+    if (motor == NULL) {
+        return;
     }
-    
-    // 设置方向
-    if(direction == DIR_CW) {
-        HAL_GPIO_WritePin(motor->dir_port, motor->dir_pin, GPIO_PIN_SET);
-    } else {
-        HAL_GPIO_WritePin(motor->dir_port, motor->dir_pin, GPIO_PIN_RESET);
-    }
-    
-    // 计算定时器参数（根据当前速度）
-    uint16_t arr_value = (1000000 / motor->params.default_speed) - 1;
-    motor->htim->Instance->ARR = arr_value;
-    __HAL_TIM_SET_COMPARE(motor->htim, TIM_CHANNEL_1, arr_value / 2);
-    
-    // 启动PWM
-    motor->pulse_count = 0;
-    HAL_TIM_PWM_Start(motor->htim, TIM_CHANNEL_1);
-    
-    // 等待移动完成
-    while(motor->pulse_count < steps);
-    
-    // 更新位置信息
-    float mm = (float)steps / motor->params.pulses_per_mm;
-    if (direction == DIR_CW) {
-        motor->current_pos += mm;
-    } else {
-        motor->current_pos = (mm > motor->current_pos) ? 0 : motor->current_pos - mm;
-    }
-    
-    Motor_Stop(motor);
-}
-
-// 按毫米移动（自动计算步数）
-void Motor_MoveMM(Motor_Device* motor, uint8_t direction, float mm) {
-    if (mm <= 0) return;
-    uint32_t steps = (uint32_t)(mm * motor->params.pulses_per_mm);
-    Motor_MoveSteps(motor, direction, steps);
-}
-
-// 重置位置为0
-void Motor_ResetPos(Motor_Device* motor) {
-    motor->current_pos = 0.0f;
-}
-
-// 获取当前位置(mm)
-float Motor_GetPos(Motor_Device* motor) {
-    return motor->current_pos;
-}
-
-// 非阻塞式按步数移动电机
-void Motor_MoveStepsNonBlocking(Motor_Device* motor, uint8_t direction, uint32_t steps) {
-    // 检查是否超过最大行程
-    if (steps > motor->params.max_steps) {
-        steps = motor->params.max_steps;
-    }
-    
-    // 停止当前运动（如果有）
+    Motor_HardwareStop(motor);
     if (motor->is_moving) {
-        Motor_Stop(motor);
+        motor->is_moving = 0U;
+        motor->finalize_pending = 1U;
     }
-    
-    // 设置方向
-    motor->direction = direction;
-    if(direction == DIR_CW) {
-        HAL_GPIO_WritePin(motor->dir_port, motor->dir_pin, GPIO_PIN_SET);
+    motor->stop_reason = reason;
+    if (invalidate_position) {
+        motor->position_valid = 0U;
+    }
+}
+
+void Motor_Stop(Motor_Device *motor) {
+    Motor_StopWithReason(motor, MOTOR_STOP_USER, 1U);
+}
+
+void Motor_StopAll(void) {
+    Motor_Device *motors[3];
+    uint8_t index;
+
+    motors[0] = &motor1;
+    motors[1] = &motor2;
+    motors[2] = &motor3;
+    for (index = 0U; index < 3U; index++) {
+        uint8_t homing = Motor_HomeInProgress(motors[index]);
+        Motor_Stop(motors[index]);
+        if (homing) {
+            Motor_RestoreHomeSpeed(motors[index]);
+            motors[index]->home_state = HOME_FAILED;
+            motors[index]->fault_latched = 1U;
+        }
+    }
+    home_all_active = 0U;
+}
+
+static Motor_Result Motor_StartSteps(
+    Motor_Device *motor,
+    uint8_t direction,
+    uint32_t steps,
+    uint8_t enforce_position
+) {
+    uint32_t arr_value;
+    float delta;
+    float target;
+
+    if (motor == NULL) {
+        return MOTOR_ERR_AXIS;
+    }
+    if (direction != DIR_CW && direction != DIR_CCW) {
+        return MOTOR_ERR_VALUE;
+    }
+    if (steps == 0U || steps > motor->params.max_steps) {
+        return MOTOR_ERR_TRAVEL_RANGE;
+    }
+    if (
+        motor->params.default_speed < MOTOR_SPEED_MIN_HZ
+        || motor->params.default_speed > MOTOR_SPEED_MAX_HZ
+    ) {
+        return MOTOR_ERR_SPEED_RANGE;
+    }
+    if (motor->is_moving) {
+        return MOTOR_ERR_BUSY;
+    }
+    if (motor->fault_latched && !Motor_HomeInProgress(motor)) {
+        return MOTOR_ERR_FAULT_LATCHED;
+    }
+    if (
+        direction == motor->home_direction
+        && Motor_ReadLimit(motor)
+        && !Motor_HomeInProgress(motor)
+    ) {
+        return MOTOR_ERR_LIMIT_ACTIVE;
+    }
+
+    delta = (float)steps / (float)motor->params.pulses_per_mm;
+    motor->motion_start_pos = motor->current_pos;
+    motor->motion_start_valid = motor->position_valid;
+    motor->target_position_valid = motor->position_valid;
+    target = motor->current_pos;
+    if (motor->position_valid) {
+        target += (direction == DIR_CW) ? delta : -delta;
+        motor->target_position = target;
+        if (
+            enforce_position
+            && (
+                target < -MOTOR_POSITION_EPSILON_MM
+                || target > motor->params.max_travel_mm
+                    + MOTOR_POSITION_EPSILON_MM
+            )
+        ) {
+            return MOTOR_ERR_TRAVEL_RANGE;
+        }
     } else {
-        HAL_GPIO_WritePin(motor->dir_port, motor->dir_pin, GPIO_PIN_RESET);
+        motor->target_position = 0.0f;
+        motor->target_position_valid = 0U;
     }
-    
-    // 计算定时器参数（根据当前速度）
-    uint16_t arr_value = (1000000 / motor->params.default_speed) - 1;
+
+    motor->direction = direction;
+    HAL_GPIO_WritePin(
+        motor->dir_port,
+        motor->dir_pin,
+        direction == DIR_CW ? GPIO_PIN_SET : GPIO_PIN_RESET
+    );
+
+    arr_value = (MOTOR_TIMER_CLOCK_HZ / motor->params.default_speed) - 1U;
     motor->htim->Instance->ARR = arr_value;
-    __HAL_TIM_SET_COMPARE(motor->htim, TIM_CHANNEL_1, arr_value / 2);
-    
-    // 设置目标脉冲数和移动状态
-    motor->pulse_count = 0;
+    __HAL_TIM_SET_COMPARE(
+        motor->htim,
+        TIM_CHANNEL_1,
+        (arr_value + 1U) / 2U
+    );
+    __HAL_TIM_SET_COUNTER(motor->htim, 0U);
+
+    motor->pulse_count = 0U;
     motor->target_pulses = steps;
-    motor->is_moving = 1;
-    
-    // 启动PWM
-    HAL_TIM_PWM_Start(motor->htim, TIM_CHANNEL_1);
+    motor->finalize_pending = 0U;
+    motor->stop_reason = MOTOR_STOP_NONE;
+    motor->is_moving = 1U;
+    if (HAL_TIM_PWM_Start(motor->htim, TIM_CHANNEL_1) != HAL_OK) {
+        motor->is_moving = 0U;
+        motor->stop_reason = MOTOR_STOP_REPLACED;
+        return MOTOR_ERR_VALUE;
+    }
+    return MOTOR_OK;
 }
 
-// 非阻塞式按毫米移动电机
-void Motor_MoveMMNonBlocking(Motor_Device* motor, uint8_t direction, float mm) {
-    if (mm <= 0) return;
-    uint32_t steps = (uint32_t)(mm * motor->params.pulses_per_mm);
-    Motor_MoveStepsNonBlocking(motor, direction, steps);
+Motor_Result Motor_MoveStepsNonBlocking(
+    Motor_Device *motor,
+    uint8_t direction,
+    uint32_t steps
+) {
+    if (motor != NULL && Motor_HomeInProgress(motor)) {
+        return MOTOR_ERR_HOME_ACTIVE;
+    }
+    if (motor != NULL && motor->home_state == HOME_FAILED) {
+        return MOTOR_ERR_FAULT_LATCHED;
+    }
+    if (motor != NULL && motor->home_state == HOME_DONE) {
+        motor->home_state = HOME_IDLE;
+    }
+    return Motor_StartSteps(motor, direction, steps, 1U);
 }
 
-// 定期调用以更新电机运动状态
+Motor_Result Motor_MoveMMNonBlocking(
+    Motor_Device *motor,
+    uint8_t direction,
+    float mm
+) {
+    uint32_t steps;
+
+    if (motor == NULL) {
+        return MOTOR_ERR_AXIS;
+    }
+    if (mm <= 0.0f || mm > MOTOR_TRAVEL_MM) {
+        return MOTOR_ERR_TRAVEL_RANGE;
+    }
+    steps = (uint32_t)(
+        mm * (float)motor->params.pulses_per_mm + 0.5f
+    );
+    if (steps == 0U) {
+        return MOTOR_ERR_TRAVEL_RANGE;
+    }
+    return Motor_MoveStepsNonBlocking(motor, direction, steps);
+}
+
+Motor_Result Motor_MoveMM(
+    Motor_Device *motor,
+    uint8_t direction,
+    float mm
+) {
+    Motor_Result result;
+
+    result = Motor_MoveMMNonBlocking(motor, direction, mm);
+    while (result == MOTOR_OK && motor->is_moving) {
+        Motor_Update();
+    }
+    return result;
+}
+
+Motor_Result Motor_SetPosition(Motor_Device *motor, float position_mm) {
+    if (motor == NULL) {
+        return MOTOR_ERR_AXIS;
+    }
+    if (motor->is_moving || Motor_HomeInProgress(motor)) {
+        return MOTOR_ERR_BUSY;
+    }
+    if (motor->home_state == HOME_FAILED) {
+        return MOTOR_ERR_FAULT_LATCHED;
+    }
+    if (motor->home_state == HOME_DONE) {
+        motor->home_state = HOME_IDLE;
+    }
+    if (
+        position_mm < 0.0f
+        || position_mm > motor->params.max_travel_mm
+    ) {
+        return MOTOR_ERR_TRAVEL_RANGE;
+    }
+    motor->current_pos = position_mm;
+    motor->motion_start_pos = position_mm;
+    motor->target_position = position_mm;
+    motor->position_valid = 1U;
+    motor->motion_start_valid = 1U;
+    motor->target_position_valid = 1U;
+    motor->stop_reason = MOTOR_STOP_NONE;
+    return MOTOR_OK;
+}
+
+void Motor_ResetPos(Motor_Device *motor) {
+    (void)Motor_SetPosition(motor, 0.0f);
+}
+
+float Motor_GetPos(Motor_Device *motor) {
+    return motor == NULL ? 0.0f : motor->current_pos;
+}
+
+uint8_t Motor_IsMoving(Motor_Device *motor) {
+    return motor == NULL ? 0U : motor->is_moving;
+}
+
+static void Motor_FinalizeMotion(Motor_Device *motor) {
+    uint32_t executed;
+    float delta;
+    float position;
+
+    if (motor == NULL || !motor->finalize_pending) {
+        return;
+    }
+    motor->finalize_pending = 0U;
+    executed = motor->pulse_count;
+    if (executed > motor->target_pulses) {
+        executed = motor->target_pulses;
+    }
+    if (motor->motion_start_valid) {
+        delta = (float)executed / (float)motor->params.pulses_per_mm;
+        position = motor->motion_start_pos;
+        position += (motor->direction == DIR_CW) ? delta : -delta;
+        if (position < 0.0f) {
+            position = 0.0f;
+        }
+        if (position > motor->params.max_travel_mm) {
+            position = motor->params.max_travel_mm;
+        }
+        motor->current_pos = position;
+    }
+}
+
+static uint8_t Motor_ReadLimit(Motor_Device *motor) {
+    GPIO_PinState state;
+
+    if (motor == NULL) {
+        return 0U;
+    }
+    state = HAL_GPIO_ReadPin(GPIOB, motor->limit_pin);
+    return state == LIMIT_ACTIVE_LEVEL ? 1U : 0U;
+}
+
+uint8_t Motor_LimitActive(Motor_Device *motor) {
+    return motor == NULL ? 0U : motor->limit_active;
+}
+
+static void Motor_HandleStableLimit(Motor_Device *motor) {
+    uint8_t expected_zero_target;
+
+    if (motor == NULL) {
+        return;
+    }
+    motor->current_pos = 0.0f;
+    motor->position_valid = 1U;
+    motor->motion_start_valid = 1U;
+
+    if (
+        motor->home_state == HOME_FAST_APPROACH
+        && motor->stop_reason == MOTOR_STOP_LIMIT
+    ) {
+        motor->home_state = HOME_BACKOFF;
+        Motor_StartHomeMove(
+            motor,
+            motor->home_direction == DIR_CCW ? DIR_CW : DIR_CCW,
+            MOTOR_HOME_BACKOFF_MM,
+            MOTOR_HOME_FAST_HZ
+        );
+        return;
+    }
+
+    if (
+        motor->home_state == HOME_SLOW_APPROACH
+        && motor->stop_reason == MOTOR_STOP_LIMIT
+    ) {
+        Motor_RestoreHomeSpeed(motor);
+        motor->home_state = HOME_DONE;
+        motor->stop_reason = MOTOR_STOP_HOMED;
+        motor->fault_latched = 0U;
+        return;
+    }
+
+    expected_zero_target = (
+        motor->target_position_valid
+        && motor->target_position <= MOTOR_POSITION_EPSILON_MM
+    ) ? 1U : 0U;
+    if (!expected_zero_target && motor->home_state == HOME_IDLE) {
+        motor->fault_latched = 1U;
+        motor->stop_reason = MOTOR_STOP_LIMIT_UNEXPECTED;
+    }
+}
+
+static void Motor_UpdateLimit(Motor_Device *motor) {
+    uint8_t raw;
+    uint32_t now;
+
+    if (motor == NULL) {
+        return;
+    }
+    raw = Motor_ReadLimit(motor);
+    now = HAL_GetTick();
+    if (raw != motor->limit_raw) {
+        motor->limit_raw = raw;
+        motor->limit_changed_at = now;
+    }
+    if (
+        raw != motor->limit_active
+        && (uint32_t)(now - motor->limit_changed_at) >= LIMIT_DEBOUNCE_MS
+    ) {
+        motor->limit_active = raw;
+        if (raw) {
+            Motor_HandleStableLimit(motor);
+        }
+    }
+    motor->limit_irq_pending = 0U;
+}
+
+static void Motor_StartHomeMove(
+    Motor_Device *motor,
+    uint8_t direction,
+    float distance_mm,
+    uint16_t speed_hz
+) {
+    uint32_t steps;
+    Motor_Result result;
+
+    motor->params.default_speed = speed_hz;
+    steps = (uint32_t)(
+        distance_mm * (float)motor->params.pulses_per_mm + 0.5f
+    );
+    result = Motor_StartSteps(motor, direction, steps, 0U);
+    if (result != MOTOR_OK) {
+        Motor_FailHome(motor, MOTOR_STOP_HOME_SWITCH);
+    }
+}
+
+static Motor_Result Motor_StartHomeInternal(Motor_Device *motor) {
+    uint8_t active;
+
+    if (motor == NULL) {
+        return MOTOR_ERR_AXIS;
+    }
+    if (motor->is_moving) {
+        return MOTOR_ERR_BUSY;
+    }
+    if (
+        motor->home_state != HOME_IDLE
+        && motor->home_state != HOME_DONE
+        && motor->home_state != HOME_FAILED
+    ) {
+        return MOTOR_ERR_HOME_ACTIVE;
+    }
+
+    motor->fault_latched = 0U;
+    motor->saved_speed = motor->params.default_speed;
+    motor->home_started_at = HAL_GetTick();
+    motor->position_valid = 0U;
+    motor->stop_reason = MOTOR_STOP_NONE;
+    active = Motor_ReadLimit(motor);
+    motor->limit_raw = active;
+    motor->limit_active = active;
+    motor->limit_changed_at = HAL_GetTick();
+
+    if (active) {
+        motor->current_pos = 0.0f;
+        motor->position_valid = 1U;
+        motor->home_state = HOME_LEAVE_SWITCH;
+        Motor_StartHomeMove(
+            motor,
+            motor->home_direction == DIR_CCW ? DIR_CW : DIR_CCW,
+            MOTOR_HOME_BACKOFF_MM,
+            MOTOR_HOME_FAST_HZ
+        );
+    } else {
+        motor->home_state = HOME_FAST_APPROACH;
+        Motor_StartHomeMove(
+            motor,
+            motor->home_direction,
+            MOTOR_TRAVEL_MM,
+            MOTOR_HOME_FAST_HZ
+        );
+    }
+    return motor->home_state == HOME_FAILED
+        ? MOTOR_ERR_HOME_ACTIVE
+        : MOTOR_OK;
+}
+
+Motor_Result Motor_StartHome(Motor_Device *motor) {
+    if (home_all_active) {
+        return MOTOR_ERR_HOME_ACTIVE;
+    }
+    return Motor_StartHomeInternal(motor);
+}
+
+Motor_Result Motor_StartHomeAll(void) {
+    Motor_Result result;
+
+    if (
+        home_all_active
+        || motor1.is_moving
+        || motor2.is_moving
+        || motor3.is_moving
+    ) {
+        return MOTOR_ERR_BUSY;
+    }
+    home_all_active = 1U;
+    home_all_index = 0U;
+    result = Motor_StartHomeInternal(&motor1);
+    if (result != MOTOR_OK) {
+        home_all_active = 0U;
+    }
+    return result;
+}
+
+uint8_t Motor_HomeAllActive(void) {
+    return home_all_active;
+}
+
+static void Motor_RestoreHomeSpeed(Motor_Device *motor) {
+    if (motor == NULL) {
+        return;
+    }
+    motor->params.default_speed = motor->saved_speed;
+}
+
+static void Motor_FailHome(
+    Motor_Device *motor,
+    Motor_StopReason reason
+) {
+    if (motor == NULL) {
+        return;
+    }
+    Motor_StopWithReason(motor, reason, 1U);
+    Motor_RestoreHomeSpeed(motor);
+    motor->home_state = HOME_FAILED;
+    motor->fault_latched = 1U;
+}
+
+static void Motor_UpdateHome(Motor_Device *motor) {
+    uint32_t now;
+
+    if (motor == NULL) {
+        return;
+    }
+    if (
+        motor->home_state == HOME_IDLE
+        || motor->home_state == HOME_DONE
+        || motor->home_state == HOME_FAILED
+    ) {
+        return;
+    }
+
+    now = HAL_GetTick();
+    if (
+        (uint32_t)(now - motor->home_started_at)
+        > MOTOR_HOME_TIMEOUT_MS
+    ) {
+        Motor_FailHome(motor, MOTOR_STOP_HOME_TIMEOUT);
+        return;
+    }
+
+    if (motor->is_moving) {
+        return;
+    }
+
+    if (motor->home_state == HOME_LEAVE_SWITCH) {
+        if (motor->stop_reason != MOTOR_STOP_DONE) {
+            Motor_FailHome(motor, MOTOR_STOP_HOME_SWITCH);
+            return;
+        }
+        if (motor->limit_active) {
+            if (!motor->limit_raw) {
+                return;
+            }
+            Motor_FailHome(motor, MOTOR_STOP_HOME_SWITCH);
+            return;
+        }
+        motor->position_valid = 0U;
+        motor->home_state = HOME_FAST_APPROACH;
+        Motor_StartHomeMove(
+            motor,
+            motor->home_direction,
+            MOTOR_TRAVEL_MM,
+            MOTOR_HOME_FAST_HZ
+        );
+        return;
+    }
+
+    if (motor->home_state == HOME_FAST_APPROACH) {
+        if (
+            motor->stop_reason == MOTOR_STOP_DONE
+            && !motor->limit_active
+        ) {
+            Motor_FailHome(motor, MOTOR_STOP_HOME_TIMEOUT);
+        }
+        return;
+    }
+
+    if (motor->home_state == HOME_BACKOFF) {
+        if (motor->stop_reason != MOTOR_STOP_DONE) {
+            Motor_FailHome(motor, MOTOR_STOP_HOME_SWITCH);
+            return;
+        }
+        if (motor->limit_active) {
+            if (!motor->limit_raw) {
+                return;
+            }
+            Motor_FailHome(motor, MOTOR_STOP_HOME_SWITCH);
+            return;
+        }
+        motor->home_state = HOME_SLOW_APPROACH;
+        Motor_StartHomeMove(
+            motor,
+            motor->home_direction,
+            MOTOR_HOME_SLOW_SEARCH_MM,
+            MOTOR_HOME_SLOW_HZ
+        );
+        return;
+    }
+
+    if (
+        motor->home_state == HOME_SLOW_APPROACH
+        && motor->stop_reason == MOTOR_STOP_DONE
+        && !motor->limit_active
+    ) {
+        Motor_FailHome(motor, MOTOR_STOP_HOME_SWITCH);
+    }
+}
+
+static void Motor_UpdateHomeAll(void) {
+    Motor_Device *current;
+    Motor_Result result;
+
+    if (!home_all_active) {
+        return;
+    }
+    current = home_all_index == 0U
+        ? &motor1
+        : (home_all_index == 1U ? &motor2 : &motor3);
+    if (current->home_state == HOME_FAILED) {
+        home_all_active = 0U;
+        return;
+    }
+    if (current->home_state != HOME_DONE) {
+        return;
+    }
+    if (home_all_index >= 2U) {
+        home_all_active = 0U;
+        return;
+    }
+    home_all_index++;
+    current = home_all_index == 1U ? &motor2 : &motor3;
+    result = Motor_StartHomeInternal(current);
+    if (result != MOTOR_OK) {
+        home_all_active = 0U;
+    }
+}
+
+void Motor_ClearFaults(void) {
+    Motor_Device *motors[3];
+    uint8_t index;
+
+    motors[0] = &motor1;
+    motors[1] = &motor2;
+    motors[2] = &motor3;
+    for (index = 0U; index < 3U; index++) {
+        if (!motors[index]->is_moving) {
+            motors[index]->fault_latched = 0U;
+            if (
+                motors[index]->home_state == HOME_FAILED
+                || motors[index]->home_state == HOME_DONE
+            ) {
+                motors[index]->home_state = HOME_IDLE;
+            }
+        }
+    }
+}
+
+void Motor_Update(void) {
+    Motor_Device *motors[3];
+    uint8_t index;
+
+    motors[0] = &motor1;
+    motors[1] = &motor2;
+    motors[2] = &motor3;
+
+    for (index = 0U; index < 3U; index++) {
+        if (
+            motors[index]->is_moving
+            && motors[index]->pulse_count
+                >= motors[index]->target_pulses
+        ) {
+            Motor_StopWithReason(
+                motors[index],
+                MOTOR_STOP_DONE,
+                0U
+            );
+        }
+        Motor_FinalizeMotion(motors[index]);
+        Motor_UpdateLimit(motors[index]);
+        Motor_UpdateHome(motors[index]);
+    }
+    Motor_UpdateHomeAll();
+}
+
 void Motor_UpdateMotion(void) {
-    // 检查并更新X轴状态
-    if (motor1.is_moving) {
-        if (motor1.pulse_count >= motor1.target_pulses) {
-            Motor_Stop(&motor1);
-            motor1.is_moving = 0;
-            
-            // 更新位置信息
-            float mm = (float)motor1.target_pulses / motor1.params.pulses_per_mm;
-            if (motor1.direction == DIR_CW) {
-                motor1.current_pos += mm;
-            } else {
-                motor1.current_pos = (mm > motor1.current_pos) ? 0 : motor1.current_pos - mm;
-            }
-        }
-    }
-    
-    // 检查并更新Y轴状态
-    if (motor2.is_moving) {
-        if (motor2.pulse_count >= motor2.target_pulses) {
-            Motor_Stop(&motor2);
-            motor2.is_moving = 0;
-            
-            // 更新位置信息
-            float mm = (float)motor2.target_pulses / motor2.params.pulses_per_mm;
-            if (motor2.direction == DIR_CW) {
-                motor2.current_pos += mm;
-            } else {
-                motor2.current_pos = (mm > motor2.current_pos) ? 0 : motor2.current_pos - mm;
-            }
-        }
-    }
-    
-    // 检查并更新Z轴状态
-    if (motor3.is_moving) {
-        if (motor3.pulse_count >= motor3.target_pulses) {
-            Motor_Stop(&motor3);
-            motor3.is_moving = 0;
-            
-            // 更新位置信息
-            float mm = (float)motor3.target_pulses / motor3.params.pulses_per_mm;
-            if (motor3.direction == DIR_CW) {
-                motor3.current_pos += mm;
-            } else {
-                motor3.current_pos = (mm > motor3.current_pos) ? 0 : motor3.current_pos - mm;
-            }
-        }
-    }
-    
-    
+    Motor_Update();
 }
 
-// 检查电机是否正在移动
-uint8_t Motor_IsMoving(Motor_Device* motor) {
-    return motor->is_moving;
+static void PUL_GPIO_Configuration(void) {
+    GPIO_InitTypeDef GPIO_InitStruct;
+
+    memset(&GPIO_InitStruct, 0, sizeof(GPIO_InitStruct));
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
+    __HAL_AFIO_REMAP_SWJ_NOJTAG();
+
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Pin = motor1.pulse_pin;
+    HAL_GPIO_Init(motor1.pulse_port, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = motor2.pulse_pin;
+    HAL_GPIO_Init(motor2.pulse_port, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = motor3.pulse_pin;
+    HAL_GPIO_Init(motor3.pulse_port, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Pin = motor1.dir_pin;
+    HAL_GPIO_Init(motor1.dir_port, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = motor2.dir_pin;
+    HAL_GPIO_Init(motor2.dir_port, &GPIO_InitStruct);
+    GPIO_InitStruct.Pin = motor3.dir_pin;
+    HAL_GPIO_Init(motor3.dir_port, &GPIO_InitStruct);
+
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_3);
+    __HAL_GPIO_EXTI_CLEAR_IT(
+        GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5
+    );
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Pin = LIMIT_REFERENCE_PIN;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOB, LIMIT_REFERENCE_PIN, GPIO_PIN_RESET);
+
+    HAL_NVIC_SetPriority(EXTI3_IRQn, 0U, 0U);
+    HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+    HAL_NVIC_SetPriority(EXTI4_IRQn, 0U, 0U);
+    HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0U, 0U);
+    HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Pin = GPIO_PIN_12;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_14;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
 }
 
-// 各电机单步控制函数
-void Motor1_MoveForwardOneMM(void) {
-    Motor_MoveMM(&motor1, DIR_CW, 1.0f);
-}
-void Motor1_MoveBackwardOneMM(void) {
-    Motor_MoveMM(&motor1, DIR_CCW, 1.0f);
-}
-void Motor2_MoveForwardOneMM(void) {
-    Motor_MoveMM(&motor2, DIR_CW, 1.0f);
-}
-void Motor2_MoveBackwardOneMM(void) {
-    Motor_MoveMM(&motor2, DIR_CCW, 1.0f);
-}
-void Motor3_MoveForwardOneMM(void) {
-    Motor_MoveMM(&motor3, DIR_CW, 1.0f);
-}
-void Motor3_MoveBackwardOneMM(void) {
-    Motor_MoveMM(&motor3, DIR_CCW, 1.0f);
-}
-
-// 初始化所有电机
 void PUL_Init(void) {
-    
-    // 配置各电机参数
-    Motor_Params param1 = {10000,640, 160000};
-    Motor_Params param2 = {10000,640, 160000};
-    Motor_Params param3 = {10000,640, 160000};
+    TMC_AxisAddr axes[4];
+    uint8_t index;
 
-    // 初始化电机（调整脉冲引脚与定时器映射）
-    // X轴: PA8 -> TIM1 CH1, 方向 PA7
-    Motor_Init(&motor1, GPIOA, GPIO_PIN_8,  GPIOA, GPIO_PIN_7,  &htim1, param1);
-    // Y轴: PA6 -> TIM3 CH1, 方向 PA5
-    Motor_Init(&motor2, GPIOA, GPIO_PIN_6,  GPIOA, GPIO_PIN_5,  &htim3, param2);
-    // Z轴: PA0 -> TIM2 CH1, 方向 PA1
-    Motor_Init(&motor3, GPIOA, GPIO_PIN_0,  GPIOA, GPIO_PIN_1,  &htim2, param3);
+    Motor_Init(
+        &motor1,
+        MOTOR_AXIS_X,
+        'X',
+        GPIOA,
+        GPIO_PIN_8,
+        GPIOA,
+        GPIO_PIN_7,
+        &htim1,
+        X_ZERO_LIMIT_PIN
+    );
+    Motor_Init(
+        &motor2,
+        MOTOR_AXIS_Y,
+        'Y',
+        GPIOA,
+        GPIO_PIN_6,
+        GPIOA,
+        GPIO_PIN_5,
+        &htim3,
+        Y_ZERO_LIMIT_PIN
+    );
+    Motor_Init(
+        &motor3,
+        MOTOR_AXIS_Z,
+        'Z',
+        GPIOA,
+        GPIO_PIN_0,
+        GPIOA,
+        GPIO_PIN_1,
+        &htim2,
+        Z_ZERO_LIMIT_PIN
+    );
 
-
-    // 配置GPIO
     PUL_GPIO_Configuration();
+    motor1.limit_raw = Motor_ReadLimit(&motor1);
+    motor1.limit_active = motor1.limit_raw;
+    motor2.limit_raw = Motor_ReadLimit(&motor2);
+    motor2.limit_active = motor2.limit_raw;
+    motor3.limit_raw = Motor_ReadLimit(&motor3);
+    motor3.limit_active = motor3.limit_raw;
 
-    // 启动定时器中断（仅 TIM1/TIM2/TIM3 用于脉冲输出）
     HAL_TIM_Base_Start_IT(&htim1);
     HAL_TIM_Base_Start_IT(&htim2);
     HAL_TIM_Base_Start_IT(&htim3);
 
-
-    // 初始化 USART1 (PA9 TX) -- 115200, 8N1, 仅 TX
     __HAL_RCC_USART1_CLK_ENABLE();
     huart1.Instance = USART1;
     huart1.Init.BaudRate = 115200;
@@ -256,151 +929,106 @@ void PUL_Init(void) {
     huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart1.Init.OverSampling = UART_OVERSAMPLING_16;
     HAL_UART_Init(&huart1);
-	
-	// 定义四个轴的地址
-    TMC_AxisAddr axes[] = {TMC_AXIS_X, TMC_AXIS_Y1, TMC_AXIS_Y2, TMC_AXIS_Z};
 
-    for (int i = 0; i < 4; i++) {
-        // 1. GCONF: 0x000000C4
-        TMC2209_WriteRegister(axes[i], 0x00, 0x000000C4);
-		// 清楚异常位
-		TMC2209_WriteRegister(axes[i], 0x01, 0x00000003);
-        // 2. IHOLD_IRUN: 0x00081F08
-        TMC2209_WriteRegister(axes[i], 0x10, 0x00080F00);
-        // 3. CHOPCONF: 0x140100C3
-        TMC2209_WriteRegister(axes[i], 0x6C, 0x140100C3);
-        // 4. TPOWERDOWN: 0x00000014
-        TMC2209_WriteRegister(axes[i], 0x11, 0x00000014);
+    axes[0] = TMC_AXIS_X;
+    axes[1] = TMC_AXIS_Y1;
+    axes[2] = TMC_AXIS_Y2;
+    axes[3] = TMC_AXIS_Z;
+    for (index = 0U; index < 4U; index++) {
+        TMC2209_WriteRegister(axes[index], 0x00, 0x000000C4);
+        TMC2209_WriteRegister(axes[index], 0x01, 0x00000003);
+        TMC2209_WriteRegister(axes[index], 0x10, 0x00080F00);
+        TMC2209_WriteRegister(axes[index], 0x6C, 0x140100C3);
+        TMC2209_WriteRegister(axes[index], 0x11, 0x00000014);
     }
-
 }
 
-// GPIO配置
-static void PUL_GPIO_Configuration(void) {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    // 使能GPIO时钟
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-
-    // 电机脉冲引脚（复用推挽输出），仅为已配置的脉冲引脚初始化
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-
-    GPIO_InitStruct.Pin = motor1.pulse_pin;
-    HAL_GPIO_Init(motor1.pulse_port, &GPIO_InitStruct);
-    
-    GPIO_InitStruct.Pin = motor2.pulse_pin;
-    HAL_GPIO_Init(motor2.pulse_port, &GPIO_InitStruct);
-    
-    GPIO_InitStruct.Pin = motor3.pulse_pin;
-    HAL_GPIO_Init(motor3.pulse_port, &GPIO_InitStruct);
-
-
-    // 方向引脚（推挽输出），仅初始化已配置的方向引脚
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-
-    GPIO_InitStruct.Pin = motor1.dir_pin;
-    HAL_GPIO_Init(motor1.dir_port, &GPIO_InitStruct);
-    
-    GPIO_InitStruct.Pin = motor2.dir_pin;
-    HAL_GPIO_Init(motor2.dir_port, &GPIO_InitStruct);
-    
-    GPIO_InitStruct.Pin = motor3.dir_pin;
-    HAL_GPIO_Init(motor3.dir_port, &GPIO_InitStruct);
-
-
-    // PA3: DIAG 输入，外部中断（上升沿）
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Pin = GPIO_PIN_3;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-    HAL_NVIC_SetPriority(EXTI3_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI3_IRQn);
-
-    // PA9: USART1 TX (AF Push-Pull)
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    GPIO_InitStruct.Pin = GPIO_PIN_9;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-    // PB10: 上拉输出 (3.3V 输出)
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Pin = GPIO_PIN_10;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, GPIO_PIN_SET);
-
-    // PB0配置为外部中断模式，用于检测外部触发信号
-    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;  // 上升沿触发
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Pin = GPIO_PIN_0;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-	
-	// 配置外部中断优先级
-    HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
-
-    // PB12: 推挽输出（切换斩波模式，默认为1）
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Pin = GPIO_PIN_12;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
-
-    // PB14: 推挽输出（驱动芯片使能，0使能，1非使能，初始化为1）
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Pin = GPIO_PIN_14;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-
-
-}
-
-
-// 定时器更新回调函数
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim->Instance == TIM1) {
+    if (htim->Instance == TIM1 && motor1.is_moving) {
         motor1.pulse_count++;
-    } else if (htim->Instance == TIM2) {
-        // TIM2 mapped to motor3 (Z axis)
+    } else if (htim->Instance == TIM2 && motor3.is_moving) {
         motor3.pulse_count++;
-    } else if (htim->Instance == TIM3) {
-        // TIM3 mapped to motor2 (Y axis)
+    } else if (htim->Instance == TIM3 && motor2.is_moving) {
         motor2.pulse_count++;
     }
 }
 
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    Motor_Device *motor;
 
+    motor = NULL;
+    if (GPIO_Pin == X_ZERO_LIMIT_PIN) {
+        motor = &motor1;
+    } else if (GPIO_Pin == Y_ZERO_LIMIT_PIN) {
+        motor = &motor2;
+    } else if (GPIO_Pin == Z_ZERO_LIMIT_PIN) {
+        motor = &motor3;
+    }
+    if (motor == NULL) {
+        return;
+    }
 
-
-
-/**
-  * @brief  EXTI0外部中断处理函数（PB0）
-  * @param  无
-  * @retval 无
-  */
-void EXTI0_IRQHandler(void) {
-    // 检查是否是PB0的外部中断
-    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_0) != RESET) {
-        // 清除中断标志位
-        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);
-        
-        // 检测到外部触发信号，发送EXT_TRIGGER命令
-        if (!trigger_sent) {
-            USB_Send_Response("EXT_TRIGGER");
-            // 设置发送标志，防止重复发送
-            trigger_sent = 1;
-            
-            // 短暂延时，确保触发信号被处理
-            // 注意：这里的延时不会阻塞主程序，因为中断处理函数会快速执行
-            for (uint32_t i = 0; i < 1000; i++) {
-                // 短暂延时，确保触发信号被处理
-            }
-            trigger_sent = 0;
-        }
+    motor->limit_irq_pending = 1U;
+    motor->limit_raw = 1U;
+    motor->limit_changed_at = HAL_GetTick();
+    if (
+        motor->is_moving
+        && motor->direction == motor->home_direction
+    ) {
+        Motor_StopWithReason(motor, MOTOR_STOP_LIMIT, 0U);
     }
 }
 
+void EXTI4_IRQHandler(void) {
+    HAL_GPIO_EXTI_IRQHandler(Y_ZERO_LIMIT_PIN);
+}
 
+void EXTI9_5_IRQHandler(void) {
+    if (__HAL_GPIO_EXTI_GET_IT(Z_ZERO_LIMIT_PIN) != RESET) {
+        HAL_GPIO_EXTI_IRQHandler(Z_ZERO_LIMIT_PIN);
+    }
+}
+
+const char *Motor_ResultName(Motor_Result result) {
+    switch (result) {
+        case MOTOR_OK: return "OK";
+        case MOTOR_ERR_AXIS: return "BAD_AXIS";
+        case MOTOR_ERR_VALUE: return "BAD_VALUE";
+        case MOTOR_ERR_SPEED_RANGE: return "SPEED_RANGE";
+        case MOTOR_ERR_TRAVEL_RANGE: return "TRAVEL_RANGE";
+        case MOTOR_ERR_BUSY: return "BUSY";
+        case MOTOR_ERR_LIMIT_ACTIVE: return "LIMIT_ACTIVE";
+        case MOTOR_ERR_FAULT_LATCHED: return "FAULT_LATCHED";
+        case MOTOR_ERR_POSITION_UNKNOWN: return "POSITION_UNKNOWN";
+        case MOTOR_ERR_HOME_ACTIVE: return "HOME_ACTIVE";
+        default: return "UNKNOWN";
+    }
+}
+
+const char *Motor_StopReasonName(Motor_StopReason reason) {
+    switch (reason) {
+        case MOTOR_STOP_NONE: return "NONE";
+        case MOTOR_STOP_DONE: return "DONE";
+        case MOTOR_STOP_USER: return "USER";
+        case MOTOR_STOP_LIMIT: return "LIMIT";
+        case MOTOR_STOP_LIMIT_UNEXPECTED: return "LIMIT_UNEXPECTED";
+        case MOTOR_STOP_HOME_TIMEOUT: return "HOME_TIMEOUT";
+        case MOTOR_STOP_HOME_SWITCH: return "HOME_SWITCH";
+        case MOTOR_STOP_HOMED: return "HOMED";
+        case MOTOR_STOP_REPLACED: return "REPLACED";
+        default: return "UNKNOWN";
+    }
+}
+
+const char *Motor_HomeStateName(Motor_HomeState state) {
+    switch (state) {
+        case HOME_IDLE: return "IDLE";
+        case HOME_LEAVE_SWITCH: return "LEAVE_SWITCH";
+        case HOME_FAST_APPROACH: return "FAST_APPROACH";
+        case HOME_BACKOFF: return "BACKOFF";
+        case HOME_SLOW_APPROACH: return "SLOW_APPROACH";
+        case HOME_DONE: return "DONE";
+        case HOME_FAILED: return "FAILED";
+        default: return "UNKNOWN";
+    }
+}

@@ -25,7 +25,6 @@
 #include "USB_Command.h"
 #include "usbd_cdc.h"
 #include "PUL.h"
-#include "Scan.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -62,8 +61,6 @@ void SystemClock_Config(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 extern USBD_HandleTypeDef hUsbDeviceFS;
-extern uint32_t Recv_dlen;
-extern uint8_t UserRxBuffer[1024];
 /* USER CODE END 0 */
 
 /**
@@ -103,7 +100,6 @@ int main(void)
   /* USER CODE BEGIN 2 */
   PUL_Init();
   USB_Command_Init();
-  Scan_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -113,16 +109,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	// 定期更新电机运动状态（非阻塞模式）
-	Motor_UpdateMotion();
-	// 更新扫描状态
-//	Scan_Update();
-//	 if(Recv_dlen) {
-//            USB_Command_Process((char*)UserRxBuffer);
-//            Recv_dlen = 0;
-//        }
-
-//		HAL_Delay(10); // 减小延迟以提高非阻塞模式的响应性
+	Motor_Update();
+	USB_Command_Update();
   }
   /* USER CODE END 3 */
 }

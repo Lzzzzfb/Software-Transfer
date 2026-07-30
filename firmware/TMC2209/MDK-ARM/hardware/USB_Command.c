@@ -1,399 +1,487 @@
 #include "USB_Command.h"
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
 
-// 添加PB14控制相关头文件
+#include "PUL.h"
 #include "main.h"
+#include "usbd_cdc.h"
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-// 响应缓冲区定义
-// 用于存储USB命令的响应字符串，大小由USB_RESPONSE_BUFFER_SIZE宏定义
+extern uint8_t CDC_Transmit_FS(uint8_t *Buf, uint16_t Len);
+extern USBD_HandleTypeDef hUsbDeviceFS;
+
 char usb_response_buffer[USB_RESPONSE_BUFFER_SIZE];
 
-// 外部函数声明（在usbd_cdc_if.c中实现）
-// CDC_Transmit_FS: 通过USB CDC接口发送数据
-extern uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
+static char rx_line_buffer[USB_COMMAND_LINE_SIZE];
+static uint16_t rx_line_length = 0U;
+static uint8_t rx_discard_until_newline = 0U;
 
-/**
-  * @brief  USB命令模块初始化
-  * @param  无
-  * @retval 无
-  */
+static char tx_queue[USB_TX_QUEUE_DEPTH][USB_RESPONSE_BUFFER_SIZE];
+static volatile uint8_t tx_queue_head = 0U;
+static volatile uint8_t tx_queue_tail = 0U;
+static volatile uint8_t tx_queue_count = 0U;
+static uint8_t tx_in_flight = 0U;
+
+static void Process_Single_Command(
+    const char *cmd,
+    char *out_buf,
+    size_t buf_size
+);
+static Motor_Device *Motor_FromAxis(char axis);
+static uint8_t ParseUnsigned(const char *text, uint32_t *value);
+static uint8_t ParseFloat(const char *text, float *value);
+static void WriteMotorError(
+    char *out_buf,
+    size_t buf_size,
+    Motor_Result result
+);
+static void WriteStatus(char *out_buf, size_t buf_size);
+static uint8_t AnyMotorMoving(void);
+
 void USB_Command_Init(void) {
-    // 初始化响应缓冲区，将所有字节设置为0
     memset(usb_response_buffer, 0, sizeof(usb_response_buffer));
+    memset(rx_line_buffer, 0, sizeof(rx_line_buffer));
+    memset(tx_queue, 0, sizeof(tx_queue));
+    rx_line_length = 0U;
+    rx_discard_until_newline = 0U;
+    tx_queue_head = 0U;
+    tx_queue_tail = 0U;
+    tx_queue_count = 0U;
+    tx_in_flight = 0U;
 }
 
-/**
-  * @brief  发送USB响应
-  * @param  response: 响应字符串
-  * @retval 无
-  */
-void USB_Send_Response(char* response) {
-    // 检查响应字符串是否有效且非空
-    if (response != NULL && strlen(response) > 0) {
-        // 调用CDC_Transmit_FS函数通过USB发送响应
-        CDC_Transmit_FS((uint8_t*)response, strlen(response));
-    }
-}
+void USB_Send_Response(const char *response) {
+    uint32_t interrupt_state;
+    size_t length;
 
-/**
-  * @brief  设置电机速度
-  * @param  motor_num: 电机编号(1-4)
-  * @param  speed: 速度值(Hz)
-  * @retval 无
-  */
-static void Set_Motor_Speed(uint8_t motor_num, uint16_t speed) {
-    // 仅保留下限，解除上限限制
-    if (speed < 100) speed = 100;   // 最小速度限制
-    
-    // 根据电机编号设置对应电机的速度
-    switch(motor_num) {
-        case 1:
-            motor1.params.default_speed = speed;
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Motor1 speed set to %d Hz\r\n", speed);
-            break;
-        case 2:
-            motor2.params.default_speed = speed;
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Motor2 speed set to %d Hz\r\n", speed);
-            break;
-        case 3:
-            motor3.params.default_speed = speed;
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Motor3 speed set to %d Hz\r\n", speed);
-            break;   
-        default:
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Error: Invalid motor number %d\r\n", motor_num);
-            break;
-    }
-}
-
-
-/**
-  * @brief  显示系统状态
-  * @param  无
-  * @retval 无
-  */
-static void Show_System_Status(void) {
-    // 格式化系统状态信息，包括各个电机的速度、位置、运动状态
-    char status_msg[256];
-    snprintf(status_msg, sizeof(status_msg),
-            "=== System Status ===\r\n"
-            "Motor1: Speed=%dHz, Pos=%.1fmm, Moving=%d\r\n"
-            "Motor2: Speed=%dHz, Pos=%.1fmm, Moving=%d\r\n"
-            "Motor3: Speed=%dHz, Pos=%.1fmm, Moving=%d\r\n"
-            "====================\r\n",
-            motor1.params.default_speed, motor1.current_pos, motor1.is_moving,
-            motor2.params.default_speed, motor2.current_pos, motor2.is_moving,
-            motor3.params.default_speed, motor3.current_pos, motor3.is_moving);
-
-    // 将状态信息复制到响应缓冲区
-    strncpy(usb_response_buffer, status_msg, sizeof(usb_response_buffer));
-}
-
-/**
-  * @brief  显示帮助信息
-  * @param  无
-  * @retval 无
-  */
-static void Show_Help(void) {
-    // 定义帮助信息字符串，包含所有可用命令的说明
-    const char* help_msg = 
-        "=== Available Commands ===\r\n"
-        "Motor Speed Control:\r\n"
-        "  SPEED1=1000 - Set motor1 speed to 1000Hz\r\n"
-        "  SPEED2=1500 - Set motor2 speed to 1500Hz\r\n"
-        "  SPEED3=800  - Set motor3 speed to 800Hz\r\n"
-        
-        "\r\n"
-        "Motor Step Control:\r\n"
-        "  STEPLEN1=100 - Set motor1 step length to 100\r\n"
-        "  STEPLEN2=100 - Set motor2 step length to 100\r\n"
-        "  STEPLEN3=100 - Set motor3 step length to 100\r\n"
-        
-        "  STEPCOUNT1=500 - Set motor1 step count to 500\r\n"
-        "  STEPCOUNT2=500 - Set motor2 step count to 500\r\n"
-        "  STEPCOUNT3=500 - Set motor3 step count to 500\r\n"
-        
-        "\r\n"
-        "Non-blocking Motor Movement:\r\n"
-        "  MOVE1=100:1 - Move motor1 100mm in clockwise direction\r\n"
-        "  MOVE2=50:0  - Move motor2 50mm in counter-clockwise direction\r\n"
-        "  MOVE3=75:1  - Move motor3 75mm in clockwise direction\r\n"
-        
-        "  (Format: MOVE<num>=<distance>:<direction>, direction: 0=CCW, 1=CW)\r\n"
-        "\r\n"
-        "Scan Commands:\r\n"
-        "  SCAN_*      - Disabled in firmware command layer\r\n"
-        "               Use host-side scan controller only\r\n"
-        "\r\n"
-        "System Commands:\r\n"
-        "  STATUS - Show system status\r\n"
-        "  HELP   - Show this help message\r\n"
-        "  RESET  - Reset all motors to origin\r\n"
-        "\r\n"
-        "GPIO Control:\r\n"
-        "  PB14=1 - Disable motor (non-enable)\r\n"
-        "  PB14=0 - Enable motor (enable)\r\n"
-        "==========================\r\n";
-    
-    // 将帮助信息复制到响应缓冲区
-    strncpy(usb_response_buffer, help_msg, sizeof(usb_response_buffer));
-}
-
-/**
-  * @brief  使用非阻塞模式移动电机指定距离
-  * @param  motor_num: 电机编号(1-3)
-  * @param  distance: 移动距离(mm)
-  * @param  direction: 方向(0=逆时针, 1=顺时针)
-  * @retval 无
-  */
-static void Move_Motor_NonBlocking(uint8_t motor_num, float distance, uint8_t direction) {
-    // 限制距离为正数
-    if (distance <= 0) {
-        snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                "Error: Distance must be positive\r\n");
+    if (response == NULL || response[0] == '\0') {
         return;
     }
-    
-    // 根据电机编号和方向控制对应的电机移动
-    switch(motor_num) {
-        case 1:
-            Motor_MoveMMNonBlocking(&motor1, direction, distance);
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Motor1 moving %.1fmm %s\r\n", 
-                    distance, direction ? "Clockwise" : "Counter-clockwise");
-            break;
-        case 2:
-            Motor_MoveMMNonBlocking(&motor2, direction, distance);
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Motor2 moving %.1fmm %s\r\n", 
-                    distance, direction ? "Clockwise" : "Counter-clockwise");
-            break;
-        case 3:
-            Motor_MoveMMNonBlocking(&motor3, direction, distance);
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Motor3 moving %.1fmm %s\r\n", 
-                    distance, direction ? "Clockwise" : "Counter-clockwise");
-            break;
-        default:
-            snprintf(usb_response_buffer, sizeof(usb_response_buffer), 
-                    "Error: Invalid motor number %d\r\n", motor_num);
-            break;
+    length = strlen(response);
+    if (length >= USB_RESPONSE_BUFFER_SIZE) {
+        length = USB_RESPONSE_BUFFER_SIZE - 1U;
+    }
+
+    interrupt_state = __get_PRIMASK();
+    __disable_irq();
+    if (tx_queue_count < USB_TX_QUEUE_DEPTH) {
+        memcpy(tx_queue[tx_queue_tail], response, length);
+        tx_queue[tx_queue_tail][length] = '\0';
+        tx_queue_tail = (uint8_t)(
+            (tx_queue_tail + 1U) % USB_TX_QUEUE_DEPTH
+        );
+        tx_queue_count++;
+    }
+    if (interrupt_state == 0U) {
+        __enable_irq();
     }
 }
 
-/**
-  * @brief  处理单条已去除换行符的命令
-  * @param  cmd: 已截断换行符的命令字符串
-  * @param  out_buf: 输出缓冲区，用于写入本条命令的响应
-  * @param  buf_size: 输出缓冲区大小
-  * @retval 无
-  * @note   将原 USB_Command_Process 中的 if-else 分支提取至此，便于多命令循环调用。
-  */
-static void Process_Single_Command(const char* cmd, char* out_buf, size_t buf_size) {
-    // PB3/PB4/PB5 控制命令已移除
-    if (strncmp(cmd, "SPEED", 5) == 0) {
-        // 处理电机速度控制命令
-        char motor_char = cmd[5];
-        if (motor_char >= '1' && motor_char <= '4') {
-            uint8_t motor_num = motor_char - '0';
-            const char* equal_pos = strchr(cmd, '=');
-            if (equal_pos) {
-                uint16_t speed = atoi(equal_pos + 1);
-                Set_Motor_Speed(motor_num, speed);
-            } else {
-                snprintf(out_buf, buf_size,
-                        "Error: Invalid SPEED command format\r\n");
-            }
-        } else {
-            snprintf(out_buf, buf_size,
-                    "Error: Invalid motor number in SPEED command\r\n");
+void USB_Command_Update(void) {
+    USBD_CDC_HandleTypeDef *cdc_handle;
+    uint32_t interrupt_state;
+    uint16_t length;
+
+    cdc_handle = (USBD_CDC_HandleTypeDef *)hUsbDeviceFS.pClassData;
+    if (cdc_handle == NULL) {
+        return;
+    }
+
+    if (tx_in_flight && cdc_handle->TxState == 0U) {
+        interrupt_state = __get_PRIMASK();
+        __disable_irq();
+        if (tx_queue_count > 0U) {
+            tx_queue_head = (uint8_t)(
+                (tx_queue_head + 1U) % USB_TX_QUEUE_DEPTH
+            );
+            tx_queue_count--;
+        }
+        tx_in_flight = 0U;
+        if (interrupt_state == 0U) {
+            __enable_irq();
         }
     }
-    else if (strcmp(cmd, "STATUS") == 0) {
-        // 处理STATUS命令，显示系统状态
-        Show_System_Status();
-        strncpy(out_buf, usb_response_buffer, buf_size - 1);
-        out_buf[buf_size - 1] = '\0';
-        return; // Show_System_Status 写入全局缓冲区，需要复制出来
-    }
-    else if (strcmp(cmd, "HELP") == 0) {
-        // 处理HELP命令，显示帮助信息
-        Show_Help();
-        strncpy(out_buf, usb_response_buffer, buf_size - 1);
-        out_buf[buf_size - 1] = '\0';
+
+    if (tx_in_flight || tx_queue_count == 0U) {
         return;
     }
-    else if (strcmp(cmd, "RESET") == 0) {
-        // 处理RESET命令，停止所有电机
-        Motor_Stop(&motor1);
-        Motor_Stop(&motor2);
-        Motor_Stop(&motor3);
-
-        // 清除移动状态标志
-        motor1.is_moving = 0;
-        motor2.is_moving = 0;
-        motor3.is_moving = 0;
-
-        snprintf(out_buf, buf_size,
-                "All motors have been stopped and reset\r\n");
+    length = (uint16_t)strlen(tx_queue[tx_queue_head]);
+    if (
+        length > 0U
+        && CDC_Transmit_FS(
+            (uint8_t *)tx_queue[tx_queue_head],
+            length
+        ) == USBD_OK
+    ) {
+        tx_in_flight = 1U;
     }
-    else if (strncmp(cmd, "MOVE", 4) == 0) {
-        // 处理非阻塞式电机移动命令
-        // 命令格式: MOVE<num>=<distance>:<direction>
-        char motor_char = cmd[4];
-        if (motor_char >= '1' && motor_char <= '4') {
-            uint8_t motor_num = motor_char - '0';
-            const char* equal_pos = strchr(cmd, '=');
-            const char* colon_pos = strchr(cmd, ':');
+}
 
-            if (equal_pos && colon_pos && equal_pos < colon_pos) {
-                // 提取距离和方向参数
-                char distance_str[16];
-                char direction_str[2];
+static Motor_Device *Motor_FromAxis(char axis) {
+    return Motor_GetByAxis(axis);
+}
 
-                // 计算距离字符串的长度并复制
-                int distance_len = colon_pos - equal_pos - 1;
-                if (distance_len < (int)sizeof(distance_str)) {
-                    strncpy(distance_str, equal_pos + 1, distance_len);
-                    distance_str[distance_len] = '\0';
+static uint8_t ParseUnsigned(const char *text, uint32_t *value) {
+    char *end;
+    unsigned long parsed;
+
+    if (text == NULL || value == NULL || text[0] == '\0') {
+        return 0U;
+    }
+    parsed = strtoul(text, &end, 10);
+    if (end == text || *end != '\0') {
+        return 0U;
+    }
+    *value = (uint32_t)parsed;
+    return 1U;
+}
+
+static uint8_t ParseFloat(const char *text, float *value) {
+    char *end;
+    float parsed;
+
+    if (text == NULL || value == NULL || text[0] == '\0') {
+        return 0U;
+    }
+    parsed = strtof(text, &end);
+    if (end == text || *end != '\0' || parsed != parsed) {
+        return 0U;
+    }
+    *value = parsed;
+    return 1U;
+}
+
+static void WriteMotorError(
+    char *out_buf,
+    size_t buf_size,
+    Motor_Result result
+) {
+    snprintf(
+        out_buf,
+        buf_size,
+        "ERR %s\r\n",
+        Motor_ResultName(result)
+    );
+    out_buf[buf_size - 1] = '\0';
+}
+
+static uint8_t AnyMotorMoving(void) {
+    return (
+        Motor_IsMoving(&motor1)
+        || Motor_IsMoving(&motor2)
+        || Motor_IsMoving(&motor3)
+        || Motor_HomeAllActive()
+    ) ? 1U : 0U;
+}
+
+static void WriteStatus(char *out_buf, size_t buf_size) {
+    snprintf(
+        out_buf,
+        buf_size,
+        "OK STATUS "
+        "X_POS=%.3f X_VALID=%u X_MOVING=%u X_LIMIT=%u "
+        "X_STOP=%s X_HOME=%s "
+        "Y_POS=%.3f Y_VALID=%u Y_MOVING=%u Y_LIMIT=%u "
+        "Y_STOP=%s Y_HOME=%s "
+        "Z_POS=%.3f Z_VALID=%u Z_MOVING=%u Z_LIMIT=%u "
+        "Z_STOP=%s Z_HOME=%s FAULT=%u\r\n",
+        motor1.current_pos,
+        (unsigned int)motor1.position_valid,
+        (unsigned int)motor1.is_moving,
+        (unsigned int)motor1.limit_active,
+        Motor_StopReasonName(motor1.stop_reason),
+        Motor_HomeStateName(motor1.home_state),
+        motor2.current_pos,
+        (unsigned int)motor2.position_valid,
+        (unsigned int)motor2.is_moving,
+        (unsigned int)motor2.limit_active,
+        Motor_StopReasonName(motor2.stop_reason),
+        Motor_HomeStateName(motor2.home_state),
+        motor3.current_pos,
+        (unsigned int)motor3.position_valid,
+        (unsigned int)motor3.is_moving,
+        (unsigned int)motor3.limit_active,
+        Motor_StopReasonName(motor3.stop_reason),
+        Motor_HomeStateName(motor3.home_state),
+        (unsigned int)(
+            motor1.fault_latched
+            || motor2.fault_latched
+            || motor3.fault_latched
+        )
+    );
+    out_buf[buf_size - 1] = '\0';
+}
+
+static void Process_Single_Command(
+    const char *cmd,
+    char *out_buf,
+    size_t buf_size
+) {
+    Motor_Device *motor;
+    Motor_Result result;
+    uint32_t unsigned_value;
+    float float_value;
+    const char *colon;
+    char number_buffer[24];
+    size_t number_length;
+    uint8_t motor_number;
+    uint8_t direction;
+
+    if (out_buf == NULL || buf_size == 0U) {
+        return;
+    }
+    out_buf[0] = '\0';
+
+    if (strcmp(cmd, "ID?") == 0) {
+        snprintf(
+            out_buf,
+            buf_size,
+            "OK ID=TMC2209 MOTOR_PROTOCOL=%u TRAVEL_MM=%.1f "
+            "PULSES_PER_MM=%u\r\n",
+            (unsigned int)MOTOR_PROTOCOL_VERSION,
+            (double)MOTOR_TRAVEL_MM,
+            (unsigned int)MOTOR_PULSES_PER_MM
+        );
+    } else if (strcmp(cmd, "LIMIT?") == 0) {
+        snprintf(
+            out_buf,
+            buf_size,
+            "OK LIMIT X=%u Y=%u Z=%u ACTIVE_LOW=1\r\n",
+            (unsigned int)Motor_LimitActive(&motor1),
+            (unsigned int)Motor_LimitActive(&motor2),
+            (unsigned int)Motor_LimitActive(&motor3)
+        );
+    } else if (strcmp(cmd, "POS?") == 0) {
+        snprintf(
+            out_buf,
+            buf_size,
+            "OK POS X=%.3f X_VALID=%u Y=%.3f Y_VALID=%u "
+            "Z=%.3f Z_VALID=%u\r\n",
+            motor1.current_pos,
+            (unsigned int)motor1.position_valid,
+            motor2.current_pos,
+            (unsigned int)motor2.position_valid,
+            motor3.current_pos,
+            (unsigned int)motor3.position_valid
+        );
+    } else if (
+        strcmp(cmd, "STATUS") == 0
+        || strcmp(cmd, "STATUS?") == 0
+    ) {
+        WriteStatus(out_buf, buf_size);
+    } else if (strcmp(cmd, "FAULT?") == 0) {
+        snprintf(
+            out_buf,
+            buf_size,
+            "OK FAULT X=%u Y=%u Z=%u\r\n",
+            (unsigned int)motor1.fault_latched,
+            (unsigned int)motor2.fault_latched,
+            (unsigned int)motor3.fault_latched
+        );
+    } else if (strcmp(cmd, "CLEARFAULT") == 0) {
+        if (AnyMotorMoving()) {
+            snprintf(out_buf, buf_size, "ERR BUSY\r\n");
+        } else {
+            Motor_ClearFaults();
+            snprintf(out_buf, buf_size, "OK CLEARFAULT\r\n");
+        }
+    } else if (strncmp(cmd, "POSSET=", 7) == 0) {
+        motor = Motor_FromAxis(cmd[7]);
+        if (
+            motor == NULL
+            || cmd[8] != ':'
+            || !ParseFloat(cmd + 9, &float_value)
+        ) {
+            snprintf(out_buf, buf_size, "ERR BAD_COMMAND\r\n");
+        } else {
+            result = Motor_SetPosition(motor, float_value);
+            if (result != MOTOR_OK) {
+                WriteMotorError(out_buf, buf_size, result);
+            } else {
+                snprintf(
+                    out_buf,
+                    buf_size,
+                    "OK POSSET AXIS=%c POS=%.3f\r\n",
+                    motor->axis_name,
+                    motor->current_pos
+                );
+            }
+        }
+    } else if (strncmp(cmd, "HOME=", 5) == 0) {
+        if (strcmp(cmd + 5, "ALL") == 0) {
+            result = Motor_StartHomeAll();
+        } else if (cmd[5] != '\0' && cmd[6] == '\0') {
+            motor = Motor_FromAxis(cmd[5]);
+            result = motor == NULL
+                ? MOTOR_ERR_AXIS
+                : Motor_StartHome(motor);
+        } else {
+            result = MOTOR_ERR_VALUE;
+        }
+        if (result != MOTOR_OK) {
+            WriteMotorError(out_buf, buf_size, result);
+        } else {
+            snprintf(
+                out_buf,
+                buf_size,
+                "OK HOME AXIS=%s\r\n",
+                strcmp(cmd + 5, "ALL") == 0 ? "ALL" : cmd + 5
+            );
+        }
+    } else if (
+        strncmp(cmd, "SPEED", 5) == 0
+        && cmd[5] >= '1'
+        && cmd[5] <= '3'
+        && cmd[6] == '='
+    ) {
+        motor_number = (uint8_t)(cmd[5] - '0');
+        motor = Motor_GetByNumber(motor_number);
+        if (
+            !ParseUnsigned(cmd + 7, &unsigned_value)
+            || unsigned_value > 65535UL
+        ) {
+            snprintf(out_buf, buf_size, "ERR BAD_COMMAND\r\n");
+        } else {
+            result = Motor_SetSpeed(motor, (uint16_t)unsigned_value);
+            if (result != MOTOR_OK) {
+                WriteMotorError(out_buf, buf_size, result);
+            } else {
+                snprintf(
+                    out_buf,
+                    buf_size,
+                    "OK SPEED MOTOR=%u HZ=%lu\r\n",
+                    (unsigned int)motor_number,
+                    (unsigned long)unsigned_value
+                );
+            }
+        }
+    } else if (
+        strncmp(cmd, "MOVE", 4) == 0
+        && cmd[4] >= '1'
+        && cmd[4] <= '3'
+        && cmd[5] == '='
+    ) {
+        motor_number = (uint8_t)(cmd[4] - '0');
+        motor = Motor_GetByNumber(motor_number);
+        colon = strchr(cmd + 6, ':');
+        if (colon == NULL) {
+            snprintf(out_buf, buf_size, "ERR BAD_COMMAND\r\n");
+        } else {
+            number_length = (size_t)(colon - (cmd + 6));
+            if (
+                number_length == 0U
+                || number_length >= sizeof(number_buffer)
+            ) {
+                snprintf(out_buf, buf_size, "ERR BAD_COMMAND\r\n");
+            } else {
+                memcpy(number_buffer, cmd + 6, number_length);
+                number_buffer[number_length] = '\0';
+                if (
+                    !ParseFloat(number_buffer, &float_value)
+                    || (colon[1] != '0' && colon[1] != '1')
+                    || colon[2] != '\0'
+                ) {
+                    snprintf(out_buf, buf_size, "ERR BAD_COMMAND\r\n");
                 } else {
-                    snprintf(out_buf, buf_size,
-                            "Error: Distance parameter too long\r\n");
-                    return;
+                    direction = (uint8_t)(colon[1] - '0');
+                    result = Motor_MoveMMNonBlocking(
+                        motor,
+                        direction,
+                        float_value
+                    );
+                    if (result != MOTOR_OK) {
+                        WriteMotorError(out_buf, buf_size, result);
+                    } else {
+                        snprintf(
+                            out_buf,
+                            buf_size,
+                            "OK MOVE MOTOR=%u MM=%.3f DIR=%u\r\n",
+                            (unsigned int)motor_number,
+                            float_value,
+                            (unsigned int)direction
+                        );
+                    }
                 }
-
-                // 复制方向字符串
-                strncpy(direction_str, colon_pos + 1, sizeof(direction_str) - 1);
-                direction_str[sizeof(direction_str) - 1] = '\0';
-
-                // 转换为浮点数距离和整数方向
-                float distance = atof(distance_str);
-                uint8_t direction = atoi(direction_str);
-
-                // 方向值只能是0或1
-                if (direction != 0 && direction != 1) {
-                    snprintf(out_buf, buf_size,
-                            "Error: Direction must be 0 (CCW) or 1 (CW)\r\n");
-                    return;
-                }
-
-                // 调用非阻塞式电机移动函数
-                Move_Motor_NonBlocking(motor_num, distance, direction);
-                // Move_Motor_NonBlocking 写入全局缓冲区，复制出来
-                strncpy(out_buf, usb_response_buffer, buf_size - 1);
-                out_buf[buf_size - 1] = '\0';
-                return;
-            } else {
-                snprintf(out_buf, buf_size,
-                        "Error: Invalid MOVE command format. Use MOVE<num>=<distance>:<direction>\r\n");
             }
-        } else {
-            snprintf(out_buf, buf_size,
-                    "Error: Invalid motor number in MOVE command\r\n");
         }
-    }
-    else if (strncmp(cmd, "SCAN_", 5) == 0) {
-        // 扫描控制入口在命令层禁用，避免与上位机扫描状态机并存导致误操作。
-        snprintf(out_buf, buf_size,
-                "Scan command disabled in firmware. Use host-side scan control.\r\n");
-    }
-    else if (strncmp(cmd, "PB14=", 5) == 0) {
-        // 处理PB14控制命令
-        const char* value_str = cmd + 5;
-        int value = atoi(value_str);
-
-        if (value == 1) {
-            // PB14=1: 非使能（关闭电机）
-            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-            snprintf(out_buf, buf_size,
-                    "Motor disabled (PB14=1)\r\n");
-        } else if (value == 0) {
-            // PB14=0: 使能（开启电机）
+    } else if (strcmp(cmd, "STOP") == 0) {
+        Motor_StopAll();
+        snprintf(out_buf, buf_size, "OK STOP\r\n");
+    } else if (strcmp(cmd, "RESET") == 0) {
+        Motor_StopAll();
+        snprintf(out_buf, buf_size, "OK STOP ALIAS=RESET\r\n");
+    } else if (strncmp(cmd, "SCAN_", 5) == 0) {
+        snprintf(out_buf, buf_size, "ERR HOST_SCAN_REQUIRED\r\n");
+    } else if (strncmp(cmd, "PB14=", 5) == 0) {
+        if (strcmp(cmd + 5, "0") == 0) {
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-            snprintf(out_buf, buf_size,
-                    "Motor enabled (PB14=0)\r\n");
+            snprintf(out_buf, buf_size, "OK ENABLE VALUE=1\r\n");
+        } else if (strcmp(cmd + 5, "1") == 0) {
+            Motor_StopAll();
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+            snprintf(out_buf, buf_size, "OK ENABLE VALUE=0\r\n");
         } else {
-            // 无效值
-            snprintf(out_buf, buf_size,
-                    "Error: PB14 value must be 0 or 1\r\n");
+            snprintf(out_buf, buf_size, "ERR BAD_COMMAND\r\n");
         }
+    } else if (strcmp(cmd, "HELP") == 0) {
+        snprintf(
+            out_buf,
+            buf_size,
+            "OK HELP ID? STATUS LIMIT? POS? POSSET=<X|Y|Z>:<mm> "
+            "SPEED<n>=<Hz> MOVE<n>=<mm>:<0|1> HOME=<X|Y|Z|ALL> "
+            "STOP FAULT? CLEARFAULT PB14=<0|1>\r\n"
+        );
+    } else {
+        snprintf(out_buf, buf_size, "ERR BAD_COMMAND\r\n");
     }
-    else {
-        // 未知命令，输出错误信息
-        snprintf(out_buf, buf_size,
-                "Error: Unknown command '%s'. Type HELP for available commands.\r\n", cmd);
-    }
+    out_buf[buf_size - 1] = '\0';
 }
 
-/**
-  * @brief  USB命令处理函数（支持批量命令：按换行符分割，逐条处理）
-  * @param  command: 接收到的命令字符串（可包含多条\n分隔的命令）
-  * @retval 无
-  */
-void USB_Command_Process(char* command) {
-    // 清除全局响应缓冲区
-    memset(usb_response_buffer, 0, sizeof(usb_response_buffer));
-
-    char* start = command;
-    char cmd[64];
+void USB_Command_Process(char *command) {
+    char current;
     char single_response[USB_RESPONSE_BUFFER_SIZE];
-    int total_offset = 0;
 
-    // 按换行符分割，逐条处理
-    while (*start) {
-        // 跳过前导换行符
-        while (*start == '\r' || *start == '\n') {
-            start++;
-        }
-        if (*start == '\0') break;
+    if (command == NULL) {
+        return;
+    }
 
-        // 找到本条命令结尾
-        char* end = start;
-        while (*end && *end != '\r' && *end != '\n') {
-            end++;
-        }
-
-        // 计算命令长度
-        size_t len = end - start;
-        if (len == 0) {
-            start = end;
+    while (*command != '\0') {
+        current = *command++;
+        if (current == '\r' || current == '\n') {
+            if (rx_discard_until_newline) {
+                rx_discard_until_newline = 0U;
+                rx_line_length = 0U;
+                USB_Send_Response("ERR LINE_TOO_LONG\r\n");
+            } else if (rx_line_length > 0U) {
+                rx_line_buffer[rx_line_length] = '\0';
+                Process_Single_Command(
+                    rx_line_buffer,
+                    single_response,
+                    sizeof(single_response)
+                );
+                strncpy(
+                    usb_response_buffer,
+                    single_response,
+                    sizeof(usb_response_buffer) - 1U
+                );
+                usb_response_buffer[
+                    sizeof(usb_response_buffer) - 1U
+                ] = '\0';
+                USB_Send_Response(single_response);
+                rx_line_length = 0U;
+            }
             continue;
         }
-        if (len >= sizeof(cmd)) len = sizeof(cmd) - 1;
 
-        // 复制本条命令
-        memcpy(cmd, start, len);
-        cmd[len] = '\0';
-
-        // 清空单条响应缓冲区
-        memset(single_response, 0, sizeof(single_response));
-
-        // 处理本条命令
-        Process_Single_Command(cmd, single_response, sizeof(single_response));
-
-        // 将单条响应追加到全局缓冲区
-        int resp_len = strlen(single_response);
-        if (resp_len > 0 && total_offset + resp_len + 2 < (int)sizeof(usb_response_buffer)) {
-            if (total_offset > 0) {
-                usb_response_buffer[total_offset++] = '\r';
-                usb_response_buffer[total_offset++] = '\n';
-            }
-            memcpy(usb_response_buffer + total_offset, single_response, resp_len);
-            total_offset += resp_len;
+        if (rx_discard_until_newline) {
+            continue;
         }
-
-        // 移动到下一条命令
-        start = end;
-    }
-
-    // 发送汇总响应到USB
-    if (total_offset > 0) {
-        usb_response_buffer[total_offset] = '\0';
-        USB_Send_Response(usb_response_buffer);
+        if (rx_line_length >= USB_COMMAND_LINE_SIZE - 1U) {
+            rx_line_length = 0U;
+            rx_discard_until_newline = 1U;
+            continue;
+        }
+        rx_line_buffer[rx_line_length++] = current;
     }
 }
