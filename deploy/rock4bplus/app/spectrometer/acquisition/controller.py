@@ -115,6 +115,10 @@ class AcquisitionController(QtCore.QObject):
         return self._global_state
 
     @property
+    def global_task_id(self) -> Optional[str]:
+        return self._global_task_id
+
+    @property
     def busy(self) -> bool:
         return bool(self._tasks) or self.manual_export_active
 
@@ -202,6 +206,51 @@ class AcquisitionController(QtCore.QObject):
         storage_format=StorageFormat.CSV_EXCEL,
         batch_size: int = 500,
     ) -> bool:
+        return self._start_global(
+            AcquisitionOwner.GLOBAL,
+            device_ids,
+            mode,
+            sync_mode,
+            master_device_id=master_device_id,
+            auto_store=auto_store,
+            storage_format=storage_format,
+            batch_size=batch_size,
+        )
+
+    def start_scan_global(
+        self,
+        device_ids,
+        mode=AcquisitionMode.CONTINUOUS,
+        sync_mode=SyncMode.INDEPENDENT,
+        *,
+        master_device_id: Optional[int] = None,
+        auto_store: bool = True,
+        storage_format=StorageFormat.CSV_EXCEL,
+        batch_size: int = 500,
+    ) -> bool:
+        return self._start_global(
+            AcquisitionOwner.SCAN,
+            device_ids,
+            mode,
+            sync_mode,
+            master_device_id=master_device_id,
+            auto_store=auto_store,
+            storage_format=storage_format,
+            batch_size=batch_size,
+        )
+
+    def _start_global(
+        self,
+        owner,
+        device_ids,
+        mode=AcquisitionMode.CONTINUOUS,
+        sync_mode=SyncMode.INDEPENDENT,
+        *,
+        master_device_id: Optional[int] = None,
+        auto_store: bool = False,
+        storage_format=StorageFormat.CSV_EXCEL,
+        batch_size: int = 500,
+    ) -> bool:
         if self.manual_export_active:
             return self._reject("光谱正在保存，请等待完成后再开始采集")
         busy_ids = [
@@ -229,7 +278,7 @@ class AcquisitionController(QtCore.QObject):
                 "上一任务缓存无法清理，已取消新的采集"
             )
         request = AcquisitionRequest.create(
-            AcquisitionOwner.GLOBAL,
+            AcquisitionOwner(owner),
             ids,
             mode=AcquisitionMode(mode),
             sync_mode=sync,

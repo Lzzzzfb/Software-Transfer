@@ -25,6 +25,9 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert window.ribbon.objectName() == "mainRibbon"
     assert window.sidebar.objectName() == "deviceSidebar"
     assert window.plot_widget.objectName() == "spectrumPlot"
+    assert window.motor_panel.objectName() == "motorPanel"
+    assert window.live_workspace.widget(0) is window.plot_widget
+    assert window.live_workspace.widget(1) is window.motor_panel
     expected_backend = (
         "pyqtgraph"
         if os.environ.get("ZGCAI_PLOT_BACKEND") == "pyqtgraph"

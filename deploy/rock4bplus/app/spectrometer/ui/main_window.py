@@ -29,6 +29,10 @@ from ..domain.enums import (
     control_state_label,
 )
 from ..domain.models import SpectrumFrame, SpectrumReference
+from ..motor.controller import MotorController
+from ..motor.models import Axis
+from ..motor.scan_controller import ScanController, ScanState
+from ..motor.state_store import MotorStateStore
 from ..processing.calibration_repository import IntensityCalibrationRepository
 from ..processing.display_service import DisplayProcessingService
 from ..processing.formula import FormulaError, validate_formula
@@ -54,6 +58,7 @@ from .device_parameters import DeviceParametersDialog
 from .diagnostics import DiagnosticsPanel
 from .history_viewer import HistoryViewer
 from .input_controls import NoWheelComboBox
+from .motor_panel import MotorPanel
 from .plot_backend import create_spectrum_plot_widget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
@@ -72,6 +77,8 @@ class MainWindow(QtWidgets.QMainWindow):
         auto_start_simulation: bool = True,
         settings_path=None,
         port_allowlist=None,
+        motor_controller=None,
+        scan_controller=None,
     ):
         super().__init__()
         self.simulation = simulation
@@ -119,6 +126,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_manager,
             self.storage_manager,
             reference_commit=self._commit_reference_frames,
+        )
+        self.motor_controller = motor_controller or MotorController(
+            self,
+            state_store=MotorStateStore(
+                self._configuration_root / "motor-state.json"
+            ),
+        )
+        self.scan_controller = scan_controller or ScanController(
+            self.motor_controller,
+            self.control,
+            manifest_directory=(
+                Path(self.settings["storage_path"]) / "scan-manifests"
+            ),
+            parent=self,
         )
         self._initializing_devices = set()
         self._task_requests = {}
@@ -191,7 +212,15 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.sidebar = DeviceSidebar(); splitter.addWidget(self.sidebar)
         self.tabs = QtWidgets.QTabWidget(); self.tabs.setObjectName("workspaceTabs")
-        self.tabs.addTab(self.plot_widget, "实时光谱")
+        self.live_workspace = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.live_workspace.setObjectName("liveWorkspace")
+        self.live_workspace.addWidget(self.plot_widget)
+        self.motor_panel = MotorPanel()
+        self.live_workspace.addWidget(self.motor_panel)
+        self.live_workspace.setStretchFactor(0, 1)
+        self.live_workspace.setStretchFactor(1, 0)
+        self.live_workspace.setSizes([530, 300])
+        self.tabs.addTab(self.live_workspace, "实时光谱")
         self.history_viewer = HistoryViewer(); self.tabs.addTab(self.history_viewer, "历史数据")
         self.diagnostics = DiagnosticsPanel(); self.tabs.addTab(self.diagnostics, "诊断")
         splitter.addWidget(self.tabs); splitter.setStretchFactor(0, 0); splitter.setStretchFactor(1, 1)
@@ -351,6 +380,67 @@ class MainWindow(QtWidgets.QMainWindow):
             self._display_processing_failed
         )
         self.tabs.currentChanged.connect(self._diagnostic_tab_changed)
+        self.motor_panel.discover_requested.connect(self._discover_motor)
+        self.motor_panel.connect_requested.connect(self._connect_motor)
+        self.motor_panel.disconnect_requested.connect(
+            self.motor_controller.disconnect
+        )
+        self.motor_panel.speed_requested.connect(
+            self.motor_controller.set_speed
+        )
+        self.motor_panel.move_requested.connect(
+            self.motor_controller.move_relative
+        )
+        self.motor_panel.position_clear_requested.connect(
+            lambda axis: self.motor_controller.set_position(Axis(axis), 0.0)
+        )
+        self.motor_panel.software_return_requested.connect(
+            self.motor_controller.return_axis_to_zero
+        )
+        self.motor_panel.home_requested.connect(self.motor_controller.home)
+        self.motor_panel.stop_requested.connect(self._stop_motor_motion)
+        self.motor_panel.clear_fault_requested.connect(
+            self.motor_controller.clear_faults
+        )
+        self.motor_panel.scan_start_requested.connect(
+            self._start_motor_scan
+        )
+        self.motor_panel.scan_stop_requested.connect(
+            self.scan_controller.stop
+        )
+        self.motor_controller.candidates_changed.connect(
+            self.motor_panel.set_candidates
+        )
+        self.motor_controller.connection_changed.connect(
+            self._motor_connection_changed
+        )
+        self.motor_controller.status_changed.connect(
+            self.motor_panel.set_motor_status
+        )
+        self.motor_controller.operation_failed.connect(
+            self._motor_operation_failed
+        )
+        self.motor_controller.diagnostic_event.connect(
+            lambda message: self._log(f"电机：{message}", "WARN")
+        )
+        self.motor_controller.motion_started.connect(
+            lambda _operation_id: self.motor_panel.set_motion_active(True)
+        )
+        self.motor_controller.motion_finished.connect(
+            self._motor_motion_finished
+        )
+        self.scan_controller.state_changed.connect(
+            self._scan_state_changed
+        )
+        self.scan_controller.progress_changed.connect(
+            self.motor_panel.set_scan_progress
+        )
+        self.scan_controller.operation_failed.connect(
+            self._scan_operation_failed
+        )
+        self.scan_controller.scan_finished.connect(
+            self._scan_finished
+        )
 
     def _apply_settings(self):
         self.plot_widget.set_line_width(self.settings["line_width"])
@@ -368,6 +458,128 @@ class MainWindow(QtWidgets.QMainWindow):
             allowed = not self.port_allowlist or port["port_name"].upper() in self.port_allowlist
             if allowed and port["port_name"] not in existing and DeviceFinder.is_likely_spectrometer(port):
                 self.device_manager.add_and_connect(port["port_name"], 115200)
+
+    def _motor_excluded_ports(self):
+        return {
+            str(device.port_name)
+            for device in self.device_manager.devices.values()
+            if device.port_name
+        }
+
+    def _discover_motor(self):
+        candidates = self.motor_controller.discover(
+            self._motor_excluded_ports()
+        )
+        if candidates:
+            self._log(
+                "发现电机候选串口："
+                + "、".join(candidate.port_name for candidate in candidates)
+            )
+        else:
+            self._log("未发现可探测的电机串口", "WARN")
+        return candidates
+
+    def _connect_motor(self):
+        self.status_panel.state_label.setText("正在识别电机串口…")
+        return self.motor_controller.connect_auto(
+            self._motor_excluded_ports()
+        )
+
+    def _motor_connection_changed(self, connected, detail):
+        self.motor_panel.set_connection_state(connected, detail)
+        if connected:
+            self._log(f"电机控制器已连接：{detail}")
+        elif detail:
+            self._log(f"电机控制器未连接：{detail}", "WARN")
+
+    def _motor_operation_failed(self, message):
+        self.motor_panel.set_motion_active(False)
+        self._log(f"电机操作失败：{message}", "ERROR")
+        self.status_panel.state_label.setText(f"电机操作失败：{message}")
+
+    def _motor_motion_finished(self, _operation_id, success, reason):
+        self.motor_panel.set_motion_active(False)
+        if not success and reason != "user_stop":
+            self._log(f"电机运动异常结束：{reason}", "ERROR")
+
+    def _stop_motor_motion(self):
+        if self.scan_controller.active:
+            return self.scan_controller.stop()
+        self.motor_controller.stop()
+        return True
+
+    def _start_motor_scan(self, parameters):
+        if self.control.busy:
+            self._scan_operation_failed(
+                "已有光谱仪任务未完全结束，不能启动扫描"
+            )
+            return False
+        pending = [
+            device.port_name
+            for device in self.device_manager.get_connected_devices()
+            if device.device_id in self._initializing_devices
+        ]
+        if pending:
+            self._scan_operation_failed(
+                f"光谱仪正在初始化：{', '.join(pending)}"
+            )
+            return False
+        devices = self._global_devices()
+        device_ids = [device.device_id for device in devices]
+        if not device_ids:
+            self._scan_operation_failed("没有参与扫描采集的光谱仪")
+            return False
+        self.scan_controller.set_manifest_directory(
+            Path(self.settings["storage_path"]) / "scan-manifests"
+        )
+        self.acquisition.reset(device_ids)
+        return self.scan_controller.start(
+            parameters,
+            device_ids=device_ids,
+            sync_mode=SyncMode(self.ribbon.sync_combo.currentData()),
+            master_device_id=self.sidebar.selected_device_id,
+            storage_format=StorageFormat(
+                self.settings["storage_format"]
+            ),
+            batch_size=int(self.settings["batch_size"]),
+        )
+
+    def _set_scan_ui_locked(self, locked):
+        locked = bool(locked)
+        for key in ("acquisition", "background", "reference"):
+            self.ribbon.buttons[key].setEnabled(not locked)
+        self.ribbon.sync_combo.setEnabled(not locked)
+        self.acquisition_mode.setEnabled(not locked)
+        self.sidebar.set_scan_locked(locked)
+
+    def _scan_state_changed(self, state):
+        state = ScanState(state)
+        self.motor_panel.set_scan_state(state)
+        self._set_scan_ui_locked(self.scan_controller.active)
+        if state is ScanState.STOPPING_ACQUISITION:
+            self.status_panel.state_label.setText(
+                "扫描轮次完成，正在停止光谱仪并保存…"
+            )
+        elif state is ScanState.RETURNING:
+            self.status_panel.state_label.setText(
+                "光谱数据已保存，电机正在返回扫描起点…"
+            )
+
+    def _scan_operation_failed(self, message):
+        self._log(f"扫描任务失败：{message}", "ERROR")
+        self.status_panel.state_label.setText(f"扫描任务失败：{message}")
+
+    def _scan_finished(self, success, reason, manifest_path):
+        self._set_scan_ui_locked(False)
+        if success:
+            self._log(f"扫描任务完成；清单：{manifest_path}")
+        elif reason != "user_stop":
+            self._log(
+                f"扫描任务异常结束：{reason}；清单：{manifest_path}",
+                "ERROR",
+            )
+        else:
+            self._log(f"扫描任务已由用户停止；清单：{manifest_path}", "WARN")
 
     def _device_changed(self, device_id):
         device = self.device_manager.get_device(device_id)
@@ -660,7 +872,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _plot_tick(self):
         self._pending_plot_frames.update(self.acquisition.take_latest_frames())
-        if self.tabs.currentWidget() is not self.plot_widget:
+        if self.tabs.currentWidget() is not self.live_workspace:
             return
         frames = self._pending_plot_frames
         self._pending_plot_frames = {}
@@ -723,7 +935,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _display_processing_ready(self, result):
         if (
-            self.tabs.currentWidget() is not self.plot_widget
+            self.tabs.currentWidget() is not self.live_workspace
             or self._processing_generation_by_device.get(
                 result.device_id, 0
             )
@@ -869,7 +1081,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         if missing:
             self._processing_snapshots(missing)
-        scope = "总控" if request.owner is AcquisitionOwner.GLOBAL else "单机"
+        if request.owner is AcquisitionOwner.SCAN:
+            scope = "扫描"
+        elif request.owner is AcquisitionOwner.GLOBAL:
+            scope = "总控"
+        else:
+            scope = "单机"
         mode = "连续" if request.mode is AcquisitionMode.CONTINUOUS else "单次"
         self._log(f"{scope}{mode}采集已启动，共 {len(request.device_ids)} 台设备")
 
@@ -1038,6 +1255,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.settings.update(dialog.values()); self.plot_widget.set_line_width(self.settings["line_width"])
             self.storage_manager.set_output_directory(self.settings["storage_path"])
             self.reference_repository = ReferenceRepository(Path(self.settings["storage_path"]) / "references")
+            self.scan_controller.set_manifest_directory(
+                Path(self.settings["storage_path"]) / "scan-manifests"
+            )
             self.settings_service.save(self.settings); self._log("设置已保存")
 
     def open_device_parameters(self, device_id):
@@ -1168,7 +1388,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "workspace_tab_changed",
             {"index": int(index), "label": self.tabs.tabText(index)},
         )
-        if self.tabs.widget(index) is self.plot_widget:
+        if self.tabs.widget(index) is self.live_workspace:
             QtCore.QTimer.singleShot(0, self._plot_tick)
 
     def _diagnostic_frame_summary(self, _device_id, values):
@@ -1299,6 +1519,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_manager.inject_simulated_frame(SpectrumFrame.create(device_id, sequence << 8, pixels))
 
     def closeEvent(self, event):
+        if self.scan_controller.active:
+            self.scan_controller.stop()
         if self.control.global_state is not ControlState.IDLE:
             self.control.stop_global()
         else:
@@ -1309,6 +1531,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control.finish_pending_stops()
         if not self.control.manual_export_active:
             self.control.discard_pending_capture("shutdown")
+        self.motor_controller.shutdown()
         self.storage_manager.shutdown(timeout=10.0)
         if not self.control.manual_export_active:
             self.control.discard_pending_capture("shutdown")

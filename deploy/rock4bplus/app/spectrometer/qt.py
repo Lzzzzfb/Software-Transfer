@@ -69,6 +69,7 @@ def _install_flat_enum_aliases():
             {
                 "QueuedConnection": ("ConnectionType", "QueuedConnection"),
                 "Horizontal": ("Orientation", "Horizontal"),
+                "Vertical": ("Orientation", "Vertical"),
                 "ToolButtonTextOnly": ("ToolButtonStyle", "ToolButtonTextOnly"),
                 "PointingHandCursor": ("CursorShape", "PointingHandCursor"),
                 "Key_Up": ("Key", "Key_Up"),

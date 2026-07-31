@@ -360,11 +360,15 @@ class MotorController(QtCore.QObject):
         )
         self.state_store.begin_motion(self.device_id)
         self.motion_started.emit(operation_id)
-        self.transport.send_command(
+        accepted = self.transport.send_command(
             command,
             tag=("move_ack", operation_id),
             timeout_ms=1000,
         )
+        if not accepted:
+            if self._active_motion is not None:
+                self._fail_motion("command_not_queued", emergency=False)
+            return None
         return operation_id
 
     def return_axis_to_zero(self, axis: Axis) -> str | None:
@@ -396,11 +400,15 @@ class MotorController(QtCore.QObject):
         )
         self.state_store.begin_motion(self.device_id)
         self.motion_started.emit(operation_id)
-        self.transport.send_command(
+        accepted = self.transport.send_command(
             build_home_command(axis),
             tag=("home_ack", operation_id),
             timeout_ms=1000,
         )
+        if not accepted:
+            if self._active_motion is not None:
+                self._fail_motion("command_not_queued", emergency=False)
+            return None
         return operation_id
 
     def stop(self):
@@ -533,7 +541,10 @@ class MotorController(QtCore.QObject):
             position = self._position_for_store()
             if position is not None and self.device_id:
                 saved = self.state_store.load(self.device_id)
-                if saved is not None and saved.trusted:
+                context = tag[1] if len(tag) > 1 else ""
+                if context == "set_position" or (
+                    saved is not None and saved.trusted
+                ):
                     self.state_store.confirm_position(self.device_id, position)
             return
         if kind == "speed":

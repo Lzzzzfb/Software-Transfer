@@ -23,15 +23,17 @@ ID?
 响应示例：
 
 ```text
-OK ID DEVICE=MOTOR_CTRL PROTO=2 AXES=XYZ PPM=640 TRAVEL=15.000 LIMIT=XYZ0
+OK ID=TMC2209 MOTOR_PROTOCOL=2 TRAVEL_MM=15.0 PULSES_PER_MM=640
 ```
 
 自动识别必须同时验证：
 
 - USB VID:PID优先为 `0483:5740`；
-- `DEVICE=MOTOR_CTRL`；
-- `PROTO=2`；
-- USB序列号绑定同一块STM32。
+- `ID=TMC2209`；
+- `MOTOR_PROTOCOL=2`。
+
+USB序列号存在时用于稳定绑定同一块STM32；设备未提供序列号时，以系统位置作为
+退化身份。VID:PID只改变探测优先级，不能代替协议握手。
 
 ## 3. 轴
 

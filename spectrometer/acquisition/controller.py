@@ -115,6 +115,10 @@ class AcquisitionController(QtCore.QObject):
         return self._global_state
 
     @property
+    def global_task_id(self) -> Optional[str]:
+        return self._global_task_id
+
+    @property
     def busy(self) -> bool:
         return bool(self._tasks) or self.manual_export_active
 

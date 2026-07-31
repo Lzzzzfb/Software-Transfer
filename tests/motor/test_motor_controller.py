@@ -61,6 +61,13 @@ class FakeTransport(QtCore.QObject):
         self.command_completed.emit(tag, parse_response(line))
 
 
+class SynchronousFailTransport(FakeTransport):
+    def send_command(self, command, *, tag=None, timeout_ms=1000):
+        self.sent.append((bytes(command), tag, timeout_ms))
+        self.command_failed.emit(tag, "not connected")
+        return False
+
+
 PORTS = [
     {
         "port_name": "COM8",
@@ -193,4 +200,55 @@ def test_emergency_stop_invalidates_an_active_motion(tmp_path):
     controller.stop()
 
     assert transport.emergency == [b"STOP\r\n"]
+    assert store.load("MOTOR-A").trusted is False
+
+
+def test_manual_coordinate_set_is_persisted_after_status_confirmation(
+    tmp_path,
+):
+    application()
+    store = MotorStateStore(tmp_path / "motor.json")
+    transport = FakeTransport()
+    transport.connected = True
+    controller = MotorController(
+        transport=transport,
+        state_store=store,
+        port_provider=lambda: PORTS[:1],
+    )
+    controller._confirmed_candidate = controller.discover()[0]
+    controller._connected = True
+    controller._status = controller._parse_status(
+        parse_response(_status_line(1, 2, 0))
+    )
+
+    assert controller.set_position(Axis.X, 0.0)
+    transport.complete(0, "OK POSSET AXIS=X POS=0.000")
+    transport.complete(1, _status_line(0, 2, 0))
+
+    saved = store.load("MOTOR-A")
+    assert saved.trusted
+    assert saved.position == Position(0, 2, 0)
+
+
+def test_synchronous_transport_failure_rejects_motion_immediately(tmp_path):
+    application()
+    store = MotorStateStore(tmp_path / "motor.json")
+    store.confirm_position("MOTOR-A", Position(1, 2, 0))
+    transport = SynchronousFailTransport()
+    controller = MotorController(
+        transport=transport,
+        state_store=store,
+        port_provider=lambda: PORTS[:1],
+    )
+    controller._confirmed_candidate = controller.discover()[0]
+    controller._connected = True
+    controller._status = controller._parse_status(
+        parse_response(_status_line(1, 2, 0))
+    )
+
+    assert (
+        controller.move_relative(Axis.X, 1.0, Direction.POSITIVE)
+        is None
+    )
+    assert controller.motion_active is False
     assert store.load("MOTOR-A").trusted is False

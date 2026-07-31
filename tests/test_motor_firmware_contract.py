@@ -126,3 +126,13 @@ def test_interrupt_handlers_do_not_send_usb_or_delay():
     callback = source[source.index("void HAL_GPIO_EXTI_Callback") :]
     assert "USB_Send_Response" not in callback
     assert "HAL_Delay" not in callback
+
+
+def test_imported_motor_hardware_contains_no_laser_control():
+    sources = "\n".join(
+        _text(path)
+        for path in HARDWARE.iterdir()
+        if path.suffix.lower() in {".c", ".h"}
+    )
+    assert "SCAN_LD_" not in sources
+    assert "激光" not in sources

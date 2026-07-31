@@ -134,11 +134,6 @@ class MotorSerialTransport(QtCore.QObject):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_timeout)
 
-        if self._own_thread:
-            self._thread = QtCore.QThread(self)
-            self._worker.moveToThread(self._thread)
-            self._thread.start()
-
         self.open_requested.connect(self._worker.open_port)
         self.close_requested.connect(self._worker.close_port)
         self.write_requested.connect(self._worker.write)
@@ -159,8 +154,16 @@ class MotorSerialTransport(QtCore.QObject):
     def busy(self) -> bool:
         return self._active is not None or bool(self._queue)
 
+    def _ensure_thread(self):
+        if not self._own_thread or self._thread is not None:
+            return
+        self._thread = QtCore.QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.start()
+
     def connect_port(self, port_name: str, baud_rate: int = 115_200):
         self.disconnect_port()
+        self._ensure_thread()
         self._port_name = str(port_name)
         self.open_requested.emit(self._port_name, int(baud_rate))
 

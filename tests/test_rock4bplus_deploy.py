@@ -43,6 +43,10 @@ def test_udev_rule_is_scoped_and_not_world_writable():
     rule = (DEPLOY / "99-zgcai-spectrometer.rules").read_text(encoding="utf-8")
     assert 'idVendor}=="1a86"' in rule
     assert 'idProduct}=="fe0c"' in rule
+    assert 'idVendor}=="0483"' in rule
+    assert 'idProduct}=="5740"' in rule
+    assert rule.count('GROUP="dialout"') == 2
+    assert rule.count('MODE="0660"') == 2
     assert 'GROUP="dialout"' in rule
     assert 'MODE="0660"' in rule
     assert "0666" not in rule

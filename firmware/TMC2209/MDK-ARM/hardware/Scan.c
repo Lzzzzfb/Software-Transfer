@@ -210,8 +210,6 @@ void Scan_Stop(void)
     {
         scan_status.state = SCAN_IDLE;
         Scan_ResetRuntimeState();
-        // 发送关闭激光器指令
-        USB_Send_Response("SCAN_LD_OFF\r\n");
         // 发送停止扫描响应
         USB_Send_Response("SCAN_STOP\r\n");
     }
@@ -227,8 +225,6 @@ void Scan_Pause(void)
     if (scan_status.state == SCAN_RUNNING)
     {
         scan_status.state = SCAN_PAUSED;
-        // 发送关闭激光器指令
-        USB_Send_Response("SCAN_LD_OFF\r\n");
         // 发送暂停扫描响应
         USB_Send_Response("SCAN_PAUSE\r\n");
     }
@@ -268,17 +264,9 @@ void Scan_Update(void)
     {
         case 0: // 执行10*10mm扫描
             scan_step_complete = 0;
-            // 开始扫描前再次检查状态，确保只有在运行状态下才发送开启激光器指令
-            if (scan_status.state == SCAN_RUNNING)
-            {
-                // 开始扫描前打开激光器
-                USB_Send_Response("SCAN_LD_ON\r\n");
-            }
             Scan_10x10Grid();
             if (scan_step_complete == 1)
             {
-                // 扫描完成，关闭激光器
-                USB_Send_Response("SCAN_LD_OFF\r\n");
                 // 扫描完成，进入下一个步骤
                 scan_status.scan_step++;
                 scan_step_complete = 0;
@@ -288,8 +276,6 @@ void Scan_Update(void)
             
         case 1: // 扫描完成后复位
             scan_step_complete = 0;
-            // 确保激光器关闭
-            USB_Send_Response("SCAN_LD_OFF\r\n");
             Scan_Reset();
             if (scan_step_complete == 1)
             {
@@ -301,8 +287,6 @@ void Scan_Update(void)
             break;
             
         case 2: // 移动到下一个方格或换行
-            // 确保激光器关闭
-            USB_Send_Response("SCAN_LD_OFF\r\n");
             // 检查是否需要移动到下一个方格
             if (scan_status.current_grid_x < scan_status.config.grid_count_x - 1)
             {
@@ -329,8 +313,6 @@ void Scan_Update(void)
                 }
                 else
                 {
-                    // 完成所有扫描，确保激光器关闭
-                    USB_Send_Response("SCAN_LD_OFF\r\n");
                     scan_status.state = SCAN_COMPLETED;
                     USB_Send_Response("SCAN_COMPLETED\r\n");
                     scan_status.scan_step = 0;
