@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 
@@ -24,6 +25,14 @@ def test_complete_motor_firmware_project_is_present():
         FIRMWARE / "MDK-ARM" / "TMC2209" / "TMC2209.hex",
     }
     assert not {str(path.relative_to(ROOT)) for path in required if not path.is_file()}
+
+
+def test_checked_in_motor_hex_matches_recorded_sha256():
+    hex_path = FIRMWARE / "MDK-ARM" / "TMC2209" / "TMC2209.hex"
+    checksum_path = hex_path.with_suffix(hex_path.suffix + ".sha256")
+    recorded = checksum_path.read_text(encoding="ascii").split()[0]
+    actual = hashlib.sha256(hex_path.read_bytes()).hexdigest()
+    assert actual.casefold() == recorded.casefold()
 
 
 def test_motor_truth_constants_are_centralized():

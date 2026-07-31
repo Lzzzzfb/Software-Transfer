@@ -128,3 +128,15 @@
 - [ ] 实测最高可靠速度已记录；
 - [ ] 三轴方向配置已记录；
 - [ ] 未通过或待确认项没有被标记完成。
+
+## K. 当前固件构建记录
+
+以下记录仅证明工程能够构建，不代表已经完成烧录或实机验收：
+
+- 构建日期：2026-07-31；
+- Keil MDK：ARMCC V5.06 update 7（build 960）；
+- 结果：0 Error、0 Warning；
+- 程序大小：Code=35704，RO-data=1200，RW-data=404，ZI-data=9764；
+- HEX：`firmware/TMC2209/MDK-ARM/TMC2209/TMC2209.hex`；
+- SHA-256：`1843DBA2B80C58316CAE21EAE84744CE30093A032FB44CB6AF1B1F09D827D944`；
+- 烧录与 ROCK 4B+ 实机验证：待执行。
