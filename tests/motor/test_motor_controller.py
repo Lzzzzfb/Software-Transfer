@@ -1,11 +1,19 @@
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from spectrometer.motor.controller import MotorController
-from spectrometer.motor.models import Axis, Direction, Position
-from spectrometer.motor.protocol import parse_response
-from spectrometer.motor.state_store import MotorStateStore
+from spectrometer.motor.lk_md2202 import (
+    AxisConfiguration,
+    CommunicationConfiguration,
+    DeviceConfiguration,
+    DriverAxis,
+    RunCurrent,
+    relative_move_request,
+)
+from spectrometer.motor.models import Axis, Direction
+from spectrometer.motor.settings_store import MotorSettingsStore
 from spectrometer.qt import QtCore, QtWidgets, Signal
 
 
@@ -14,9 +22,7 @@ _APPLICATION = None
 
 def application():
     global _APPLICATION
-    _APPLICATION = (
-        QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    )
+    _APPLICATION = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     return _APPLICATION
 
 
@@ -32,223 +38,229 @@ class FakeTransport(QtCore.QObject):
         self.port_name = ""
         self.sent = []
         self.emergency = []
+        self.opened = []
 
     @property
     def busy(self):
         return False
 
-    def connect_port(self, port_name, baud_rate=115_200):
+    def connect_port(self, port_name, baud_rate=9600):
         self.connected = True
         self.port_name = port_name
+        self.opened.append((port_name, baud_rate))
         self.connection_changed.emit(True, "")
 
     def disconnect_port(self):
         self.connected = False
-        self.port_name = ""
 
-    def send_command(self, command, *, tag=None, timeout_ms=1000):
-        self.sent.append((bytes(command), tag, timeout_ms))
-        return self.connected
+    def send_request(self, request, **options):
+        self.sent.append((bytes(request), options))
+        if not self.connected:
+            self.command_failed.emit(options.get("tag"), "not_connected")
+            return False
+        return True
 
-    def send_emergency(self, command, *, reason="cancelled"):
-        self.emergency.append(bytes(command))
+    def send_emergency(self, requests, **_options):
+        self.emergency.append(tuple(bytes(request) for request in requests))
 
-    def shutdown(self, timeout_ms=1000):
+    def shutdown(self):
         self.disconnect_port()
 
-    def complete(self, index, line):
-        _command, tag, _timeout = self.sent[index]
-        self.command_completed.emit(tag, parse_response(line))
+    def complete_last(self, registers):
+        _request, options = self.sent[-1]
+        self.command_completed.emit(
+            options.get("tag"), SimpleNamespace(registers=tuple(registers))
+        )
 
 
-class SynchronousFailTransport(FakeTransport):
-    def send_command(self, command, *, tag=None, timeout_ms=1000):
-        self.sent.append((bytes(command), tag, timeout_ms))
-        self.command_failed.emit(tag, "not connected")
-        return False
+PORTS = [{
+    "port_name": "COM8",
+    "system_location": "COM8",
+    "serial_number": "RS485-A",
+    "vendor_id": 0x0403,
+    "product_id": 0x6001,
+}]
 
 
-PORTS = [
-    {
-        "port_name": "COM8",
-        "system_location": "COM8",
-        "serial_number": "MOTOR-A",
-        "vendor_id": 0x0483,
-        "product_id": 0x5740,
-    },
-    {
-        "port_name": "COM9",
-        "system_location": "COM9",
-        "serial_number": "UNKNOWN",
-        "vendor_id": 0x9999,
-        "product_id": 0x0001,
-    },
-]
+def identity_registers(name="LK-MD2202"):
+    raw = name.encode("ascii").ljust(20, b"\0")
+    name_regs = [int.from_bytes(raw[index:index + 2], "big") for index in range(0, 20, 2)]
+    return [0x0100, 0, 0, 0, 0, 0, *name_regs]
 
 
-def _status_line(x=0.0, y=0.0, z=0.0, *, moving=0, stop="DONE"):
-    return (
-        "OK STATUS "
-        f"X_POS={x:.3f} X_VALID=1 X_MOVING={moving} X_LIMIT=0 "
-        f"X_STOP={stop} X_HOME=IDLE "
-        f"Y_POS={y:.3f} Y_VALID=1 Y_MOVING=0 Y_LIMIT=0 "
-        "Y_STOP=DONE Y_HOME=IDLE "
-        f"Z_POS={z:.3f} Z_VALID=1 Z_MOVING=0 Z_LIMIT=0 "
-        "Z_STOP=DONE Z_HOME=IDLE FAULT=0"
-    )
-
-
-def test_auto_connect_requires_protocol_identity(tmp_path):
-    application()
-    transport = FakeTransport()
-    controller = MotorController(
-        transport=transport,
-        state_store=MotorStateStore(tmp_path / "motor.json"),
-        port_provider=lambda: PORTS,
-    )
-    confirmed = []
-    controller.connection_changed.connect(
-        lambda connected, detail: confirmed.append((connected, detail))
-    )
-
-    controller.connect_auto(excluded_ports={"COM7"})
-    assert transport.sent[0][0] == b"ID?\r\n"
-    transport.complete(0, "OK ID=NOT_MOTOR MOTOR_PROTOCOL=2")
-
-    assert transport.port_name == "COM9"
-    transport.complete(1, "OK ID=TMC2209 MOTOR_PROTOCOL=2")
-
-    assert controller.connected is True
-    assert controller.device_id == "UNKNOWN"
-    assert confirmed[-1] == (True, "COM9")
-
-
-def test_trusted_saved_coordinates_are_restored_to_same_device(tmp_path):
-    app = application()
-    store = MotorStateStore(tmp_path / "motor.json")
-    store.confirm_position("MOTOR-A", Position(1.0, 2.0, 0.0))
-    transport = FakeTransport()
-    controller = MotorController(
-        transport=transport,
-        state_store=store,
-        port_provider=lambda: PORTS[:1],
-    )
-
-    controller.connect_auto()
-    transport.complete(0, "OK ID=TMC2209 MOTOR_PROTOCOL=2")
-    app.processEvents()
-
-    assert [item[0] for item in transport.sent[1:4]] == [
-        b"POSSET=X:1.000\r\n",
-        b"POSSET=Y:2.000\r\n",
-        b"POSSET=Z:0.000\r\n",
+def axis_config_registers(config=AxisConfiguration()):
+    end_hi, end_lo = divmod(config.end_position_pulses, 0x10000)
+    speed_hi, speed_lo = divmod(config.position_speed_pps, 0x10000)
+    return [
+        int(config.step_angle), int(config.microstep), int(config.run_current),
+        int(config.limit_mode), end_hi, end_lo, 0, 0, 0,
+        int(config.stop_current), config.acceleration, config.deceleration,
+        0, 0, speed_hi, speed_lo,
     ]
 
 
-def test_motion_marks_state_dirty_then_confirms_reported_position(tmp_path):
-    app = application()
-    store = MotorStateStore(tmp_path / "motor.json")
-    store.confirm_position("MOTOR-A", Position(1.0, 2.0, 0.0))
+def connect_controller(tmp_path):
+    application()
     transport = FakeTransport()
     controller = MotorController(
         transport=transport,
-        state_store=store,
-        port_provider=lambda: PORTS[:1],
+        settings_store=MotorSettingsStore(tmp_path / "motor-settings.json"),
+        port_provider=lambda: PORTS,
     )
-    controller.connect_auto()
-    transport.complete(0, "OK ID=TMC2209 MOTOR_PROTOCOL=2")
-    for index in range(1, 4):
-        transport.complete(index, "OK POSSET AXIS=X POS=0.000")
-    transport.complete(4, _status_line(1, 2, 0))
+    assert controller.connect_auto()
+    assert transport.sent[-1][1]["tag"] == ("probe",)
+    transport.complete_last(identity_registers())
+    assert transport.sent[-1][1]["tag"] == ("init", "x_config")
+    transport.complete_last(axis_config_registers())
+    transport.complete_last(axis_config_registers())
+    transport.complete_last([1, 3, 8, 1, 0])
+    transport.complete_last([0, 0, 0, 0])
+    transport.complete_last([0, 0, 0, 0])
+    assert controller.connected
+    return controller, transport
 
+
+def test_auto_connect_uses_read_only_identity_then_reads_configuration(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    assert controller.device_id == "RS485-A"
+    assert all(item[0][1] == 0x03 for item in transport.sent[:6])
+    assert controller.configuration == DeviceConfiguration()
+
+
+def test_relative_move_uses_one_signed_32bit_modbus_action(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    operation_id = controller.move_relative(Axis.X, 1.0, Direction.POSITIVE)
+    assert operation_id
+    request, options = transport.sent[-1]
+    assert request == relative_move_request(1, DriverAxis.X, 320)
+    assert options["action"] is True
+    assert options.get("read_retries", 0) == 0
+
+
+def test_software_zero_allows_negative_coordinates_without_power_cycle_restore(tmp_path):
+    controller, _transport = connect_controller(tmp_path)
+    assert controller.clear_software_zero(Axis.X)
+    controller._axis_device_status[Axis.X] = SimpleNamespace(
+        position_pulses=-320,
+        moving=False,
+        limit_active=False,
+    )
+    controller._refresh_status()
+    assert controller.status.x.software_position_mm == -1.0
+    assert controller.status.x.calibrated is False
+
+
+def test_mechanical_home_establishes_calibrated_zero(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    operation_id = controller.home(Axis.X)
+    assert operation_id
+    transport.complete_last(())  # home write acknowledgement
+    controller._poll_motion()
+    transport.complete_last([1, 0, 0, 0])
+    assert controller.status.x.calibrated is True
+    assert controller.status.x.software_position_mm == 0.0
+
+
+def test_motion_action_timeout_reads_status_instead_of_retrying(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    completed = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: completed.append(
+            (operation_id, success, reason)
+        )
+    )
     operation_id = controller.move_relative(
         Axis.X, 1.0, Direction.POSITIVE
     )
-    assert operation_id
-    assert store.load("MOTOR-A").dirty is True
-    move_index = len(transport.sent) - 1
-    assert transport.sent[move_index][0] == b"MOVE1=1.000:1\r\n"
+    move_request, options = transport.sent[-1]
+    transport.command_failed.emit(options["tag"], "result_unknown")
+    assert transport.sent[-1][1]["tag"] == (
+        "motion_status",
+        operation_id,
+    )
+    assert transport.sent.count((move_request, options)) == 1
+    transport.complete_last([0, 0, 0, 320])
+    assert completed[-1] == (operation_id, True, "completed")
 
-    transport.complete(move_index, "OK MOVE MOTOR=1 MM=1.000 DIR=1")
+
+def test_home_requires_zero_limit_confirmation(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    failures = []
+    controller.motion_finished.connect(
+        lambda _operation_id, success, reason: failures.append(
+            (success, reason)
+        )
+    )
+    controller.home(Axis.X)
+    transport.complete_last(())
     controller._poll_motion()
-    status_index = len(transport.sent) - 1
-    transport.complete(status_index, _status_line(2, 2, 0))
-    app.processEvents()
-
-    restored = store.load("MOTOR-A")
-    assert restored.trusted is True
-    assert restored.position == Position(2, 2, 0)
+    transport.complete_last([0, 0, 0, 0])
+    assert failures[-1] == (False, "home_zero_limit_not_confirmed")
+    assert controller.status.x.calibrated is False
 
 
-def test_emergency_stop_invalidates_an_active_motion(tmp_path):
-    application()
-    store = MotorStateStore(tmp_path / "motor.json")
-    store.confirm_position("MOTOR-A", Position(1, 2, 0))
-    transport = FakeTransport()
-    controller = MotorController(
-        transport=transport,
-        state_store=store,
-        port_provider=lambda: PORTS[:1],
+def test_configuration_writes_only_changed_fields_then_reads_back(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    desired = DeviceConfiguration(
+        x=AxisConfiguration(run_current=RunCurrent.P37_5),
+        y=AxisConfiguration(),
     )
-    controller._confirmed_candidate = controller.discover()[0]
-    controller._connected = True
-    controller._status = controller._parse_status(
-        parse_response(_status_line(1, 2, 0))
+    before = len(transport.sent)
+    assert controller.apply_configuration(desired, controller.host_settings)
+    writes = transport.sent[before:]
+    assert len(writes) == 1
+    assert writes[0][0][1] == 0x06
+    assert writes[0][1]["tag"] == ("config_write", "X.run_current")
+    transport.complete_last(())
+    assert transport.sent[-1][1]["tag"] == ("init", "x_config")
+
+
+def test_scan_lease_rejects_configuration_write(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller.set_scan_active(True)
+    before = len(transport.sent)
+    assert not controller.apply_configuration(DeviceConfiguration(), controller.host_settings)
+    assert len(transport.sent) == before
+
+
+def test_reversed_axis_checks_logical_travel_and_accepts_negative_driver_position(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller.host_settings = controller.host_settings.__class__(reverse_x=True)
+    controller._calibrated[Axis.X] = True
+    controller._refresh_status()
+    operation_id = controller.move_relative(Axis.X, 1.0, Direction.POSITIVE)
+    assert operation_id
+    assert transport.sent[-1][0] == relative_move_request(1, DriverAxis.X, -320)
+
+    controller._active_motion = None
+    controller._axis_device_status[Axis.X] = SimpleNamespace(
+        position_pulses=-320,
+        moving=False,
+        limit_active=False,
     )
-    controller._active_motion = object()
-
-    controller.stop()
-
-    assert transport.emergency == [b"STOP\r\n"]
-    assert store.load("MOTOR-A").trusted is False
+    controller._refresh_status()
+    assert controller.status.x.mechanical_position_mm == 1.0
 
 
-def test_manual_coordinate_set_is_persisted_after_status_confirmation(
-    tmp_path,
-):
-    application()
-    store = MotorStateStore(tmp_path / "motor.json")
-    transport = FakeTransport()
-    transport.connected = True
-    controller = MotorController(
-        transport=transport,
-        state_store=store,
-        port_provider=lambda: PORTS[:1],
+def test_address_and_baud_changes_reconnect_between_each_write(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    desired = DeviceConfiguration(
+        communication=CommunicationConfiguration(address=7, baud_rate=19200)
     )
-    controller._confirmed_candidate = controller.discover()[0]
-    controller._connected = True
-    controller._status = controller._parse_status(
-        parse_response(_status_line(1, 2, 0))
-    )
+    assert controller.apply_configuration(desired, controller.host_settings)
 
-    assert controller.set_position(Axis.X, 0.0)
-    transport.complete(0, "OK POSSET AXIS=X POS=0.000")
-    transport.complete(1, _status_line(0, 2, 0))
+    address_request, options = transport.sent[-1]
+    assert options["tag"] == ("config_write", "communication.address")
+    assert address_request[0] == 1
+    transport.complete_last(())
+    assert transport.opened[-1] == ("COM8", 9600)
+    assert transport.sent[-1][1]["tag"] == ("config_reconnect",)
+    assert transport.sent[-1][0][0] == 7
 
-    saved = store.load("MOTOR-A")
-    assert saved.trusted
-    assert saved.position == Position(0, 2, 0)
-
-
-def test_synchronous_transport_failure_rejects_motion_immediately(tmp_path):
-    application()
-    store = MotorStateStore(tmp_path / "motor.json")
-    store.confirm_position("MOTOR-A", Position(1, 2, 0))
-    transport = SynchronousFailTransport()
-    controller = MotorController(
-        transport=transport,
-        state_store=store,
-        port_provider=lambda: PORTS[:1],
-    )
-    controller._confirmed_candidate = controller.discover()[0]
-    controller._connected = True
-    controller._status = controller._parse_status(
-        parse_response(_status_line(1, 2, 0))
-    )
-
-    assert (
-        controller.move_relative(Axis.X, 1.0, Direction.POSITIVE)
-        is None
-    )
-    assert controller.motion_active is False
-    assert store.load("MOTOR-A").trusted is False
+    transport.complete_last(identity_registers())
+    baud_request, options = transport.sent[-1]
+    assert options["tag"] == ("config_write", "communication.baud_rate")
+    assert baud_request[0] == 7
+    transport.complete_last(())
+    assert transport.opened[-1] == ("COM8", 19200)
+    assert transport.sent[-1][1]["tag"] == ("config_reconnect",)

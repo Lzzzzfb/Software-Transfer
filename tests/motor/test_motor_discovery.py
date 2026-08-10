@@ -1,59 +1,43 @@
-from spectrometer.motor.discovery import (
-    MOTOR_USB_PRODUCT_ID,
-    MOTOR_USB_VENDOR_ID,
-    find_motor_candidates,
-)
+from spectrometer.motor.discovery import find_motor_candidates
 
 
-def test_motor_vid_pid_candidate_is_prioritized_and_spectrometer_is_excluded():
-    ports = [
-        {
-            "port_name": "ttyACM1",
-            "vendor_id": 0x9999,
-            "product_id": 0x0001,
-            "serial_number": "",
-            "system_location": "/dev/ttyACM1",
-        },
-        {
-            "port_name": "ttyACM0",
-            "vendor_id": MOTOR_USB_VENDOR_ID,
-            "product_id": MOTOR_USB_PRODUCT_ID,
-            "serial_number": "MOTOR-001",
-            "system_location": "/dev/ttyACM0",
-        },
-        {
-            "port_name": "ttyUSB0",
-            "vendor_id": 0x1A86,
-            "product_id": 0xFE0C,
-            "serial_number": "SPECTROMETER",
-            "system_location": "/dev/ttyUSB0",
-        },
-    ]
+PORTS = [
+    {
+        "port_name": "ttyUSB1",
+        "system_location": "/dev/ttyUSB1",
+        "serial_number": "RS485-B",
+        "vendor_id": 0x0403,
+        "product_id": 0x6001,
+    },
+    {
+        "port_name": "ttyUSB0",
+        "system_location": "/dev/ttyUSB0",
+        "serial_number": "RS485-A",
+        "vendor_id": 0x1A86,
+        "product_id": 0x7523,
+    },
+]
 
-    candidates = find_motor_candidates(ports, excluded_ports={"ttyUSB0"})
 
-    assert [candidate.port_name for candidate in candidates] == [
-        "ttyACM0",
-        "ttyACM1",
-    ]
+def test_saved_port_is_prioritized_and_spectrometer_port_is_excluded():
+    candidates = find_motor_candidates(
+        PORTS,
+        excluded_ports={"/dev/ttyUSB0"},
+        preferred_port="/dev/ttyUSB1",
+    )
+    assert [candidate.port_name for candidate in candidates] == ["ttyUSB1"]
     assert candidates[0].preferred is True
-    assert candidates[0].stable_id == "MOTOR-001"
+    assert candidates[0].stable_id == "RS485-B"
 
 
-def test_only_protocol_handshake_can_confirm_a_candidate():
-    candidate = find_motor_candidates(
-        [
-            {
-                "port_name": "COM8",
-                "vendor_id": MOTOR_USB_VENDOR_ID,
-                "product_id": MOTOR_USB_PRODUCT_ID,
-                "serial_number": "",
-                "system_location": r"\\.\COM8",
-            }
-        ]
-    )[0]
-
-    assert candidate.preferred is True
+def test_usb_metadata_never_confirms_lk_md2202_identity():
+    candidate = find_motor_candidates(PORTS)[0]
     assert candidate.confirmed is False
-    assert candidate.stable_id == r"\\.\COM8"
 
+
+def test_candidates_are_stable_and_preferred_port_sorts_first():
+    candidates = find_motor_candidates(PORTS, preferred_port="ttyUSB1")
+    assert [candidate.port_name for candidate in candidates] == [
+        "ttyUSB1",
+        "ttyUSB0",
+    ]

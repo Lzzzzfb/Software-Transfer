@@ -31,11 +31,13 @@ def application():
 def _axis_status(axis, position):
     return MotorAxisStatus(
         axis=axis,
-        position_mm=position,
-        position_valid=True,
+        device_position_pulses=round(position * 320),
+        software_position_mm=position,
+        calibrated=True,
         moving=False,
         zero_limit_active=False,
         stop_reason="DONE",
+        mechanical_position_mm=position,
     )
 
 
@@ -44,7 +46,7 @@ class FakeMotorController(QtCore.QObject):
     connection_changed = Signal(bool, str)
     operation_failed = Signal(str)
 
-    def __init__(self, start=Position(0, 0, 0)):
+    def __init__(self, start=Position(0, 0)):
         super().__init__()
         self.connected = True
         self.device_id = "MOTOR-TEST"
@@ -52,7 +54,6 @@ class FakeMotorController(QtCore.QObject):
         self.status = MotorStatus(
             _axis_status(Axis.X, start.x_mm),
             _axis_status(Axis.Y, start.y_mm),
-            _axis_status(Axis.Z, start.z_mm),
         )
         self.moves = []
         self.stop_count = 0
@@ -71,13 +72,11 @@ class FakeMotorController(QtCore.QObject):
             positions = {
                 Axis.X: self.status.x.position_mm,
                 Axis.Y: self.status.y.position_mm,
-                Axis.Z: self.status.z.position_mm,
             }
             positions[axis] += distance * direction.sign
             self.status = MotorStatus(
                 _axis_status(Axis.X, positions[Axis.X]),
                 _axis_status(Axis.Y, positions[Axis.Y]),
-                _axis_status(Axis.Z, positions[Axis.Z]),
             )
         self.motion_active = False
         self._active = None
@@ -90,6 +89,9 @@ class FakeMotorController(QtCore.QObject):
         self._active = None
         if active is not None:
             self.motion_finished.emit(active[0], False, "user_stop")
+
+    def set_scan_active(self, active):
+        self.scan_active = bool(active)
 
 
 class FakeAcquisitionController(QtCore.QObject):

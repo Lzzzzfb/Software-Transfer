@@ -27,9 +27,8 @@ def application():
 
 def _status():
     return MotorStatus(
-        MotorAxisStatus(Axis.X, 1.25, True, False, False),
-        MotorAxisStatus(Axis.Y, 0.0, True, False, True),
-        MotorAxisStatus(Axis.Z, None, False, False, False),
+        MotorAxisStatus(Axis.X, 400, 1.25, True, False, False, mechanical_position_mm=1.25),
+        MotorAxisStatus(Axis.Y, 0, 0.0, True, False, True, mechanical_position_mm=0.0),
     )
 
 
@@ -48,9 +47,8 @@ class FakeUiMotor(QtCore.QObject):
         self.device_id = "MOTOR-UI"
         self.motion_active = False
         self.status = MotorStatus(
-            MotorAxisStatus(Axis.X, 0.0, True, False, True),
-            MotorAxisStatus(Axis.Y, 0.0, True, False, True),
-            MotorAxisStatus(Axis.Z, 0.0, True, False, True),
+            MotorAxisStatus(Axis.X, 0, 0.0, True, False, True, mechanical_position_mm=0.0),
+            MotorAxisStatus(Axis.Y, 0, 0.0, True, False, True, mechanical_position_mm=0.0),
         )
         self.moves = []
 
@@ -109,7 +107,7 @@ def test_motor_panel_defaults_match_confirmed_scan_contract():
     assert sum(
         button.text() == "机械回零"
         for button in panel.findChildren(QtWidgets.QPushButton)
-    ) == 3
+    ) == 2
 
 
 def test_motor_panel_emits_manual_and_scan_requests():
@@ -145,13 +143,10 @@ def test_motor_panel_displays_coordinates_limits_and_scan_lock():
 
     assert panel.findChild(
         QtWidgets.QLabel, "motorXCoordinate"
-    ).text() == "1.2500 mm"
+    ).text() == "1.2500 mm 已校准"
     assert panel.findChild(
         QtWidgets.QLabel, "motorYCoordinate"
-    ).text() == "0.0000 mm"
-    assert panel.findChild(
-        QtWidgets.QLabel, "motorZCoordinate"
-    ).text() == "坐标不可信"
+    ).text() == "0.0000 mm 已校准"
     y_limit = panel._axis_controls[Axis.Y]["limit"]
     assert y_limit.property("active") is True
 

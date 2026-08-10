@@ -44,6 +44,8 @@ class ScanManifestWriter:
             "finished_at": "",
             "parameters": asdict(plan.parameters),
             "start_position": asdict(plan.start),
+            "calibrated_start": plan.calibrated_start,
+            "pulses_per_mm": 320,
             "motor_device_id": str(motor_device_id),
             "spectrometer_device_ids": list(spectrometer_device_ids),
             "rounds": [

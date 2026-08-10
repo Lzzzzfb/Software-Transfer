@@ -8,7 +8,8 @@ version = "2.0.0"
 description = "ZGCAI multi-device spectrometer acquisition and analysis workstation"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "PySide6>=6.7,<7",
+  "PyQt6>=6.7,<7",
+  "pyqtgraph>=0.13.7,<0.14",
   "numpy>=1.26,<3",
   "scipy>=1.11,<2",
   "XlsxWriter>=3.2,<4",

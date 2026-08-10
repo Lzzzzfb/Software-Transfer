@@ -32,7 +32,7 @@ from ..domain.models import SpectrumFrame, SpectrumReference
 from ..motor.controller import MotorController
 from ..motor.models import Axis
 from ..motor.scan_controller import ScanController, ScanState
-from ..motor.state_store import MotorStateStore
+from ..motor.settings_store import MotorSettingsStore
 from ..processing.calibration_repository import IntensityCalibrationRepository
 from ..processing.display_service import DisplayProcessingService
 from ..processing.formula import FormulaError, validate_formula
@@ -40,7 +40,7 @@ from ..processing.profile_repository import ProcessingProfileRepository
 from ..processing.profiles import AirplsProfile, resolve_effective_profile
 from ..processing.processor import ProcessingSnapshot, SpectrumProcessor
 from ..processing.references import ReferenceRepository
-from ..qt import QtCore, QtWidgets, dialog_exec
+from ..qt import QT_API, QtCore, QtWidgets, dialog_exec
 from ..services.settings_service import SettingsService
 from ..services.platform_paths import (
     config_directory,
@@ -59,6 +59,10 @@ from .diagnostics import DiagnosticsPanel
 from .history_viewer import HistoryViewer
 from .input_controls import NoWheelComboBox
 from .motor_panel import MotorPanel
+from .motor_settings_dialog import (
+    MotorSettingsDialog,
+    configuration_differences,
+)
 from .plot_backend import create_spectrum_plot_widget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
@@ -129,8 +133,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.motor_controller = motor_controller or MotorController(
             self,
-            state_store=MotorStateStore(
-                self._configuration_root / "motor-state.json"
+            settings_store=MotorSettingsStore(
+                self._configuration_root / "motor-settings.json"
             ),
         )
         self.scan_controller = scan_controller or ScanController(
@@ -179,6 +183,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "active": self._plot_backend_info.active,
                 "fallback_reason": self._plot_backend_info.fallback_reason,
             },
+        )
+        self.diagnostic_recorder.record_event(
+            "qt_binding_selected", {"qt_api": QT_API}
         )
         self.diagnostics.append(
             f"实时绘图后端：{self._plot_backend_info.active}",
@@ -408,6 +415,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.motor_panel.scan_stop_requested.connect(
             self.scan_controller.stop
         )
+        self.motor_panel.settings_requested.connect(
+            self.open_motor_settings
+        )
         self.motor_controller.candidates_changed.connect(
             self.motor_panel.set_candidates
         )
@@ -481,9 +491,58 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect_motor(self):
         self.status_panel.state_label.setText("正在识别电机串口…")
+        host = self.motor_controller.host_settings
+        if not host.automatic_port and host.port_name:
+            return self.motor_controller.connect_manual(
+                host.port_name, host.address, host.baud_rate
+            )
         return self.motor_controller.connect_auto(
             self._motor_excluded_ports()
         )
+
+    def open_motor_settings(self):
+        dialog = MotorSettingsDialog(
+            self.motor_controller.host_settings,
+            self.motor_controller.configuration,
+            self,
+        )
+
+        def apply_settings(host_settings, device_configuration):
+            if self.motor_controller.connected:
+                differences = configuration_differences(
+                    self.motor_controller.configuration,
+                    device_configuration,
+                    self.motor_controller.host_settings,
+                    host_settings,
+                )
+                if differences:
+                    answer = QtWidgets.QMessageBox.question(
+                        dialog,
+                        "确认电机参数修改",
+                        "将应用以下修改：\n\n" + "\n".join(differences),
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if answer != QtWidgets.QMessageBox.Yes:
+                        dialog.set_apply_result(False, "已取消，未写入驱动板")
+                        return
+                self.motor_controller.apply_configuration(
+                    device_configuration, host_settings
+                )
+            else:
+                self.motor_controller.update_host_settings(host_settings)
+
+        dialog.apply_requested.connect(apply_settings)
+        self.motor_controller.configuration_apply_finished.connect(
+            dialog.set_apply_result
+        )
+        dialog_exec(dialog)
+        try:
+            self.motor_controller.configuration_apply_finished.disconnect(
+                dialog.set_apply_result
+            )
+        except (RuntimeError, TypeError):
+            pass
 
     def _motor_connection_changed(self, connected, detail):
         self.motor_panel.set_connection_state(connected, detail)
@@ -529,6 +588,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if not device_ids:
             self._scan_operation_failed("没有参与扫描采集的光谱仪")
             return False
+        calibrated = (
+            self.motor_controller.status.x.calibrated
+            and self.motor_controller.status.y.calibrated
+        )
+        if not calibrated:
+            answer = QtWidgets.QMessageBox.warning(
+                self,
+                "坐标未校准",
+                "X/Y 尚未完成机械回零，软件无法保证扫描矩阵不会越程。"
+                "是否仍要继续扫描？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return False
         self.scan_controller.set_manifest_directory(
             Path(self.settings["storage_path"]) / "scan-manifests"
         )
@@ -542,6 +616,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.settings["storage_format"]
             ),
             batch_size=int(self.settings["batch_size"]),
+            allow_uncalibrated=not calibrated,
         )
 
     def _set_scan_ui_locked(self, locked):
@@ -556,6 +631,7 @@ class MainWindow(QtWidgets.QMainWindow):
         state = ScanState(state)
         self.motor_panel.set_scan_state(state)
         self._set_scan_ui_locked(self.scan_controller.active)
+        self._log(f"扫描状态：{state.value}")
         if state is ScanState.STOPPING_ACQUISITION:
             self.status_panel.state_label.setText(
                 "扫描轮次完成，正在停止光谱仪并保存…"

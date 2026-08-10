@@ -2,7 +2,11 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from spectrometer.motor.protocol import build_id_command, build_stop_command
+from spectrometer.motor.modbus_rtu import (
+    append_crc,
+    build_read_holding,
+    build_write_single,
+)
 from spectrometer.motor.transport import MotorSerialTransport
 from spectrometer.qt import QtCore, QtWidgets, Signal, Slot
 
@@ -12,103 +16,115 @@ _APPLICATION = None
 
 def application():
     global _APPLICATION
-    _APPLICATION = (
-        QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    )
+    _APPLICATION = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     return _APPLICATION
+
+
+def read_response(address, *registers):
+    payload = bytearray((address, 0x03, len(registers) * 2))
+    for value in registers:
+        payload.extend(int(value).to_bytes(2, "big"))
+    return append_crc(payload)
 
 
 class FakeSerialWorker(QtCore.QObject):
     opened = Signal(bool, str)
     closed = Signal()
-    line_received = Signal(str)
+    bytes_received = Signal(object)
     connection_lost = Signal(str)
 
     def __init__(self):
         super().__init__()
         self.opened_ports = []
         self.writes = []
-        self.close_count = 0
 
     @Slot(str, int)
     def open_port(self, port_name, baud_rate):
         self.opened_ports.append((port_name, baud_rate))
         self.opened.emit(True, "")
 
-    @Slot(QtCore.QByteArray)
+    @Slot(object)
     def write(self, data):
         self.writes.append(bytes(data))
 
     @Slot()
     def close_port(self):
-        self.close_count += 1
         self.closed.emit()
 
 
-def test_transport_serializes_commands_and_parses_responses():
+def test_transport_serializes_binary_requests_and_parses_split_frames():
     app = application()
     worker = FakeSerialWorker()
     transport = MotorSerialTransport(worker=worker, own_thread=False)
     completed = []
-    transport.command_completed.connect(
-        lambda tag, response: completed.append((tag, response))
-    )
+    transport.command_completed.connect(lambda tag, response: completed.append((tag, response)))
 
-    transport.connect_port("COM8")
-    assert transport.connected
-    transport.send_command(build_id_command(), tag="identify")
-    transport.send_command(build_stop_command(), tag="stop")
+    first = build_read_holding(1, 0, 1)
+    second = build_read_holding(1, 0x20, 1)
+    transport.connect_port("COM8", 9600)
+    transport.send_request(first, tag="identity")
+    transport.send_request(second, tag="status")
     app.processEvents()
+    assert worker.writes == [first]
 
-    assert worker.writes == [b"ID?\r\n"]
-    worker.line_received.emit("OK ID=TMC2209 MOTOR_PROTOCOL=2")
+    response = read_response(1, 0x1234)
+    worker.bytes_received.emit(response[:3])
+    worker.bytes_received.emit(response[3:])
     app.processEvents()
-    assert worker.writes == [b"ID?\r\n", b"STOP\r\n"]
-    assert completed[0][0] == "identify"
-    assert completed[0][1].fields["ID"] == "TMC2209"
-
-    worker.line_received.emit("OK STOP")
-    app.processEvents()
-    assert [item[0] for item in completed] == ["identify", "stop"]
+    assert worker.writes == [first, second]
+    assert completed[0][0] == "identity"
+    assert completed[0][1].registers == (0x1234,)
 
 
-def test_timed_out_movement_is_not_retried():
+def test_read_timeout_retries_but_action_timeout_does_not():
     app = application()
     worker = FakeSerialWorker()
     transport = MotorSerialTransport(worker=worker, own_thread=False)
-    failed = []
-    transport.command_failed.connect(
-        lambda tag, reason: failed.append((tag, reason))
-    )
-
+    failures = []
+    transport.command_failed.connect(lambda tag, reason: failures.append((tag, reason)))
     transport.connect_port("COM8")
-    transport.send_command(b"MOVE1=1.000:1\r\n", tag="move", timeout_ms=10)
+
+    read = build_read_holding(1, 0, 1)
+    transport.send_request(read, tag="read", read_retries=1)
     app.processEvents()
     transport._on_timeout()
+    transport._on_timeout()
+    assert worker.writes == [read, read]
+    assert failures == [("read", "timeout")]
+
+    action = build_write_single(1, 0x24, 1)
+    transport.send_request(action, tag="move", read_retries=5, action=True)
     app.processEvents()
+    transport._on_timeout()
+    assert worker.writes[-1] == action
+    assert worker.writes.count(action) == 1
+    assert failures[-1] == ("move", "result_unknown")
 
-    assert worker.writes == [b"MOVE1=1.000:1\r\n"]
-    assert failed == [("move", "timeout")]
 
-
-def test_connection_loss_clears_active_and_queued_transactions():
+def test_connection_loss_fails_active_and_queued_transactions():
     app = application()
     worker = FakeSerialWorker()
     transport = MotorSerialTransport(worker=worker, own_thread=False)
-    failed = []
-    transport.command_failed.connect(
-        lambda tag, reason: failed.append((tag, reason))
-    )
-
+    failures = []
+    transport.command_failed.connect(lambda tag, reason: failures.append((tag, reason)))
     transport.connect_port("COM8")
-    transport.send_command(build_id_command(), tag="one")
-    transport.send_command(build_stop_command(), tag="two")
+    transport.send_request(build_read_holding(1, 0, 1), tag="one")
+    transport.send_request(build_read_holding(1, 1, 1), tag="two")
     worker.connection_lost.emit("device removed")
     app.processEvents()
+    assert failures == [("one", "device removed"), ("two", "device removed")]
 
-    assert transport.connected is False
-    assert failed == [
-        ("one", "device removed"),
-        ("two", "device removed"),
-    ]
 
+def test_read_response_register_count_must_match_request():
+    app = application()
+    worker = FakeSerialWorker()
+    transport = MotorSerialTransport(worker=worker, own_thread=False)
+    failures = []
+    transport.command_failed.connect(lambda tag, reason: failures.append((tag, reason)))
+    transport.connect_port("COM8")
+    transport.send_request(build_read_holding(1, 0, 2), tag="read-two")
+    worker.bytes_received.emit(read_response(1, 0x1234))
+    app.processEvents()
+    assert failures
+    assert failures[-1][0] == "read-two"
+    assert "register count" in failures[-1][1]

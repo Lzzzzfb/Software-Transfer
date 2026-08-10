@@ -128,6 +128,7 @@ class ScanController(QtCore.QObject):
         master_device_id=None,
         storage_format=StorageFormat.CSV_EXCEL,
         batch_size: int = 500,
+        allow_uncalibrated: bool = False,
     ) -> bool:
         if self.active:
             self.operation_failed.emit("扫描任务正在运行")
@@ -138,24 +139,27 @@ class ScanController(QtCore.QObject):
                 raise ValueError("电机控制器未连接")
             if self.motor.motion_active:
                 raise ValueError("电机正在执行其他运动")
+            if not getattr(self.motor, "mechanics_valid", True):
+                raise ValueError(
+                    "驱动板机械参数与 15 mm / 4800 pulse 换算不一致"
+                )
             status = self.motor.status
             if status.fault_latched:
                 raise ValueError("电机存在未清除故障")
-            if not status.x.position_valid or not status.y.position_valid:
+            calibrated = status.x.calibrated and status.y.calibrated
+            if not calibrated and not allow_uncalibrated:
                 raise ValueError(
-                    "X/Y 软件坐标不可信，请先确认坐标或执行机械回零"
+                    "X/Y 坐标未校准，需确认风险后才能扫描"
                 )
             ids = tuple(int(device_id) for device_id in device_ids)
             if not ids:
                 raise ValueError("没有参与扫描采集的光谱仪")
-            start_position = Position(
-                status.x.position_mm,
-                status.y.position_mm,
-                (
-                    status.z.position_mm
-                    if status.z.position_valid
-                    else 0.0
-                ),
+            start_position = (
+                Position(
+                    status.x.mechanical_position_mm,
+                    status.y.mechanical_position_mm,
+                )
+                if calibrated else None
             )
             plan = build_scan_plan(parameters, start=start_position)
             config = ScanAcquisitionConfig(
@@ -183,6 +187,8 @@ class ScanController(QtCore.QObject):
         self._failure_reason = ""
         self._user_stopping = False
         self._finished_emitted = False
+        if hasattr(self.motor, "set_scan_active"):
+            self.motor.set_scan_active(True)
         self._manifest.start(
             plan,
             motor_device_id=self.motor.device_id,
@@ -438,6 +444,8 @@ class ScanController(QtCore.QObject):
     def _emit_finished(self, success: bool, reason: str):
         if self._finished_emitted:
             return
+        if hasattr(self.motor, "set_scan_active"):
+            self.motor.set_scan_active(False)
         self._finished_emitted = True
         self.scan_finished.emit(
             bool(success),
