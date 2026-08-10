@@ -1,5 +1,8 @@
 # 电机控制器USB CDC协议
 
+> 历史协议：仅适用于 STM32/TMC2209 版本。当前 LK-MD2202 活动协议见
+> `lk-md2202-modbus-protocol.md`。
+
 ## 1. 传输
 
 - USB CDC；
