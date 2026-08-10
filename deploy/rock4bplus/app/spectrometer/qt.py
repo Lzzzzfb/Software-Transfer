@@ -4,11 +4,7 @@ import sys
 
 
 def _load_qt():
-    candidates = ("PyQt6", "PySide6", "PyQt5") if sys.platform.startswith("linux") else (
-        "PySide6",
-        "PyQt6",
-        "PyQt5",
-    )
+    candidates = ("PyQt6", "PySide6", "PyQt5")
     errors = []
     for candidate in candidates:
         try:
@@ -97,6 +93,15 @@ def _install_flat_enum_aliases():
             {
                 "Apply": ("StandardButton", "Apply"),
                 "Close": ("StandardButton", "Close"),
+                "Ok": ("StandardButton", "Ok"),
+                "Cancel": ("StandardButton", "Cancel"),
+            },
+        ),
+        (
+            QtWidgets.QMessageBox,
+            {
+                "Yes": ("StandardButton", "Yes"),
+                "No": ("StandardButton", "No"),
                 "Ok": ("StandardButton", "Ok"),
                 "Cancel": ("StandardButton", "Cancel"),
             },

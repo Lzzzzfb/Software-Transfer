@@ -1,4 +1,4 @@
-"""Pure motor domain models shared by the UI and transport layers."""
+"""Two-axis motor domain models shared by UI, scan and controller layers."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from enum import Enum
 import math
 
 
-MOTOR_PULSES_PER_MM = 640
+MOTOR_PULSES_PER_MM = 320
 MOTOR_TRAVEL_MM = 15.0
 MOTOR_SPEED_MIN_HZ = 100
 MOTOR_SPEED_MAX_HZ = 14_000
@@ -18,11 +18,10 @@ MINIMUM_MOVE_MM = 1.0 / MOTOR_PULSES_PER_MM
 class Axis(str, Enum):
     X = "X"
     Y = "Y"
-    Z = "Z"
 
     @property
-    def motor_number(self) -> int:
-        return {Axis.X: 1, Axis.Y: 2, Axis.Z: 3}[self]
+    def motor_number(self):
+        return 1 if self is Axis.X else 2
 
 
 class Direction(int, Enum):
@@ -30,11 +29,7 @@ class Direction(int, Enum):
     POSITIVE = 1
 
     @property
-    def protocol_value(self) -> int:
-        return int(self.value)
-
-    @property
-    def sign(self) -> int:
+    def sign(self):
         return 1 if self is Direction.POSITIVE else -1
 
 
@@ -42,28 +37,16 @@ class Direction(int, Enum):
 class Position:
     x_mm: float
     y_mm: float
-    z_mm: float = 0.0
 
     def __post_init__(self):
-        for name, value in (
-            ("x", self.x_mm),
-            ("y", self.y_mm),
-            ("z", self.z_mm),
-        ):
+        for name, value in (("x", self.x_mm), ("y", self.y_mm)):
             if not math.isfinite(value):
                 raise ValueError(f"{name} position must be finite")
-            if not 0.0 <= value <= MOTOR_TRAVEL_MM:
-                raise ValueError(
-                    f"{name} position must be between 0 and "
-                    f"{MOTOR_TRAVEL_MM:g} mm"
-                )
+            if not 0 <= value <= MOTOR_TRAVEL_MM:
+                raise ValueError(f"{name} position must be between 0 and 15 mm")
 
-    def for_axis(self, axis: Axis) -> float:
-        return {
-            Axis.X: self.x_mm,
-            Axis.Y: self.y_mm,
-            Axis.Z: self.z_mm,
-        }[Axis(axis)]
+    def for_axis(self, axis):
+        return self.x_mm if Axis(axis) is Axis.X else self.y_mm
 
 
 @dataclass(frozen=True)
@@ -74,73 +57,60 @@ class MotorConfiguration:
         if isinstance(self.speed_hz, bool) or not isinstance(self.speed_hz, int):
             raise ValueError("speed must be an integer pulse frequency")
         if not MOTOR_SPEED_MIN_HZ <= self.speed_hz <= MOTOR_SPEED_MAX_HZ:
-            raise ValueError(
-                f"speed must be between {MOTOR_SPEED_MIN_HZ} and "
-                f"{MOTOR_SPEED_MAX_HZ} pulse/s"
-            )
+            raise ValueError("speed must be between 100 and 14000 pulse/s")
 
 
 @dataclass(frozen=True)
 class MotorAxisStatus:
     axis: Axis
-    position_mm: float | None
-    position_valid: bool
+    device_position_pulses: int | None
+    software_position_mm: float | None
+    calibrated: bool
     moving: bool
     zero_limit_active: bool
-    fault_latched: bool = False
     stop_reason: str = "NONE"
-    home_state: str = "IDLE"
+    mechanical_position_mm: float | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "axis", Axis(self.axis))
-        if self.position_valid and self.position_mm is None:
-            raise ValueError("position is required when position_valid is true")
-        if self.position_mm is not None:
-            if not math.isfinite(self.position_mm):
-                raise ValueError("position must be finite")
-            if not 0.0 <= self.position_mm <= MOTOR_TRAVEL_MM:
-                raise ValueError(
-                    f"position must be between 0 and {MOTOR_TRAVEL_MM:g} mm"
-                )
+        if self.software_position_mm is not None and not math.isfinite(self.software_position_mm):
+            raise ValueError("software position must be finite")
+        if self.mechanical_position_mm is not None and not math.isfinite(self.mechanical_position_mm):
+            raise ValueError("mechanical position must be finite")
+
+    @property
+    def position_mm(self):
+        return self.software_position_mm
+
+    @property
+    def position_valid(self):
+        return self.calibrated
 
 
 @dataclass(frozen=True)
 class MotorStatus:
     x: MotorAxisStatus
     y: MotorAxisStatus
-    z: MotorAxisStatus
+    fault_latched: bool = False
 
     def __post_init__(self):
-        if (self.x.axis, self.y.axis, self.z.axis) != (
-            Axis.X,
-            Axis.Y,
-            Axis.Z,
-        ):
-            raise ValueError("motor status axes must be X, Y, Z")
+        if (self.x.axis, self.y.axis) != (Axis.X, Axis.Y):
+            raise ValueError("motor status axes must be X and Y")
 
     @property
-    def moving(self) -> bool:
-        return self.x.moving or self.y.moving or self.z.moving
+    def moving(self):
+        return self.x.moving or self.y.moving
 
     @property
-    def fault_latched(self) -> bool:
-        return (
-            self.x.fault_latched
-            or self.y.fault_latched
-            or self.z.fault_latched
-        )
-
-    @property
-    def position(self) -> Position | None:
-        if not (
-            self.x.position_valid
-            and self.y.position_valid
-            and self.z.position_valid
+    def position(self):
+        if (
+            not self.x.calibrated
+            or not self.y.calibrated
+            or self.x.mechanical_position_mm is None
+            or self.y.mechanical_position_mm is None
         ):
             return None
         return Position(
-            self.x.position_mm,
-            self.y.position_mm,
-            self.z.position_mm,
+            self.x.mechanical_position_mm,
+            self.y.mechanical_position_mm,
         )
-

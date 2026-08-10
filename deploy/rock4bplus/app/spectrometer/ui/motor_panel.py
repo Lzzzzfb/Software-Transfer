@@ -30,6 +30,7 @@ class MotorPanel(QtWidgets.QWidget):
     clear_fault_requested = Signal()
     scan_start_requested = Signal(object)
     scan_stop_requested = Signal()
+    settings_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -79,6 +80,9 @@ class MotorPanel(QtWidgets.QWidget):
         self.disconnect_button = QtWidgets.QPushButton("断开")
         self.disconnect_button.clicked.connect(self.disconnect_requested)
         row.addWidget(self.disconnect_button)
+        self.settings_button = QtWidgets.QPushButton("电机设置")
+        self.settings_button.clicked.connect(self.settings_requested)
+        row.addWidget(self.settings_button)
         self.stop_button = QtWidgets.QPushButton("急停")
         self.stop_button.setObjectName("motorStopButton")
         self.stop_button.clicked.connect(self.stop_requested)
@@ -101,7 +105,7 @@ class MotorPanel(QtWidgets.QWidget):
             label.setObjectName("motorColumnHeader")
             layout.addWidget(label, 0, column)
 
-        for row, axis in enumerate((Axis.X, Axis.Y, Axis.Z), start=1):
+        for row, axis in enumerate((Axis.X, Axis.Y), start=1):
             axis_label = QtWidgets.QLabel(axis.value)
             axis_label.setObjectName("motorAxisLabel")
             layout.addWidget(axis_label, row, 0)
@@ -137,7 +141,7 @@ class MotorPanel(QtWidgets.QWidget):
 
             distance = DirectDoubleSpinBox()
             distance.setDecimals(4)
-            distance.setRange(1.0 / 640.0, MOTOR_TRAVEL_MM)
+            distance.setRange(1.0 / 320.0, MOTOR_TRAVEL_MM)
             distance.setSingleStep(0.1)
             distance.setValue(1.0)
             distance.setObjectName(f"motor{axis.value}Distance")
@@ -232,13 +236,13 @@ class MotorPanel(QtWidgets.QWidget):
 
         self.scan_x = DirectDoubleSpinBox()
         self.scan_x.setDecimals(4)
-        self.scan_x.setRange(1.0 / 640.0, MOTOR_TRAVEL_MM)
+        self.scan_x.setRange(1.0 / 320.0, MOTOR_TRAVEL_MM)
         self.scan_x.setValue(10.0)
         self._scan_input(layout, 0, 0, "X 行程 mm", self.scan_x, "scanX")
 
         self.scan_y = DirectDoubleSpinBox()
         self.scan_y.setDecimals(4)
-        self.scan_y.setRange(1.0 / 640.0, MOTOR_TRAVEL_MM)
+        self.scan_y.setRange(1.0 / 320.0, MOTOR_TRAVEL_MM)
         self.scan_y.setValue(1.0)
         self._scan_input(layout, 0, 1, "Y 行程 mm", self.scan_y, "scanY")
 
@@ -346,14 +350,12 @@ class MotorPanel(QtWidgets.QWidget):
         for axis, axis_status in (
             (Axis.X, status.x),
             (Axis.Y, status.y),
-            (Axis.Z, status.z),
         ):
             coordinate = self._axis_controls[axis]["coordinate"]
             coordinate.setText(
-                f"{axis_status.position_mm:.4f} mm"
-                if axis_status.position_valid
-                and axis_status.position_mm is not None
-                else "坐标不可信"
+                (f"{axis_status.position_mm:.4f} mm "
+                 + ("已校准" if axis_status.calibrated else "未校准"))
+                if axis_status.position_mm is not None else "坐标不可用"
             )
             limit = self._axis_controls[axis]["limit"]
             limit.setText(
@@ -414,6 +416,7 @@ class MotorPanel(QtWidgets.QWidget):
         self.clear_fault_button.setEnabled(
             self._connected and not self._motion_active and not self._scan_active
         )
+        self.settings_button.setEnabled(not self._motion_active and not self._scan_active)
         for control in self._scan_inputs:
             control.setEnabled(not self._scan_active)
         self.scan_start_button.setEnabled(

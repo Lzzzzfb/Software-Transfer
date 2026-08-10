@@ -36,8 +36,9 @@
   初始范围和完整十进制刻度；滚轮和右键缩放已禁用。
 - 所有参数数值框仅允许直接输入，数值框与下拉框均屏蔽滚轮误操作。
 - 现代化双层工具带、设备侧栏、实时/历史/诊断页和状态栏。
-- 实时光谱页下方集成 X/Y/Z 电机连接、速度、正反向定距、软件坐标、
-  软件回零和可选机械回零；软件坐标范围固定为 0～15 mm。
+- 实时光谱页下方集成 LK-MD2202 的 X/M1、Y/M2 连接、速度、正反向定距、
+  软件坐标、软件回零和可选机械回零；零点开关闭合接地，机械行程 15 mm，
+  换算固定为 320 pulse/mm。
 - 扫描总控按 X 蛇形往返、Y 逐行推进执行，每轮在第一段 X 前启动连续光谱
   采集，最后一段 X 后停止并保存，再无采集返回起点；支持 X/Y 分步、步时和
   多轮扫描。
@@ -57,7 +58,7 @@ cd rock4bplus
 sudo ./install.sh
 ```
 
-注销并重新登录、重新插拔光谱仪和电机控制器后，从应用菜单或桌面快捷方式手动启动。也可运行：
+注销并重新登录、重新插拔光谱仪和 USB-RS485 后，从应用菜单或桌面快捷方式手动启动。也可运行：
 
 ```bash
 /opt/zgcai-spectrometer/run.sh
@@ -79,9 +80,17 @@ ZGCAI_PLOT_BACKEND=legacy /opt/zgcai-spectrometer/run.sh
 /opt/zgcai-spectrometer/run.sh --ports ttyACM0
 ```
 
+LK-MD2202 可先用只读探针核对身份、配置和状态，不会写参数或触发运动：
+
+```bash
+cd /opt/zgcai-spectrometer
+./.venv/bin/python -m spectrometer.motor.probe --json
+```
+
 配置位于 `~/.config/ZGCAI/Spectrometer/`，默认数据目录为
-`~/ZGCAI-Spectrometer-Data/`。电机软件坐标保存在配置目录，
-每次扫描的轮次、光谱文件和完成状态保存在数据目录下的
+`~/ZGCAI-Spectrometer-Data/`。电机端口、地址、波特率和方向反转保存在配置目录；
+软件零点与回零校准状态仅在本次运行内有效，不做掉电恢复。每次扫描的轮次、
+光谱文件和完成状态保存在数据目录下的
 `scan-manifests/`。第一阶段只提供手动启动，不配置开机自启。
 
 ## 自动测试
