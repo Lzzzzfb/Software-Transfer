@@ -15,7 +15,7 @@ ROCK 4B+、RS-485 电气、方向、限位、距离、温升或负载验收。
 - 扫描占用、停止与故障清理；
 - ROCK 4B+ 部署源码镜像检查。
 
-自动化结果：`368 passed, 1 skipped`。跳过项是当前 Windows 环境未安装
+自动化结果：`369 passed, 1 skipped`。跳过项是当前 Windows 环境未安装
 PyQtGraph 的可选后端测试；ROCK 4B+ 安装脚本会安装并断言 PyQtGraph 实际使用
 PyQt6，因此该项必须在板端重新执行，不能视为已经验收。
 
