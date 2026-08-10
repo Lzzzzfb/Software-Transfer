@@ -85,7 +85,6 @@ class MotorSerialWorker(QtCore.QObject):
         if self._serial is not None:
             self.bytes_received.emit(bytes(self._serial.readAll()))
 
-    @Slot(object)
     def _on_error(self, error):
         if error == _serial_enum("SerialPortError", "ResourceError"):
             self.connection_lost.emit(

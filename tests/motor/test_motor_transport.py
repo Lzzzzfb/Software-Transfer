@@ -7,8 +7,8 @@ from spectrometer.motor.modbus_rtu import (
     build_read_holding,
     build_write_single,
 )
-from spectrometer.motor.transport import MotorSerialTransport
-from spectrometer.qt import QtCore, QtWidgets, Signal, Slot
+from spectrometer.motor.transport import MotorSerialTransport, MotorSerialWorker
+from spectrometer.qt import QtCore, QtSerialPort, QtWidgets, Signal, Slot
 
 
 _APPLICATION = None
@@ -50,6 +50,17 @@ class FakeSerialWorker(QtCore.QObject):
     @Slot()
     def close_port(self):
         self.closed.emit()
+
+
+def test_qserialport_error_signal_accepts_motor_worker_callback():
+    app = application()
+    worker = MotorSerialWorker()
+    serial = QtSerialPort.QSerialPort()
+
+    serial.errorOccurred.connect(worker._on_error)
+    serial.errorOccurred.disconnect(worker._on_error)
+    serial.deleteLater()
+    app.processEvents()
 
 
 def test_transport_serializes_binary_requests_and_parses_split_frames():
