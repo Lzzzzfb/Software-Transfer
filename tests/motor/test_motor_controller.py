@@ -9,6 +9,7 @@ from spectrometer.motor.lk_md2202 import (
     CommunicationConfiguration,
     DeviceConfiguration,
     DriverAxis,
+    LEGACY_IDENTITY_REGISTERS,
     RunCurrent,
     relative_move_request,
 )
@@ -99,7 +100,7 @@ def axis_config_registers(config=AxisConfiguration()):
     ]
 
 
-def connect_controller(tmp_path):
+def connect_controller(tmp_path, identity_response=None):
     application()
     transport = FakeTransport()
     controller = MotorController(
@@ -109,11 +110,11 @@ def connect_controller(tmp_path):
     )
     assert controller.connect_auto()
     assert transport.sent[-1][1]["tag"] == ("probe",)
-    transport.complete_last(identity_registers())
+    transport.complete_last(identity_response or identity_registers())
     assert transport.sent[-1][1]["tag"] == ("init", "x_config")
     transport.complete_last(axis_config_registers())
     transport.complete_last(axis_config_registers())
-    transport.complete_last([1, 3, 8, 1, 0])
+    transport.complete_last([1, 3, 0, 0, 0])
     transport.complete_last([0, 0, 0, 0])
     transport.complete_last([0, 0, 0, 0])
     assert controller.connected
@@ -125,6 +126,32 @@ def test_auto_connect_uses_read_only_identity_then_reads_configuration(tmp_path)
     assert controller.device_id == "RS485-A"
     assert all(item[0][1] == 0x03 for item in transport.sent[:6])
     assert controller.configuration == DeviceConfiguration()
+
+
+def test_auto_connect_accepts_exact_legacy_identity_after_full_read_only_init(tmp_path):
+    controller, transport = connect_controller(tmp_path, LEGACY_IDENTITY_REGISTERS)
+    assert controller.connected
+    assert len(transport.sent) == 6
+    assert all(request[0][1] == 0x03 for request in transport.sent)
+
+
+def test_auto_connect_rejects_near_legacy_identity_before_initialization(tmp_path):
+    application()
+    transport = FakeTransport()
+    controller = MotorController(
+        transport=transport,
+        settings_store=MotorSettingsStore(tmp_path / "motor-settings.json"),
+        port_provider=lambda: PORTS,
+    )
+    failures = []
+    controller.operation_failed.connect(failures.append)
+    assert controller.connect_auto()
+    near_match = list(LEGACY_IDENTITY_REGISTERS)
+    near_match[1] ^= 1
+    transport.complete_last(near_match)
+    assert not controller.connected
+    assert len(transport.sent) == 1
+    assert failures[-1] == "候选串口均未通过 LK-MD2202 只读身份校验"
 
 
 def test_relative_move_uses_one_signed_32bit_modbus_action(tmp_path):
@@ -257,10 +284,12 @@ def test_address_and_baud_changes_reconnect_between_each_write(tmp_path):
     assert transport.sent[-1][1]["tag"] == ("config_reconnect",)
     assert transport.sent[-1][0][0] == 7
 
-    transport.complete_last(identity_registers())
+    transport.complete_last(LEGACY_IDENTITY_REGISTERS)
     baud_request, options = transport.sent[-1]
     assert options["tag"] == ("config_write", "communication.baud_rate")
     assert baud_request[0] == 7
     transport.complete_last(())
     assert transport.opened[-1] == ("COM8", 19200)
     assert transport.sent[-1][1]["tag"] == ("config_reconnect",)
+    transport.complete_last(identity_registers())
+    assert transport.sent[-1][1]["tag"] == ("init", "x_config")

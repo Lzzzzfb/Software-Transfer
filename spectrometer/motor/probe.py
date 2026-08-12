@@ -17,7 +17,7 @@ from .lk_md2202 import (
     decode_axis_configuration,
     decode_axis_status,
     decode_communication,
-    decode_identity,
+    decode_supported_identity,
     identity_request,
     status_request,
 )
@@ -87,9 +87,7 @@ class ReadOnlyProbe(QtCore.QObject):
         step = tag[1]
         try:
             if step == "identity":
-                identity = decode_identity(response.registers)
-                if not identity.is_lk_md2202:
-                    raise ValueError(f"unexpected device name: {identity.name}")
+                identity = decode_supported_identity(response.registers)
                 self._payload["identity"] = asdict(identity)
                 self._send(axis_configuration_request(self.address, DriverAxis.X), "x_config")
             elif step == "x_config":

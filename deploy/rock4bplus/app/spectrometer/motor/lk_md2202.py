@@ -25,6 +25,25 @@ MINIMUM_MOVE_MM = 1.0 / PULSES_PER_MM
 DEVICE_NAME_START = 0x0006
 DEVICE_NAME_COUNT = 10
 COMMUNICATION_START = 0x0050
+# Exact 0x0000..0x000F response observed from the validated legacy board.
+LEGACY_IDENTITY_REGISTERS = (
+    0x0064,
+    0x0014,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0x0002,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+    0xFFFF,
+)
 
 
 class DriverAxis(IntEnum):
@@ -88,6 +107,9 @@ BAUD_CODE_TO_RATE = {
     7: 115200,
 }
 BAUD_RATE_TO_CODE = {rate: code for code, rate in BAUD_CODE_TO_RATE.items()}
+DATA_BITS_CODE_TO_VALUE = {0: 8, 1: 9}
+STOP_BITS_CODE_TO_VALUE = {0: 1, 1: 1.5, 2: 2}
+PARITY_CODE_TO_VALUE = {0: 0, 1: 1, 2: 2}
 
 
 @dataclass(frozen=True)
@@ -157,7 +179,7 @@ class CommunicationConfiguration:
             raise ValueError("Modbus address must be between 1 and 247")
         if int(self.baud_rate) not in BAUD_RATE_TO_CODE:
             raise ValueError("unsupported baud rate")
-        if (int(self.data_bits), int(self.stop_bits), int(self.parity)) != (8, 1, 0):
+        if (self.data_bits, self.stop_bits, self.parity) != (8, 1, 0):
             raise ValueError("this application requires 8N1 without parity")
 
 
@@ -202,6 +224,15 @@ def decode_identity(registers) -> DeviceIdentity:
     return DeviceIdentity(values[0], decode_device_name(values[6:16]))
 
 
+def decode_supported_identity(registers) -> DeviceIdentity:
+    """Decode and strictly validate a supported LK-MD2202 identity response."""
+    values = tuple(registers)
+    identity = decode_identity(values)
+    if identity.is_lk_md2202 or values == LEGACY_IDENTITY_REGISTERS:
+        return identity
+    raise ValueError("unsupported LK-MD2202 identity")
+
+
 def identity_request(address: int) -> bytes:
     return build_read_holding(address, 0x0000, 16)
 
@@ -239,12 +270,26 @@ def decode_communication(registers) -> CommunicationConfiguration:
         baud_rate = BAUD_CODE_TO_RATE[values[1]]
     except KeyError as exc:
         raise ValueError("unknown baud-rate code") from exc
+    try:
+        data_bits = DATA_BITS_CODE_TO_VALUE[values[2]]
+    except KeyError as exc:
+        raise ValueError("unknown data-bit code") from exc
+    try:
+        stop_bits = STOP_BITS_CODE_TO_VALUE[values[3]]
+    except KeyError as exc:
+        raise ValueError("unknown stop-bit code") from exc
+    try:
+        parity = PARITY_CODE_TO_VALUE[values[4]]
+    except KeyError as exc:
+        raise ValueError("unknown parity code") from exc
+    if (data_bits, stop_bits, parity) != (8, 1, 0):
+        raise ValueError("this application requires 8N1 without parity")
     return CommunicationConfiguration(
         address=values[0],
         baud_rate=baud_rate,
-        data_bits=values[2],
-        stop_bits=values[3],
-        parity=values[4],
+        data_bits=data_bits,
+        stop_bits=stop_bits,
+        parity=parity,
     )
 
 

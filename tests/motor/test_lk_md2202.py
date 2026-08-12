@@ -5,12 +5,15 @@ from spectrometer.motor.lk_md2202 import (
     CommunicationConfiguration,
     DriverAxis,
     END_POSITION_PULSES,
+    LEGACY_IDENTITY_REGISTERS,
     LimitMode,
     MINIMUM_MOVE_MM,
     PULSES_PER_MM,
     decode_axis_configuration,
     decode_axis_status,
+    decode_communication,
     decode_identity,
+    decode_supported_identity,
     home_request,
     identity_request,
     relative_move_request,
@@ -26,11 +29,36 @@ def name_registers(name):
 
 def test_identity_uses_version_and_device_name_registers():
     registers = [0x0200, 0, 0, 0, 0, 0] + name_registers("LK-MD2202")
-    identity = decode_identity(registers)
+    identity = decode_supported_identity(registers)
     assert identity.software_version == 0x0200
     assert identity.name == "LK-MD2202"
     assert identity.is_lk_md2202
     assert identity_request(1)[0:6] == bytes.fromhex("01 03 00 00 00 10")
+
+
+def test_exact_legacy_identity_is_supported_without_forging_device_name():
+    decoded = decode_identity(LEGACY_IDENTITY_REGISTERS)
+    identity = decode_supported_identity(LEGACY_IDENTITY_REGISTERS)
+    assert identity == decoded
+    assert identity.software_version == 0x0064
+    assert identity.name == ""
+    assert not identity.is_lk_md2202
+
+
+def test_legacy_identity_requires_the_complete_exact_signature():
+    near_match = list(LEGACY_IDENTITY_REGISTERS)
+    near_match[1] ^= 1
+    with pytest.raises(ValueError, match="unsupported LK-MD2202 identity"):
+        decode_supported_identity(near_match)
+
+    with pytest.raises(ValueError, match="unsupported LK-MD2202 identity"):
+        decode_supported_identity([0] * 16)
+
+    with pytest.raises(ValueError):
+        decode_supported_identity([0xFFFF] * 16)
+
+    with pytest.raises(ValueError, match="0x0000..0x000F"):
+        decode_supported_identity(LEGACY_IDENTITY_REGISTERS[:-1])
 
 
 def test_confirmed_axis_defaults_match_user_configuration():
@@ -75,4 +103,28 @@ def test_communication_requires_confirmed_8n1():
     assert CommunicationConfiguration().baud_rate == 9600
     with pytest.raises(ValueError, match="8N1"):
         CommunicationConfiguration(parity=1)
+    with pytest.raises(ValueError, match="8N1"):
+        CommunicationConfiguration(stop_bits=1.5)
 
+
+def test_decode_communication_maps_driver_codes_to_8n1_semantics():
+    assert decode_communication((1, 3, 0, 0, 0)) == CommunicationConfiguration()
+
+
+@pytest.mark.parametrize(
+    ("registers", "message"),
+    [
+        ((1, 3, 1, 0, 0), "8N1"),
+        ((1, 3, 0, 1, 0), "8N1"),
+        ((1, 3, 0, 2, 0), "8N1"),
+        ((1, 3, 0, 0, 1), "8N1"),
+        ((1, 3, 0, 0, 2), "8N1"),
+        ((1, 8, 0, 0, 0), "baud-rate"),
+        ((1, 3, 2, 0, 0), "data-bit"),
+        ((1, 3, 0, 3, 0), "stop-bit"),
+        ((1, 3, 0, 0, 3), "parity"),
+    ],
+)
+def test_decode_communication_rejects_non_8n1_and_unknown_codes(registers, message):
+    with pytest.raises(ValueError, match=message):
+        decode_communication(registers)

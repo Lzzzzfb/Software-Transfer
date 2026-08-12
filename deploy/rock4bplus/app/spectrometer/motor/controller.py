@@ -20,7 +20,7 @@ from .lk_md2202 import (
     decode_axis_configuration,
     decode_axis_status,
     decode_communication,
-    decode_identity,
+    decode_supported_identity,
     axis_configuration_request,
     communication_request,
     configuration_changes,
@@ -717,11 +717,8 @@ class MotorController(QtCore.QObject):
         kind = tag[0] if isinstance(tag, tuple) and tag else ""
         if kind == "probe":
             try:
-                identity = decode_identity(response.registers)
+                decode_supported_identity(response.registers)
             except (TypeError, ValueError):
-                self._try_next_candidate()
-                return
-            if not identity.is_lk_md2202:
                 self._try_next_candidate()
                 return
             self._probing = False
@@ -759,9 +756,7 @@ class MotorController(QtCore.QObject):
                 self._send_next_config_op()
         elif kind == "config_reconnect":
             try:
-                identity = decode_identity(response.registers)
-                if not identity.is_lk_md2202:
-                    raise ValueError(identity.name)
+                decode_supported_identity(response.registers)
             except (TypeError, ValueError) as exc:
                 self._fail_configuration_apply(
                     f"新通信参数下设备身份校验失败：{exc}"
