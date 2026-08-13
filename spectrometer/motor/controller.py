@@ -246,7 +246,7 @@ class MotorController(QtCore.QObject):
             self._probing = False
             self.host_settings = self._probe_original_host
             self.operation_failed.emit("候选串口均未通过 LK-MD2202 只读身份校验")
-            self.connection_changed.emit(False, "未识别到 LK-MD2202")
+            self.connection_changed.emit(False, "未找到LK-MD2202电机驱动板")
             if self._desired_configuration is not None:
                 self._desired_configuration = None
                 self._desired_host_settings = None
@@ -293,7 +293,8 @@ class MotorController(QtCore.QObject):
             self._motion_poll_timer.stop()
             self._idle_poll_timer.stop()
             if active is not None:
-                self._enter_safety_lock("电机通信中断，停止状态未知，请切断驱动板电源")
+                detail = "电机通信中断，停止状态未知，请切断驱动板电源"
+                self._enter_safety_lock(detail)
                 self.motion_finished.emit(
                     active.operation_id, False, "connection_lost_stop_unconfirmed"
                 )
