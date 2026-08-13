@@ -18,6 +18,7 @@ from spectrometer.motor.lk_md2202 import (
     identity_request,
     relative_move_request,
     stop_request,
+    velocity_mode_request,
 )
 from spectrometer.motor.modbus_rtu import append_crc
 
@@ -92,9 +93,34 @@ def test_status_and_action_registers_are_mapped_per_axis():
     assert home_request(1, DriverAxis.Y) == append_crc(bytes.fromhex("01 06 00 45 00 01"))
 
 
+def test_velocity_mode_uses_one_signed_32bit_write_per_axis():
+    assert velocity_mode_request(1, DriverAxis.X, 5000) == append_crc(
+        bytes.fromhex("01 10 00 1C 00 02 04 00 00 13 88")
+    )
+    assert velocity_mode_request(1, DriverAxis.Y, -5000) == append_crc(
+        bytes.fromhex("01 10 00 3C 00 02 04 FF FF EC 78")
+    )
+    assert velocity_mode_request(1, DriverAxis.X, 0) == append_crc(
+        bytes.fromhex("01 10 00 1C 00 02 04 00 00 00 00")
+    )
+
+
+@pytest.mark.parametrize("speed", [-(2**31), 2**31 - 1])
+def test_velocity_mode_accepts_signed_32bit_boundaries(speed):
+    assert velocity_mode_request(1, DriverAxis.X, speed)[1] == 0x10
+
+
+@pytest.mark.parametrize("speed", [-(2**31) - 1, 2**31])
+def test_velocity_mode_rejects_signed_32bit_overflow(speed):
+    with pytest.raises(ValueError):
+        velocity_mode_request(1, DriverAxis.X, speed)
+
+
 def test_rejects_z_and_non_zero_limit_mode():
     with pytest.raises(ValueError, match="only X"):
         relative_move_request(1, "Z", 1)
+    with pytest.raises(ValueError, match="only X"):
+        velocity_mode_request(1, "Z", 1)
     with pytest.raises(ValueError, match="zero-point"):
         AxisConfiguration(limit_mode=LimitMode.NONE)
 

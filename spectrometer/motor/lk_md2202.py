@@ -311,6 +311,15 @@ def relative_move_request(address: int, axis, pulses: int) -> bytes:
     return build_write_multiple(address, channel.base + 0x10, int32_to_registers(pulses))
 
 
+def velocity_mode_request(address: int, axis, signed_speed_pps: int) -> bytes:
+    channel = _axis(axis)
+    return build_write_multiple(
+        address,
+        channel.base + 0x0C,
+        int32_to_registers(signed_speed_pps),
+    )
+
+
 def position_speed_request(address: int, axis, speed_pps: int) -> bytes:
     channel = _axis(axis)
     return build_write_multiple(address, channel.base + 0x0E, uint32_to_registers(speed_pps))
