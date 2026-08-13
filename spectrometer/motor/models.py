@@ -9,10 +9,27 @@ import math
 
 MOTOR_PULSES_PER_MM = 320
 MOTOR_TRAVEL_MM = 15.0
+MOTOR_TRAVEL_PULSES = round(MOTOR_TRAVEL_MM * MOTOR_PULSES_PER_MM)
 MOTOR_SPEED_MIN_HZ = 100
 MOTOR_SPEED_MAX_HZ = 14_000
 MOTOR_SPEED_DEFAULT_HZ = 10_000
 MINIMUM_MOVE_MM = 1.0 / MOTOR_PULSES_PER_MM
+
+
+def _non_zero_speed(speed_pps) -> int:
+    speed = abs(int(speed_pps))
+    if speed == 0:
+        raise ValueError("speed must be non-zero")
+    return speed
+
+
+def stall_release_timeout_seconds(speed_pps) -> float:
+    return min(1.0, MOTOR_TRAVEL_PULSES / _non_zero_speed(speed_pps))
+
+
+def home_timeout_seconds(speed_pps) -> float:
+    calculated = MOTOR_TRAVEL_PULSES / _non_zero_speed(speed_pps) * 3.0 + 0.5
+    return min(5.0, max(2.0, calculated))
 
 
 class Axis(str, Enum):
@@ -67,7 +84,7 @@ class MotorAxisStatus:
     software_position_mm: float | None
     calibrated: bool
     moving: bool
-    zero_limit_active: bool
+    zero_limit_active: bool | None
     stop_reason: str = "NONE"
     mechanical_position_mm: float | None = None
 
@@ -77,6 +94,10 @@ class MotorAxisStatus:
             raise ValueError("software position must be finite")
         if self.mechanical_position_mm is not None and not math.isfinite(self.mechanical_position_mm):
             raise ValueError("mechanical position must be finite")
+        if self.zero_limit_active is not None and not isinstance(
+            self.zero_limit_active, bool
+        ):
+            raise ValueError("zero limit state must be true, false or unknown")
 
     @property
     def position_mm(self):
@@ -92,6 +113,7 @@ class MotorStatus:
     x: MotorAxisStatus
     y: MotorAxisStatus
     fault_latched: bool = False
+    fault_reason: str = ""
 
     def __post_init__(self):
         if (self.x.axis, self.y.axis) != (Axis.X, Axis.Y):

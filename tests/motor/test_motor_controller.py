@@ -1,17 +1,25 @@
 import os
+import time
+from dataclasses import replace
 from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from spectrometer.motor.controller import MotorController
 from spectrometer.motor.lk_md2202 import (
     AxisConfiguration,
+    AxisDeviceStatus,
     CommunicationConfiguration,
     DeviceConfiguration,
     DriverAxis,
     LEGACY_IDENTITY_REGISTERS,
     RunCurrent,
     relative_move_request,
+    position_speed_request,
+    stop_request,
+    velocity_mode_request,
 )
 from spectrometer.motor.models import Axis, Direction
 from spectrometer.motor.settings_store import MotorSettingsStore
@@ -164,6 +172,159 @@ def test_relative_move_uses_one_signed_32bit_modbus_action(tmp_path):
     assert options.get("read_retries", 0) == 0
 
 
+def test_negative_speed_sets_absolute_position_speed_and_reports_signed_session_value(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    applied = []
+    controller.speed_applied.connect(
+        lambda axis, signed, absolute, message: applied.append(
+            (axis, signed, absolute, message)
+        )
+    )
+    assert controller.set_speed(Axis.X, -5000)
+    request, options = transport.sent[-1]
+    assert request == position_speed_request(1, DriverAxis.X, 5000)
+    assert options["tag"] == ("speed", Axis.X, -5000, 5000)
+    transport.complete_last(())
+    assert controller.configuration.x.position_speed_pps == 5000
+    assert applied[-1][:3] == (Axis.X, -5000, 5000)
+
+
+@pytest.mark.parametrize("speed", [0, 99, -99, 14_001, -14_001])
+def test_speed_rejects_zero_and_absolute_values_outside_normal_range(tmp_path, speed):
+    controller, transport = connect_controller(tmp_path)
+    before = len(transport.sent)
+    assert not controller.set_speed(Axis.X, speed)
+    assert len(transport.sent) == before
+
+
+def test_stall_release_from_closed_limit_stops_as_soon_as_limit_opens(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller._axis_device_status[Axis.X] = AxisDeviceStatus(True, 0, 0)
+    controller._refresh_status()
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+
+    operation_id = controller.release_stall(Axis.X, 5000)
+    assert operation_id
+    assert transport.sent[-1][0] == velocity_mode_request(1, DriverAxis.X, 5000)
+    transport.complete_last(())
+    controller._poll_motion()
+    transport.complete_last([0, 1, 0, 100])
+    assert transport.sent[-1][0] == velocity_mode_request(1, DriverAxis.X, 0)
+    transport.complete_last(())
+    assert transport.sent[-1][1]["tag"] == ("release_stop_status", operation_id)
+    transport.complete_last([0, 0, 0, 100])
+
+    assert finished[-1] == (operation_id, True, "stall_release_limit_released")
+    assert not controller.status.x.calibrated
+
+
+def test_stall_release_from_open_limit_stops_if_wrong_direction_closes_it(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    operation_id = controller.release_stall(Axis.X, -5000)
+    transport.complete_last(())
+    controller._poll_motion()
+    transport.complete_last([1, 1, 0, 0])
+    assert transport.sent[-1][0] == velocity_mode_request(1, DriverAxis.X, 0)
+    transport.complete_last(())
+    transport.complete_last([1, 0, 0, 0])
+    assert finished[-1] == (operation_id, False, "stall_release_wrong_direction")
+
+
+def test_stall_release_uses_travel_deadline_then_confirms_stop(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    operation_id = controller.release_stall(Axis.X, 10_000)
+    transport.complete_last(())
+    controller._active_motion = replace(controller._active_motion, deadline=0)
+    controller._poll_motion()
+    assert transport.sent[-1][0] == velocity_mode_request(1, DriverAxis.X, 0)
+    transport.complete_last(())
+    transport.complete_last([0, 0, 0, 0])
+    assert finished[-1] == (operation_id, True, "stall_release_timeout")
+
+
+def test_stall_release_stop_failure_locks_motion_and_clear_faults_only_verifies_status(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller.release_stall(Axis.X, 5000)
+    transport.complete_last(())
+    controller._active_motion = replace(controller._active_motion, deadline=0)
+    controller._poll_motion()
+    tag = transport.sent[-1][1]["tag"]
+    transport.command_failed.emit(tag, "result_unknown")
+    assert transport.sent[-1][0] == stop_request(1, DriverAxis.X)
+    fallback_tag = transport.sent[-1][1]["tag"]
+    transport.command_failed.emit(fallback_tag, "result_unknown")
+    assert controller.safety_locked
+    assert controller.status.fault_latched
+    assert not controller.move_relative(Axis.X, 1.0, Direction.POSITIVE)
+
+    assert controller.clear_faults()
+    assert controller.safety_locked
+    assert transport.sent[-1][1]["tag"] == ("safety_status", Axis.X)
+    transport.complete_last([0, 0, 0, 0])
+    transport.complete_last([0, 0, 0, 0])
+    assert not controller.safety_locked
+
+
+def test_emergency_lock_clears_only_after_both_axes_report_stopped(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller._start_emergency_stop("test_stop")
+    assert controller.safety_locked
+    assert len(transport.emergency[-1]) == 4
+
+    for _ in range(4):
+        transport.command_completed.emit(("stop",), SimpleNamespace(registers=()))
+    assert transport.sent[-1][1]["tag"] == ("safety_status", Axis.X)
+    transport.complete_last([0, 0, 0, 0])
+    assert transport.sent[-1][1]["tag"] == ("safety_status", Axis.Y)
+    transport.complete_last([0, 0, 0, 0])
+    assert not controller.safety_locked
+
+
+def test_emergency_lock_remains_when_an_axis_still_reports_motion(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller._start_emergency_stop("test_stop")
+    for _ in range(4):
+        transport.command_completed.emit(("stop",), SimpleNamespace(registers=()))
+    transport.complete_last([0, 0, 0, 0])
+    transport.complete_last([0, 1, 0, 0])
+    assert controller.safety_locked
+    assert controller.status.fault_latched
+
+
+def test_idle_poll_refreshes_both_limits_and_marks_failed_axis_unknown(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller._poll_idle_status()
+    assert transport.sent[-1][1]["tag"] == ("idle_status", Axis.X)
+    transport.complete_last([1, 0, 0, 0])
+    assert transport.sent[-1][1]["tag"] == ("idle_status", Axis.Y)
+    transport.complete_last([0, 0, 0, 0])
+    assert controller.status.x.zero_limit_active is True
+    assert controller.status.y.zero_limit_active is False
+
+    controller._poll_idle_status()
+    tag = transport.sent[-1][1]["tag"]
+    transport.command_failed.emit(tag, "timeout")
+    assert controller.status.x.zero_limit_active is None
+    assert not controller.safety_locked
+
+
 def test_software_zero_allows_negative_coordinates_without_power_cycle_restore(tmp_path):
     controller, _transport = connect_controller(tmp_path)
     assert controller.clear_software_zero(Axis.X)
@@ -181,11 +342,24 @@ def test_mechanical_home_establishes_calibrated_zero(tmp_path):
     controller, transport = connect_controller(tmp_path)
     operation_id = controller.home(Axis.X)
     assert operation_id
+    assert 1.9 <= controller._active_motion.deadline - time.monotonic() <= 5.0
     transport.complete_last(())  # home write acknowledgement
+    controller._poll_motion()
+    transport.complete_last([1, 1, 0, 20])
     controller._poll_motion()
     transport.complete_last([1, 0, 0, 0])
     assert controller.status.x.calibrated is True
     assert controller.status.x.software_position_mm == 0.0
+
+
+def test_mechanical_home_rejects_limit_that_is_already_closed(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    controller._axis_device_status[Axis.X] = AxisDeviceStatus(True, 0, 0)
+    controller._refresh_status()
+    before = len(transport.sent)
+    assert controller.home(Axis.X) is None
+    assert len(transport.sent) == before
+    assert not controller.status.x.calibrated
 
 
 def test_motion_action_timeout_reads_status_instead_of_retrying(tmp_path):
