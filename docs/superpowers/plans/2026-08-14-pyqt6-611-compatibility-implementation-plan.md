@@ -59,11 +59,14 @@ fix: support PyQt6 6.11 enum and point types
 
 ```powershell
 .\.venv\Scripts\python.exe tools/build_rock4bplus_deploy.py
-.\.venv\Scripts\python.exe tools/build_rock4bplus_deploy.py --check
 .\.venv\Scripts\python.exe -m compileall -q deploy/rock4bplus/app
+.\.venv\Scripts\python.exe tools/build_rock4bplus_deploy.py
+.\.venv\Scripts\python.exe tools/build_rock4bplus_deploy.py --check
 .\.venv\Scripts\python.exe -m pytest -q tests/test_rock4bplus_deploy.py
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+部署目录语法编译会生成 `__pycache__`；编译后再次运行构建脚本，以恢复不含缓存的最小部署载荷，再执行纯净性测试。
 
 新增兼容层测试后目标为 427 项全部通过，部署目录不包含测试、文档、Office 文件、用户数据、诊断包或缓存。
 
