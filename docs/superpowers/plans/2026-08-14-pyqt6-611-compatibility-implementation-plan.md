@@ -65,7 +65,7 @@ fix: support PyQt6 6.11 enum and point types
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-目标为 426 项全部通过，部署目录不包含测试、文档、Office 文件、用户数据、诊断包或缓存。
+新增兼容层测试后目标为 427 项全部通过，部署目录不包含测试、文档、Office 文件、用户数据、诊断包或缓存。
 
 预期部署提交：
 
