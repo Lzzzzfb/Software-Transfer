@@ -395,6 +395,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.motor_panel.speed_requested.connect(
             self.motor_controller.set_speed
         )
+        self.motor_panel.stall_release_requested.connect(
+            self.motor_controller.release_stall
+        )
         self.motor_panel.move_requested.connect(
             self.motor_controller.move_relative
         )
@@ -425,8 +428,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._motor_connection_changed
         )
         self.motor_controller.status_changed.connect(
-            self.motor_panel.set_motor_status
+            self._motor_status_changed
         )
+        if hasattr(self.motor_controller, "configuration_changed"):
+            self.motor_controller.configuration_changed.connect(
+                self._motor_configuration_changed
+            )
+        if hasattr(self.motor_controller, "speed_applied"):
+            self.motor_controller.speed_applied.connect(
+                self._motor_speed_applied
+            )
         self.motor_controller.operation_failed.connect(
             self._motor_operation_failed
         )
@@ -490,7 +501,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return candidates
 
     def _connect_motor(self):
-        self.status_panel.state_label.setText("正在识别电机串口…")
+        self.status_panel.state_label.setText("正在识别电机串口……")
         host = self.motor_controller.host_settings
         if not host.automatic_port and host.port_name:
             return self.motor_controller.connect_manual(
@@ -548,8 +559,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.motor_panel.set_connection_state(connected, detail)
         if connected:
             self._log(f"电机控制器已连接：{detail}")
+            self.status_panel.state_label.setText(f"电机已连接：{detail}")
         elif detail:
             self._log(f"电机控制器未连接：{detail}", "WARN")
+            self.status_panel.state_label.setText(str(detail))
+        else:
+            self.status_panel.state_label.setText("电机已断开")
+
+    def _motor_configuration_changed(self, configuration):
+        if configuration is None:
+            return
+        self.motor_panel.set_axis_speed(
+            Axis.X, configuration.x.position_speed_pps, device_refresh=True
+        )
+        self.motor_panel.set_axis_speed(
+            Axis.Y, configuration.y.position_speed_pps, device_refresh=True
+        )
+
+    def _motor_speed_applied(self, axis, signed_speed, absolute_speed, message):
+        self.motor_panel.set_axis_speed(Axis(axis), signed_speed)
+        self._log(str(message))
+        self.status_panel.state_label.setText(str(message))
+
+    def _motor_status_changed(self, status):
+        self.motor_panel.set_motor_status(status)
+        if status.fault_latched and status.fault_reason:
+            self.status_panel.state_label.setText(str(status.fault_reason))
+        elif self.status_panel.state_label.text() in {
+            "正在确认急停结果",
+            "急停写入结果未知，正在读取两轴状态",
+            "电机停止状态未知，请切断驱动板电源",
+        }:
+            self.status_panel.state_label.setText("电机停止已确认")
 
     def _motor_operation_failed(self, message):
         self.motor_panel.set_motion_active(False)
@@ -558,6 +599,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _motor_motion_finished(self, _operation_id, success, reason):
         self.motor_panel.set_motion_active(False)
+        messages = {
+            "stall_release_limit_released": "脱离卡死完成：限位已释放，请重新机械回零",
+            "stall_release_timeout": "脱离卡死命令已结束，请确认实际位置并重新机械回零",
+            "stall_release_limit_not_released": "脱离卡死失败：限位未释放",
+            "stall_release_wrong_direction": "脱离卡死已停止：检测到零点限位闭合，请检查速度正负号",
+            "stop_unconfirmed": "电机停止状态未知，请切断驱动板电源",
+        }
+        if reason in messages:
+            self.status_panel.state_label.setText(messages[reason])
         if not success and reason != "user_stop":
             self._log(f"电机运动异常结束：{reason}", "ERROR")
 
@@ -568,6 +618,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _start_motor_scan(self, parameters):
+        if getattr(self.motor_controller, "safety_locked", False):
+            self._scan_operation_failed(
+                "电机停止状态未知，确认两轴停止前不能启动扫描"
+            )
+            return False
         if self.control.busy:
             self._scan_operation_failed(
                 "已有光谱仪任务未完全结束，不能启动扫描"

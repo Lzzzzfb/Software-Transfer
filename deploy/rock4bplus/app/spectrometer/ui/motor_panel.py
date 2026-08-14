@@ -22,6 +22,7 @@ class MotorPanel(QtWidgets.QWidget):
     connect_requested = Signal()
     disconnect_requested = Signal()
     speed_requested = Signal(object, int)
+    stall_release_requested = Signal(object, int)
     move_requested = Signal(object, float, object)
     position_clear_requested = Signal(object)
     software_return_requested = Signal(object)
@@ -39,6 +40,7 @@ class MotorPanel(QtWidgets.QWidget):
         self._connected = False
         self._motion_active = False
         self._scan_active = False
+        self._safety_locked = False
         self._axis_controls = {}
 
         outer = QtWidgets.QVBoxLayout(self)
@@ -115,7 +117,7 @@ class MotorPanel(QtWidgets.QWidget):
             state_layout.setContentsMargins(0, 0, 0, 0)
             coordinate = QtWidgets.QLabel("--")
             coordinate.setObjectName(f"motor{axis.value}Coordinate")
-            limit = QtWidgets.QLabel("限位开")
+            limit = QtWidgets.QLabel("限位状态未知")
             limit.setObjectName("motorLimitIndicator")
             limit.setProperty("active", False)
             state_layout.addWidget(coordinate)
@@ -123,7 +125,7 @@ class MotorPanel(QtWidgets.QWidget):
             layout.addWidget(state_box, row, 1)
 
             speed = DirectSpinBox()
-            speed.setRange(MOTOR_SPEED_MIN_HZ, MOTOR_SPEED_MAX_HZ)
+            speed.setRange(-MOTOR_SPEED_MAX_HZ, MOTOR_SPEED_MAX_HZ)
             speed.setValue(MOTOR_SPEED_DEFAULT_HZ)
             speed.setSingleStep(100)
             speed.setObjectName(f"motor{axis.value}Speed")
@@ -188,16 +190,30 @@ class MotorPanel(QtWidgets.QWidget):
                 lambda _checked=False, a=axis: self.home_requested.emit(a)
             )
             coordinate_box = QtWidgets.QWidget()
-            coordinate_layout = QtWidgets.QHBoxLayout(coordinate_box)
+            coordinate_layout = QtWidgets.QGridLayout(coordinate_box)
             coordinate_layout.setContentsMargins(0, 0, 0, 0)
-            coordinate_layout.addWidget(clear)
-            coordinate_layout.addWidget(return_zero)
-            coordinate_layout.addWidget(home)
+            coordinate_layout.setHorizontalSpacing(4)
+            coordinate_layout.setVerticalSpacing(3)
+            coordinate_layout.addWidget(clear, 0, 0)
+            coordinate_layout.addWidget(return_zero, 0, 1)
+            coordinate_layout.addWidget(home, 1, 0)
+            stall_release = QtWidgets.QPushButton("脱离卡死")
+            stall_release.setToolTip(
+                "按当前速度框的带符号速度运行；自动停止后仍需机械回零"
+            )
+            stall_release.clicked.connect(
+                lambda _checked=False, a=axis, control=speed:
+                self.stall_release_requested.emit(a, control.value())
+            )
+            coordinate_layout.addWidget(stall_release, 1, 1)
             layout.addWidget(coordinate_box, row, 5)
 
             self._axis_controls[axis] = {
                 "coordinate": coordinate,
                 "limit": limit,
+                "speed": speed,
+                "speed_apply": speed_apply,
+                "stall_release": stall_release,
                 "interactive": (
                     speed,
                     speed_apply,
@@ -207,6 +223,7 @@ class MotorPanel(QtWidgets.QWidget):
                     clear,
                     return_zero,
                     home,
+                    stall_release,
                 ),
             }
         return group
@@ -346,7 +363,21 @@ class MotorPanel(QtWidgets.QWidget):
         self._motion_active = bool(active)
         self._refresh_enabled_state()
 
+    def axis_speed(self, axis) -> int:
+        return int(self._axis_controls[Axis(axis)]["speed"].value())
+
+    def set_axis_speed(self, axis, speed_pps, *, device_refresh=False):
+        axis = Axis(axis)
+        value = int(speed_pps)
+        if device_refresh:
+            value = abs(value)
+        control = self._axis_controls[axis]["speed"]
+        control.blockSignals(True)
+        control.setValue(value)
+        control.blockSignals(False)
+
     def set_motor_status(self, status: MotorStatus):
+        self._safety_locked = bool(status.fault_latched)
         for axis, axis_status in (
             (Axis.X, status.x),
             (Axis.Y, status.y),
@@ -358,10 +389,16 @@ class MotorPanel(QtWidgets.QWidget):
                 if axis_status.position_mm is not None else "坐标不可用"
             )
             limit = self._axis_controls[axis]["limit"]
-            limit.setText(
-                "限位闭合" if axis_status.zero_limit_active else "限位开"
-            )
-            limit.setProperty("active", axis_status.zero_limit_active)
+            if axis_status.zero_limit_active is None:
+                limit.setText("限位状态未知")
+                limit.setProperty("active", False)
+            else:
+                limit.setText(
+                    "驱动器上报：限位闭合"
+                    if axis_status.zero_limit_active
+                    else "驱动器上报：限位断开"
+                )
+                limit.setProperty("active", axis_status.zero_limit_active)
             limit.style().unpolish(limit)
             limit.style().polish(limit)
         self.set_motion_active(status.moving)
@@ -402,7 +439,10 @@ class MotorPanel(QtWidgets.QWidget):
 
     def _refresh_enabled_state(self):
         manual_enabled = (
-            self._connected and not self._motion_active and not self._scan_active
+            self._connected
+            and not self._motion_active
+            and not self._scan_active
+            and not self._safety_locked
         )
         for controls in self._axis_controls.values():
             for control in controls["interactive"]:
@@ -411,7 +451,8 @@ class MotorPanel(QtWidgets.QWidget):
         self.discover_button.setEnabled(not self._scan_active)
         self.disconnect_button.setEnabled(self._connected and not self._scan_active)
         self.stop_button.setEnabled(
-            self._connected and (self._motion_active or self._scan_active)
+            self._connected
+            and (self._motion_active or self._scan_active or self._safety_locked)
         )
         self.clear_fault_button.setEnabled(
             self._connected and not self._motion_active and not self._scan_active
@@ -420,6 +461,9 @@ class MotorPanel(QtWidgets.QWidget):
         for control in self._scan_inputs:
             control.setEnabled(not self._scan_active)
         self.scan_start_button.setEnabled(
-            self._connected and not self._motion_active and not self._scan_active
+            self._connected
+            and not self._motion_active
+            and not self._scan_active
+            and not self._safety_locked
         )
         self.scan_stop_button.setEnabled(self._scan_active)

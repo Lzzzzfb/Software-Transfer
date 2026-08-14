@@ -39,11 +39,27 @@ def available_port_records():
     return records
 
 
+def _automatic_usb_candidate(record) -> bool:
+    name = str(record.get("port_name") or "").casefold()
+    location = str(record.get("system_location") or "").replace("\\", "/").casefold()
+    leaf = location.rsplit("/", 1)[-1]
+    if name.startswith("ttyfiq") or leaf.startswith("ttyfiq"):
+        return False
+    if record.get("vendor_id") is not None or record.get("product_id") is not None:
+        return True
+    return (
+        name.startswith(("ttyusb", "ttyacm", "cu.usb", "com"))
+        or leaf.startswith(("ttyusb", "ttyacm", "cu.usb", "com"))
+    )
+
+
 def find_motor_candidates(ports=None, *, excluded_ports=frozenset(), preferred_port=""):
     ports = available_port_records() if ports is None else ports
     excluded = {str(item).casefold() for item in excluded_ports}
     result = []
     for record in ports:
+        if not _automatic_usb_candidate(record):
+            continue
         name = str(record.get("port_name") or "")
         location = str(record.get("system_location") or "")
         if name.casefold() in excluded or location.casefold() in excluded:

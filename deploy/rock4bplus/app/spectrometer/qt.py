@@ -72,6 +72,8 @@ def _install_flat_enum_aliases():
                 "Key_Down": ("Key", "Key_Down"),
                 "Key_PageUp": ("Key", "Key_PageUp"),
                 "Key_PageDown": ("Key", "Key_PageDown"),
+                "NoModifier": ("KeyboardModifier", "NoModifier"),
+                "PreciseTimer": ("TimerType", "PreciseTimer"),
                 "StrongFocus": ("FocusPolicy", "StrongFocus"),
                 "AlignCenter": ("AlignmentFlag", "AlignCenter"),
                 "AlignRight": ("AlignmentFlag", "AlignRight"),
@@ -81,11 +83,24 @@ def _install_flat_enum_aliases():
             },
         ),
         (
+            QtCore.QEvent,
+            {
+                "KeyPress": ("Type", "KeyPress"),
+            },
+        ),
+        (
             QtWidgets.QFrame,
             {
                 "NoFrame": ("Shape", "NoFrame"),
                 "VLine": ("Shape", "VLine"),
                 "Sunken": ("Shadow", "Sunken"),
+            },
+        ),
+        (
+            QtWidgets.QDialog,
+            {
+                "Accepted": ("DialogCode", "Accepted"),
+                "Rejected": ("DialogCode", "Rejected"),
             },
         ),
         (

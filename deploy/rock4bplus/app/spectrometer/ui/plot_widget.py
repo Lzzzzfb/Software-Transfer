@@ -25,7 +25,7 @@ class _Curve:
 
 def _event_position(event):
     position = getattr(event, "position", None)
-    return position() if position else event.pos()
+    return QtCore.QPointF(position() if position else event.pos())
 
 
 def _text_width(metrics, text):
