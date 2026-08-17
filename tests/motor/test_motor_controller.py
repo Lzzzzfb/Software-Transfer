@@ -460,9 +460,137 @@ def test_motion_action_timeout_reads_status_instead_of_retrying(tmp_path):
         "motion_status",
         operation_id,
     )
+    assert transport.sent[-1][1]["timeout_ms"] == 100
+    assert transport.sent[-1][1]["read_retries"] == 0
     assert transport.sent.count((move_request, options)) == 1
     transport.complete_last([0, 0, 0, 320])
     assert completed[-1] == (operation_id, True, "completed")
+
+
+def test_motion_status_poll_uses_short_nonretrying_requests(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    operation_id = controller.move_relative(
+        Axis.X, 1.0, Direction.POSITIVE
+    )
+    transport.complete_last(())
+
+    assert controller._motion_poll_timer.interval() == 20
+    controller._poll_motion()
+
+    _request, options = transport.sent[-1]
+    assert options["tag"] == ("motion_status", operation_id)
+    assert options["timeout_ms"] == 100
+    assert options["read_retries"] == 0
+
+
+def test_motion_status_timeout_repolls_without_finishing_motion(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    operation_id = controller.move_relative(
+        Axis.X, 1.0, Direction.POSITIVE
+    )
+    transport.complete_last(())
+    controller._poll_motion()
+    status_tag = transport.sent[-1][1]["tag"]
+
+    transport.command_failed.emit(status_tag, "timeout")
+
+    assert controller.motion_active
+    assert finished == []
+    assert controller._motion_poll_timer.interval() == 20
+
+    controller._poll_motion()
+    assert transport.sent[-1][1]["tag"] == (
+        "motion_status",
+        operation_id,
+    )
+    transport.complete_last([0, 0, 0, 320])
+    assert finished[-1] == (operation_id, True, "completed")
+
+
+def test_motion_status_intermittent_failures_are_summarized_once(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    diagnostics = []
+    controller.diagnostic_event.connect(diagnostics.append)
+    operation_id = controller.move_relative(
+        Axis.X, 1.0, Direction.POSITIVE
+    )
+    transport.complete_last(())
+
+    for reason in ("timeout", "protocol_error:crc"):
+        controller._poll_motion()
+        transport.command_failed.emit(
+            transport.sent[-1][1]["tag"], reason
+        )
+
+    controller._poll_motion()
+    transport.complete_last([0, 0, 0, 320])
+
+    summaries = [
+        message for message in diagnostics if "动作汇总" in message
+    ]
+    assert len(summaries) == 1
+    assert operation_id in summaries[0]
+    assert "状态查询 3 次" in summaries[0]
+    assert "读取失败 2 次" in summaries[0]
+    assert "结果 成功" in summaries[0]
+    assert "原因 completed" in summaries[0]
+
+
+def test_motion_validation_failure_is_summarized_once(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    diagnostics = []
+    finished = []
+    controller.diagnostic_event.connect(diagnostics.append)
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    operation_id = controller.move_relative(
+        Axis.X, 1.0, Direction.POSITIVE
+    )
+    transport.complete_last(())
+    controller._poll_motion()
+    transport.complete_last([0, 0, 0, 318])
+
+    assert finished[-1] == (operation_id, False, "position_mismatch")
+    summaries = [
+        message for message in diagnostics if "动作汇总" in message
+    ]
+    assert len(summaries) == 1
+    assert "状态查询 1 次" in summaries[0]
+    assert "读取失败 0 次" in summaries[0]
+    assert "结果 失败" in summaries[0]
+    assert "原因 position_mismatch" in summaries[0]
+
+
+def test_motion_status_failure_at_deadline_uses_existing_stop_flow(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    operation_id = controller.move_relative(
+        Axis.X, 1.0, Direction.POSITIVE
+    )
+    transport.complete_last(())
+    controller._poll_motion()
+    controller._active_motion = replace(
+        controller._active_motion, deadline=0
+    )
+
+    transport.command_failed.emit(
+        transport.sent[-1][1]["tag"], "timeout"
+    )
+
+    assert controller.motion_active
+    assert transport.sent[-1][0] == stop_request(1, DriverAxis.X)
+    assert transport.sent[-1][1]["tag"] == (
+        "motion_stop",
+        operation_id,
+    )
 
 
 def test_home_requires_zero_limit_confirmation(tmp_path):
