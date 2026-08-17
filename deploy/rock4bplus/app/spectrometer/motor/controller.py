@@ -53,6 +53,9 @@ from .transport import MotorSerialTransport
 RELEASE_STOP_CONFIRM_SECONDS = 1.0
 RELEASE_STOP_POLL_MS = 100
 RELEASE_STOP_MAX_CHECKS = 4
+MOTION_STATUS_TIMEOUT_MS = 100
+MOTION_STATUS_REPOLL_MS = 20
+MOTION_STATUS_READ_RETRIES = 0
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,10 @@ class _ActiveMotion:
     stop_success: bool = False
     stop_check_count: int = 0
     fallback_stop_sent: bool = False
+    operation_kind: str = ""
+    started_at: float = 0.0
+    status_query_count: int = 0
+    status_failure_count: int = 0
 
 
 def _unknown_axis(axis):
@@ -302,6 +309,9 @@ class MotorController(QtCore.QObject):
             if active is not None:
                 detail = "电机通信中断，停止状态未知，请切断驱动板电源"
                 self._enter_safety_lock(detail)
+                self._emit_motion_summary(
+                    active, False, "connection_lost_stop_unconfirmed"
+                )
                 self.motion_finished.emit(
                     active.operation_id, False, "connection_lost_stop_unconfirmed"
                 )
@@ -663,7 +673,17 @@ class MotorController(QtCore.QObject):
             return None
         operation_id = uuid.uuid4().hex
         duration = abs(logical_pulses) / self._speeds[axis]
-        self._active_motion = _ActiveMotion(operation_id, "move", axis, start, target, time.monotonic() + max(5, duration * 3 + 2))
+        started_at = time.monotonic()
+        self._active_motion = _ActiveMotion(
+            operation_id,
+            "move",
+            axis,
+            start,
+            target,
+            started_at + max(5, duration * 3 + 2),
+            operation_kind="move",
+            started_at=started_at,
+        )
         self.diagnostic_event.emit(
             f"{axis.value} 轴相对运动：逻辑 {logical_pulses} pulse，"
             f"驱动器 {device_delta} pulse，操作 {operation_id}"
@@ -717,15 +737,18 @@ class MotorController(QtCore.QObject):
         operation_id = uuid.uuid4().hex
         first, remaining = axes[0], axes[1:]
         self._calibrated[first] = False
+        started_at = time.monotonic()
         self._active_motion = _ActiveMotion(
             operation_id,
             "home",
             first,
             None,
             0,
-            time.monotonic() + home_timeout_seconds(self._speeds[first]),
+            started_at + home_timeout_seconds(self._speeds[first]),
             remaining,
             initial_limit_active=False,
+            operation_kind="home",
+            started_at=started_at,
         )
         self._refresh_status()
         self.diagnostic_event.emit(
@@ -760,15 +783,18 @@ class MotorController(QtCore.QObject):
             return None
         operation_id = uuid.uuid4().hex
         self._calibrated[axis] = False
+        started_at = time.monotonic()
         self._active_motion = _ActiveMotion(
             operation_id,
             "stall_release",
             axis,
             raw.position_pulses,
             None,
-            time.monotonic() + stall_release_timeout_seconds(signed_speed),
+            started_at + stall_release_timeout_seconds(signed_speed),
             initial_limit_active=raw.limit_active,
             signed_speed_pps=signed_speed,
+            operation_kind="stall_release",
+            started_at=started_at,
         )
         self._refresh_status()
         self.diagnostic_event.emit(
@@ -801,6 +827,7 @@ class MotorController(QtCore.QObject):
         self._start_emergency_stop("正在确认急停结果")
         self.diagnostic_event.emit("已向 X/M1、Y/M2 排队发送速度0和位置急停请求")
         if active:
+            self._emit_motion_summary(active, False, "user_stop")
             self.motion_finished.emit(active.operation_id, False, "user_stop")
         self._refresh_status()
         return True
@@ -1012,7 +1039,36 @@ class MotorController(QtCore.QObject):
         self._finish_motion(False, "stop_unconfirmed")
 
     def _schedule_motion_poll(self):
-        self._motion_poll_timer.start(50)
+        self._motion_poll_timer.start(MOTION_STATUS_REPOLL_MS)
+
+    def _send_motion_status_query(self):
+        motion = self._active_motion
+        if motion is None or not self._connected:
+            return False
+        self._active_motion = replace(
+            motion,
+            status_query_count=motion.status_query_count + 1,
+        )
+        return self.transport.send_request(
+            status_request(
+                self.host_settings.address,
+                DriverAxis(motion.axis.motor_number),
+            ),
+            tag=("motion_status", motion.operation_id),
+            timeout_ms=MOTION_STATUS_TIMEOUT_MS,
+            read_retries=MOTION_STATUS_READ_RETRIES,
+        )
+
+    def _handle_motion_deadline(self, motion):
+        if motion.kind == "stall_release":
+            if motion.initial_limit_active:
+                self._begin_release_stop(
+                    "stall_release_limit_not_released", False
+                )
+            else:
+                self._begin_release_stop("stall_release_timeout", True)
+        elif motion.kind in ("home", "move"):
+            self._begin_position_stop("motion_timeout")
 
     def _poll_motion(self):
         motion = self._active_motion
@@ -1032,23 +1088,12 @@ class MotorController(QtCore.QObject):
                 self._query_release_stop_status()
             return
         if time.monotonic() > motion.deadline:
-            if motion.kind == "stall_release":
-                if motion.initial_limit_active:
-                    self._begin_release_stop(
-                        "stall_release_limit_not_released", False
-                    )
-                else:
-                    self._begin_release_stop("stall_release_timeout", True)
-            elif motion.kind in ("home", "move"):
-                self._begin_position_stop("motion_timeout")
+            self._handle_motion_deadline(motion)
             return
         if self.transport.busy:
             self._schedule_motion_poll()
             return
-        self.transport.send_request(
-            status_request(self.host_settings.address, DriverAxis(motion.axis.motor_number)),
-            tag=("motion_status", motion.operation_id), read_retries=2,
-        )
+        self._send_motion_status_query()
 
     def _handle_motion_status(self, response):
         motion = self._active_motion
@@ -1143,9 +1188,24 @@ class MotorController(QtCore.QObject):
         self._active_motion = None
         self._motion_poll_timer.stop()
         if motion:
+            self._emit_motion_summary(motion, success, reason)
             self.motion_finished.emit(motion.operation_id, bool(success), str(reason))
         if not success:
             self.operation_failed.emit(str(reason))
+
+    def _emit_motion_summary(self, motion, success, reason):
+        started_at = motion.started_at or time.monotonic()
+        elapsed_ms = max(
+            0, round((time.monotonic() - started_at) * 1000)
+        )
+        operation_kind = motion.operation_kind or motion.kind
+        result = "成功" if success else "失败"
+        self.diagnostic_event.emit(
+            f"{motion.axis.value} 轴动作汇总：类型 {operation_kind}，"
+            f"耗时 {elapsed_ms} ms，状态查询 {motion.status_query_count} 次，"
+            f"读取失败 {motion.status_failure_count} 次，结果 {result}，"
+            f"原因 {reason}，操作 {motion.operation_id}"
+        )
 
     @Slot(object, object)
     def _on_command_completed(self, tag, response):
@@ -1290,7 +1350,29 @@ class MotorController(QtCore.QObject):
         kind = tag[0] if isinstance(tag, tuple) and tag else ""
         if kind == "probe" and self._probing:
             self._try_next_candidate()
-        elif kind in ("move_ack", "home_ack", "motion_status"):
+        elif kind == "motion_status":
+            motion = self._active_motion
+            if (
+                motion is None
+                or len(tag) < 2
+                or tag[1] != motion.operation_id
+            ):
+                return
+            motion = replace(
+                motion,
+                status_failure_count=motion.status_failure_count + 1,
+            )
+            self._active_motion = motion
+            if (
+                not self._connected
+                or reason in ("not_connected", "disconnected")
+            ):
+                self._finish_motion(False, reason)
+            elif time.monotonic() >= motion.deadline:
+                self._handle_motion_deadline(motion)
+            else:
+                self._schedule_motion_poll()
+        elif kind in ("move_ack", "home_ack"):
             if (
                 kind in ("move_ack", "home_ack")
                 and reason == "result_unknown"
@@ -1300,14 +1382,7 @@ class MotorController(QtCore.QObject):
                 self.diagnostic_event.emit(
                     f"{motion.axis.value} 轴动作写入应答超时，正在只读核对位置和状态"
                 )
-                self.transport.send_request(
-                    status_request(
-                        self.host_settings.address,
-                        DriverAxis(motion.axis.motor_number),
-                    ),
-                    tag=("motion_status", motion.operation_id),
-                    read_retries=2,
-                )
+                self._send_motion_status_query()
             else:
                 self._finish_motion(False, reason)
         elif kind == "release_ack":
