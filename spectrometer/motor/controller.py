@@ -50,6 +50,11 @@ from .settings_store import HostMotorSettings, MotorSettingsStore
 from .transport import MotorSerialTransport
 
 
+RELEASE_STOP_CONFIRM_SECONDS = 1.0
+RELEASE_STOP_POLL_MS = 100
+RELEASE_STOP_MAX_CHECKS = 4
+
+
 @dataclass(frozen=True)
 class _ActiveMotion:
     operation_id: str
@@ -64,6 +69,8 @@ class _ActiveMotion:
     signed_speed_pps: int = 0
     stop_reason: str = ""
     stop_success: bool = False
+    stop_check_count: int = 0
+    fallback_stop_sent: bool = False
 
 
 def _unknown_axis(axis):
@@ -870,8 +877,11 @@ class MotorController(QtCore.QObject):
         self._active_motion = replace(
             motion,
             kind="stall_release_stopping",
+            deadline=time.monotonic() + RELEASE_STOP_CONFIRM_SECONDS,
             stop_reason=str(reason),
             stop_success=bool(success),
+            stop_check_count=0,
+            fallback_stop_sent=False,
         )
         accepted = self.transport.send_request(
             velocity_mode_request(
@@ -890,6 +900,10 @@ class MotorController(QtCore.QObject):
         motion = self._active_motion
         if motion is None:
             return
+        if motion.fallback_stop_sent:
+            self._retry_release_stop_status(reason)
+            return
+        self._active_motion = replace(motion, fallback_stop_sent=True)
         self.diagnostic_event.emit(
             f"{motion.axis.value} 轴速度0停止结果未知，补发位置急停：{reason}"
         )
@@ -903,13 +917,45 @@ class MotorController(QtCore.QObject):
             action=True,
         )
         if not accepted:
-            self._lock_active_motion_stop_unknown("release_fallback_not_queued")
+            self._retry_release_stop_status("release_fallback_not_queued")
+
+    def _schedule_release_stop_poll(self):
+        self._motion_poll_timer.start(RELEASE_STOP_POLL_MS)
+
+    def _retry_release_stop_status(self, reason):
+        motion = self._active_motion
+        if motion is None:
+            return
+        if (
+            not self._connected
+            or time.monotonic() >= motion.deadline
+            or motion.stop_check_count >= RELEASE_STOP_MAX_CHECKS
+        ):
+            self._lock_active_motion_stop_unknown(reason)
+            return
+        self.diagnostic_event.emit(
+            f"{motion.axis.value} 轴停止状态尚未确认，正在复核：{reason}"
+        )
+        self._schedule_release_stop_poll()
 
     def _query_release_stop_status(self):
         motion = self._active_motion
         if motion is None:
             return
-        self.transport.send_request(
+        if (
+            not self._connected
+            or time.monotonic() >= motion.deadline
+            or motion.stop_check_count >= RELEASE_STOP_MAX_CHECKS
+        ):
+            self._lock_active_motion_stop_unknown(
+                "release_stop_confirmation_timeout"
+            )
+            return
+        self._active_motion = replace(
+            motion,
+            stop_check_count=motion.stop_check_count + 1,
+        )
+        accepted = self.transport.send_request(
             status_request(
                 self.host_settings.address,
                 DriverAxis(motion.axis.motor_number),
@@ -917,6 +963,10 @@ class MotorController(QtCore.QObject):
             tag=("release_stop_status", motion.operation_id),
             read_retries=2,
         )
+        if not accepted and self._active_motion is not None:
+            self._retry_release_stop_status(
+                "release_stop_status_not_queued"
+            )
 
     def _begin_position_stop(self, reason):
         motion = self._active_motion
@@ -967,6 +1017,19 @@ class MotorController(QtCore.QObject):
     def _poll_motion(self):
         motion = self._active_motion
         if motion is None or not self._connected:
+            return
+        if motion.kind == "stall_release_stopping":
+            if (
+                time.monotonic() >= motion.deadline
+                or motion.stop_check_count >= RELEASE_STOP_MAX_CHECKS
+            ):
+                self._lock_active_motion_stop_unknown(
+                    "release_stop_confirmation_timeout"
+                )
+            elif self.transport.busy:
+                self._schedule_release_stop_poll()
+            else:
+                self._query_release_stop_status()
             return
         if time.monotonic() > motion.deadline:
             if motion.kind == "stall_release":
@@ -1106,8 +1169,10 @@ class MotorController(QtCore.QObject):
             self._schedule_motion_poll()
         elif kind == "motion_status":
             self._handle_motion_status(response)
-        elif kind in ("release_stop", "release_fallback_stop"):
+        elif kind == "release_stop":
             self._query_release_stop_status()
+        elif kind == "release_fallback_stop":
+            self._schedule_release_stop_poll()
         elif kind == "release_stop_status":
             motion = self._active_motion
             if motion is None:
@@ -1117,9 +1182,14 @@ class MotorController(QtCore.QObject):
             self._axis_limit_known[motion.axis] = True
             self._refresh_status()
             if raw.moving:
-                self._lock_active_motion_stop_unknown(
-                    "release_still_running_after_stop"
-                )
+                if motion.fallback_stop_sent:
+                    self._retry_release_stop_status(
+                        "release_still_running_after_fallback_stop"
+                    )
+                else:
+                    self._fallback_release_stop(
+                        "release_still_running_after_velocity_stop"
+                    )
                 return
             self._finish_motion(
                 motion.stop_success,
@@ -1247,8 +1317,16 @@ class MotorController(QtCore.QObject):
             self._begin_release_stop("release_start_result_unknown", False)
         elif kind == "release_stop":
             self._fallback_release_stop(reason)
-        elif kind in ("release_fallback_stop", "release_stop_status"):
-            self._lock_active_motion_stop_unknown(reason)
+        elif kind == "release_fallback_stop":
+            self._retry_release_stop_status(reason)
+        elif kind == "release_stop_status":
+            motion = self._active_motion
+            if motion is None:
+                return
+            if motion.fallback_stop_sent:
+                self._retry_release_stop_status(reason)
+            else:
+                self._fallback_release_stop(reason)
         elif kind in ("motion_stop", "motion_stop_status"):
             self._lock_active_motion_stop_unknown(reason)
         elif kind == "stop":

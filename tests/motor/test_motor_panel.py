@@ -149,6 +149,29 @@ def test_motor_panel_emits_manual_and_scan_requests():
     assert scans == [panel.scan_parameters()]
 
 
+def test_motion_start_does_not_move_button_focus_to_scan_x():
+    app = application()
+    panel = MotorPanel()
+    panel.set_connection_state(True, "/dev/ttyUSB0")
+    panel.show()
+    plus = next(
+        button
+        for button in panel.findChildren(QtWidgets.QPushButton)
+        if button.toolTip() == "X 轴正向运动"
+    )
+    plus.setFocus()
+    app.processEvents()
+    assert plus.hasFocus()
+
+    panel.set_motion_active(True)
+    app.processEvents()
+
+    assert not panel.scan_x.hasFocus()
+    assert panel.scan_x.lineEdit().selectedText() == ""
+    panel.close()
+    app.processEvents()
+
+
 def test_motor_panel_emits_signed_speed_for_setting_and_stall_release():
     application()
     panel = MotorPanel()

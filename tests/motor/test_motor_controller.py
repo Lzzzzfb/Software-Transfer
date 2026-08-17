@@ -259,9 +259,80 @@ def test_stall_release_uses_travel_deadline_then_confirms_stop(tmp_path):
     assert finished[-1] == (operation_id, True, "stall_release_timeout")
 
 
-def test_stall_release_stop_failure_locks_motion_and_clear_faults_only_verifies_status(tmp_path):
+def test_stall_release_stale_running_status_uses_fallback_then_finishes(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    operation_id = controller.release_stall(Axis.X, 5000)
+    transport.complete_last(())
+    controller._active_motion = replace(controller._active_motion, deadline=0)
+    controller._poll_motion()
+    transport.complete_last(())
+
+    transport.complete_last([0, 1, 0, 100])
+    assert not controller.safety_locked
+    assert transport.sent[-1][0] == stop_request(1, DriverAxis.X)
+
+    transport.complete_last(())
+    controller._poll_motion()
+    transport.complete_last([0, 0, 0, 100])
+
+    assert not controller.safety_locked
+    assert finished[-1] == (operation_id, True, "stall_release_timeout")
+    assert not controller.status.x.calibrated
+
+
+def test_stall_release_status_read_failure_can_recover_without_lock(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    operation_id = controller.release_stall(Axis.X, 5000)
+    transport.complete_last(())
+    controller._active_motion = replace(controller._active_motion, deadline=0)
+    controller._poll_motion()
+    transport.complete_last(())
+
+    status_tag = transport.sent[-1][1]["tag"]
+    transport.command_failed.emit(status_tag, "timeout")
+    assert not controller.safety_locked
+    assert transport.sent[-1][0] == stop_request(1, DriverAxis.X)
+
+    transport.complete_last(())
+    controller._poll_motion()
+    transport.complete_last([0, 0, 0, 0])
+
+    assert not controller.safety_locked
+    assert finished[-1] == (operation_id, True, "stall_release_timeout")
+
+
+def test_stall_release_persistent_running_status_still_locks(tmp_path):
     controller, transport = connect_controller(tmp_path)
     controller.release_stall(Axis.X, 5000)
+    transport.complete_last(())
+    controller._active_motion = replace(controller._active_motion, deadline=0)
+    controller._poll_motion()
+    transport.complete_last(())
+    transport.complete_last([0, 1, 0, 100])
+    assert not controller.safety_locked
+    transport.complete_last(())
+
+    controller._active_motion = replace(controller._active_motion, deadline=0)
+    controller._poll_motion()
+    assert controller.safety_locked
+    assert controller.status.fault_latched
+
+
+def test_stall_release_stop_failures_lock_only_after_bounded_confirmation(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    operation_id = controller.release_stall(Axis.X, 5000)
     transport.complete_last(())
     controller._active_motion = replace(controller._active_motion, deadline=0)
     controller._poll_motion()
@@ -270,6 +341,16 @@ def test_stall_release_stop_failure_locks_motion_and_clear_faults_only_verifies_
     assert transport.sent[-1][0] == stop_request(1, DriverAxis.X)
     fallback_tag = transport.sent[-1][1]["tag"]
     transport.command_failed.emit(fallback_tag, "result_unknown")
+    assert not controller.safety_locked
+
+    controller._poll_motion()
+    assert transport.sent[-1][1]["tag"] == (
+        "release_stop_status",
+        operation_id,
+    )
+    status_tag = transport.sent[-1][1]["tag"]
+    controller._active_motion = replace(controller._active_motion, deadline=0)
+    transport.command_failed.emit(status_tag, "timeout")
     assert controller.safety_locked
     assert controller.status.fault_latched
     assert not controller.move_relative(Axis.X, 1.0, Direction.POSITIVE)

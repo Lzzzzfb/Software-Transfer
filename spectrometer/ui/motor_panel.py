@@ -360,7 +360,16 @@ class MotorPanel(QtWidgets.QWidget):
         self._refresh_enabled_state()
 
     def set_motion_active(self, active: bool):
-        self._motion_active = bool(active)
+        active = bool(active)
+        if active and not self._motion_active:
+            focus = QtWidgets.QApplication.focusWidget()
+            if isinstance(focus, QtWidgets.QPushButton) and any(
+                focus is control
+                for controls in self._axis_controls.values()
+                for control in controls["interactive"]
+            ):
+                focus.clearFocus()
+        self._motion_active = active
         self._refresh_enabled_state()
 
     def axis_speed(self, axis) -> int:
