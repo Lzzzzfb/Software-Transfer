@@ -114,6 +114,11 @@ def test_motor_panel_defaults_match_confirmed_scan_contract():
     assert parameters.dwell_seconds == 0.0
     assert not panel.scan_start_button.isEnabled()
     assert not panel.scan_stop_button.isEnabled()
+    assert panel.scan_start_button.text() == "开始扫描"
+    assert any(
+        group.title() == "扫描运动（连接光谱仪时同步采集并保存）"
+        for group in panel.findChildren(QtWidgets.QGroupBox)
+    )
     assert sum(
         button.text() == "机械回零"
         for button in panel.findChildren(QtWidgets.QPushButton)
@@ -348,3 +353,52 @@ def test_main_window_starts_scan_as_scan_owned_global_acquisition(tmp_path):
 
     window.close()
     app.processEvents()
+
+
+def test_main_window_starts_logged_motor_only_scan_without_devices(
+    tmp_path,
+    monkeypatch,
+):
+    app = application()
+    motor = FakeUiMotor()
+    window = MainWindow(
+        simulation=True,
+        auto_start_simulation=False,
+        settings_path=tmp_path / "settings.json",
+        motor_controller=motor,
+    )
+    window.device_manager.remove_all_devices()
+    window._sim_x.clear()
+    window.motor_panel.set_connection_state(True, "MOTOR-UI")
+    resets = []
+    window.acquisition.reset = lambda device_ids=None: resets.append(device_ids)
+
+    assert window._start_motor_scan(window.motor_panel.scan_parameters())
+    assert window.scan_controller.acquisition_enabled is False
+    assert window.scan_controller.state is ScanState.SCANNING
+    assert motor.moves
+    assert resets == []
+    assert not window.control.busy
+    assert (
+        window.status_panel.state_label.text()
+        == "未连接光谱仪，本次仅执行电机扫描"
+    )
+    assert "纯电机扫描开始" in window.diagnostics.log.toPlainText()
+    monkeypatch.setattr(
+        "spectrometer.ui.main_window.latest_run_with_acquisition",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("纯电机扫描应优先导出当前诊断会话")
+        ),
+    )
+    assert window._diagnostic_export_source() == (
+        window.diagnostic_recorder.run_dir,
+        "",
+    )
+
+    diagnostic_run = window.diagnostic_recorder.run_dir
+    window.scan_controller.stop()
+    window.close()
+    app.processEvents()
+    timeline = (diagnostic_run / "timeline.jsonl").read_text(encoding="utf-8")
+    assert '"event":"motor_scan_started"' in timeline
+    assert '"mode":"motor_only"' in timeline

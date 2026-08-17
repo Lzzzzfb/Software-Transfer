@@ -40,6 +40,7 @@ class MotorPanel(QtWidgets.QWidget):
         self._connected = False
         self._motion_active = False
         self._scan_active = False
+        self._scan_acquisition_enabled = True
         self._safety_locked = False
         self._axis_controls = {}
 
@@ -244,7 +245,7 @@ class MotorPanel(QtWidgets.QWidget):
         return control
 
     def _build_scan_group(self):
-        group = QtWidgets.QGroupBox("扫描运动（每轮连续采集并保存）")
+        group = QtWidgets.QGroupBox("扫描运动（连接光谱仪时同步采集并保存）")
         group.setObjectName("motorGroup")
         layout = QtWidgets.QGridLayout(group)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -313,7 +314,7 @@ class MotorPanel(QtWidgets.QWidget):
         layout.addWidget(note, 4, 0, 1, 4)
 
         button_row = QtWidgets.QHBoxLayout()
-        self.scan_start_button = QtWidgets.QPushButton("开始扫描并采集")
+        self.scan_start_button = QtWidgets.QPushButton("开始扫描")
         self.scan_start_button.setObjectName("scanStartButton")
         self.scan_start_button.clicked.connect(
             lambda: self.scan_start_requested.emit(self.scan_parameters())
@@ -423,16 +424,27 @@ class MotorPanel(QtWidgets.QWidget):
             ScanState.IDLE: "等待开始",
             ScanState.PRECHECK: "正在检查参数",
             ScanState.STARTING_ACQUISITION: "正在启动光谱仪",
-            ScanState.SCANNING: "扫描采集中",
+            ScanState.SCANNING: (
+                "扫描采集中"
+                if self._scan_acquisition_enabled
+                else "电机扫描中"
+            ),
             ScanState.DWELLING: "步进等待",
             ScanState.STOPPING_ACQUISITION: "正在停止并保存",
             ScanState.RETURNING: "正在返回扫描起点",
             ScanState.STOPPING: "正在安全停止",
-            ScanState.COMPLETED: "扫描完成",
+            ScanState.COMPLETED: (
+                "扫描完成"
+                if self._scan_acquisition_enabled
+                else "纯电机扫描完成"
+            ),
             ScanState.FAULTED: "扫描故障",
         }
         self.scan_progress.setText(labels[state])
         self._refresh_enabled_state()
+
+    def set_scan_acquisition_enabled(self, enabled: bool):
+        self._scan_acquisition_enabled = bool(enabled)
 
     def set_scan_progress(
         self,

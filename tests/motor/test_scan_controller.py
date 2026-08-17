@@ -195,6 +195,105 @@ def test_each_round_acquires_continuously_then_returns_without_acquisition(
     assert manifest["rounds"][0]["completed"] is True
 
 
+def test_motor_only_scan_runs_and_returns_without_acquisition_or_manifest(
+    tmp_path,
+):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+    events = []
+    controller.scan_event.connect(
+        lambda event, payload: events.append((event, dict(payload)))
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(),
+        storage_format=StorageFormat.CSV,
+        batch_size=50,
+    )
+    assert controller.state is ScanState.SCANNING
+    assert controller.acquisition_enabled is False
+    assert acquisition.starts == []
+    assert len(motor.moves) == 1
+
+    for _ in range(3):
+        motor.finish_motion()
+    assert controller.state is ScanState.RETURNING
+    assert acquisition.stop_count == 0
+    assert motor.moves[-1] == (Axis.Y, 1.0, Direction.NEGATIVE)
+
+    motor.finish_motion()
+    assert controller.state is ScanState.COMPLETED
+    assert acquisition.starts == []
+    assert acquisition.stop_count == 0
+    assert controller.manifest_path is None
+    assert list(tmp_path.glob("scan-*.json")) == []
+    assert [event for event, _payload in events] == [
+        "motor_scan_started",
+        "motor_scan_round_started",
+        "motor_scan_round_completed",
+        "motor_scan_finished",
+    ]
+    assert events[0][1]["mode"] == "motor_only"
+    assert events[-1][1]["status"] == "completed"
+
+
+def test_motor_only_scan_starts_next_round_after_return(tmp_path):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+    assert controller.start(
+        ScanParameters(1, 1, 1, 2),
+        device_ids=(),
+    )
+
+    for _ in range(4):
+        motor.finish_motion()
+
+    assert controller.state is ScanState.SCANNING
+    assert len(motor.moves) == 5
+    assert acquisition.starts == []
+
+
+def test_motor_only_stop_and_fault_do_not_wait_for_acquisition(tmp_path):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+    finished = []
+    controller.scan_finished.connect(
+        lambda success, reason, manifest: finished.append(
+            (success, reason, manifest)
+        )
+    )
+    assert controller.start(ScanParameters(1, 1, 1, 1), device_ids=())
+    assert controller.stop()
+    assert controller.state is ScanState.IDLE
+    assert finished[-1] == (False, "user_stop", None)
+    assert acquisition.stop_count == 0
+
+    assert controller.start(ScanParameters(1, 1, 1, 1), device_ids=())
+    motor.finish_motion(success=False, reason="limit_fault")
+    assert controller.state is ScanState.FAULTED
+    assert finished[-1] == (False, "limit_fault", None)
+    assert acquisition.stop_count == 0
+
+
 def test_next_round_starts_only_after_save_and_return_complete(tmp_path):
     application()
     parameters = ScanParameters(1, 1, 1, 2)

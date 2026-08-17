@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
+import uuid
 
 from ..domain.enums import (
     AcquisitionMode,
@@ -39,12 +40,17 @@ class ScanAcquisitionConfig:
     storage_format: StorageFormat
     batch_size: int
 
+    @property
+    def enabled(self) -> bool:
+        return bool(self.device_ids)
+
 
 class ScanController(QtCore.QObject):
     state_changed = Signal(object)
     progress_changed = Signal(int, int, int, int)
     operation_failed = Signal(str)
     scan_finished = Signal(bool, str, object)
+    scan_event = Signal(str, object)
 
     def __init__(
         self,
@@ -58,6 +64,7 @@ class ScanController(QtCore.QObject):
         self.motor = motor_controller
         self.acquisition = acquisition_controller
         self._manifest = ScanManifestWriter(manifest_directory)
+        self._manifest_active = False
         self._state = ScanState.IDLE
         self._plan: ScanPlan | None = None
         self._config: ScanAcquisitionConfig | None = None
@@ -70,6 +77,7 @@ class ScanController(QtCore.QObject):
         self._failure_reason = ""
         self._user_stopping = False
         self._finished_emitted = False
+        self._scan_id = ""
 
         self._dwell_timer = QtCore.QTimer(self)
         self._dwell_timer.setSingleShot(True)
@@ -104,7 +112,15 @@ class ScanController(QtCore.QObject):
 
     @property
     def manifest_path(self):
-        return self._manifest.path
+        return self._manifest.path if self._manifest_active else None
+
+    @property
+    def acquisition_enabled(self) -> bool:
+        return bool(self._config and self._config.enabled)
+
+    @property
+    def scan_id(self) -> str:
+        return self._scan_id
 
     def set_manifest_directory(self, directory) -> bool:
         if self.active:
@@ -118,6 +134,20 @@ class ScanController(QtCore.QObject):
             return
         self._state = state
         self.state_changed.emit(state)
+
+    def _emit_scan_event(self, event: str, **payload):
+        self.scan_event.emit(
+            str(event),
+            {
+                "scan_id": self._scan_id,
+                "mode": (
+                    "acquisition"
+                    if self.acquisition_enabled
+                    else "motor_only"
+                ),
+                **payload,
+            },
+        )
 
     def start(
         self,
@@ -152,8 +182,6 @@ class ScanController(QtCore.QObject):
                     "X/Y 坐标未校准，需确认风险后才能扫描"
                 )
             ids = tuple(int(device_id) for device_id in device_ids)
-            if not ids:
-                raise ValueError("没有参与扫描采集的光谱仪")
             start_position = (
                 Position(
                     status.x.mechanical_position_mm,
@@ -187,12 +215,23 @@ class ScanController(QtCore.QObject):
         self._failure_reason = ""
         self._user_stopping = False
         self._finished_emitted = False
+        self._scan_id = uuid.uuid4().hex
+        self._manifest_active = config.enabled
         if hasattr(self.motor, "set_scan_active"):
             self.motor.set_scan_active(True)
-        self._manifest.start(
-            plan,
-            motor_device_id=self.motor.device_id,
-            spectrometer_device_ids=config.device_ids,
+        if self._manifest_active:
+            self._manifest.start(
+                plan,
+                motor_device_id=self.motor.device_id,
+                spectrometer_device_ids=config.device_ids,
+            )
+        self._emit_scan_event(
+            "motor_scan_started",
+            parameters=asdict(plan.parameters),
+            start_position=asdict(plan.start),
+            calibrated_start=bool(plan.calibrated_start),
+            round_total=len(plan.rounds),
+            spectrometer_device_ids=list(config.device_ids),
         )
         self._start_round()
         return True
@@ -206,6 +245,17 @@ class ScanController(QtCore.QObject):
         self._current_operation_id = ""
         self._current_task_id = ""
         self._round_files = []
+        self._emit_scan_event(
+            "motor_scan_round_started",
+            round_number=self._round_index + 1,
+            round_total=len(self._plan.rounds),
+            scan_move_total=len(self._current_round().scan_moves),
+            return_move_total=len(self._current_round().return_moves),
+        )
+        if not self.acquisition_enabled:
+            self._set_state(ScanState.SCANNING)
+            self._advance_scan()
+            return
         self._set_state(ScanState.STARTING_ACQUISITION)
         accepted = self.acquisition.start_scan_global(
             self._config.device_ids,
@@ -280,7 +330,10 @@ class ScanController(QtCore.QObject):
             return
         moves = self._current_round().scan_moves
         if self._move_index >= len(moves):
-            self._stop_round_acquisition()
+            if self.acquisition_enabled:
+                self._stop_round_acquisition()
+            else:
+                self._begin_return()
             return
         self._begin_move(moves[self._move_index], returning=False)
 
@@ -289,9 +342,17 @@ class ScanController(QtCore.QObject):
             return
         moves = self._current_round().return_moves
         if self._move_index >= len(moves):
-            self._manifest.return_finished(
-                self._current_round().index,
-                completed=True,
+            if self._manifest_active:
+                self._manifest.return_finished(
+                    self._current_round().index,
+                    completed=True,
+                )
+            self._emit_scan_event(
+                "motor_scan_round_completed",
+                round_number=self._round_index + 1,
+                round_total=len(self._plan.rounds),
+                scan_move_total=len(self._current_round().scan_moves),
+                return_move_total=len(self._current_round().return_moves),
             )
             self._round_index += 1
             if self._round_index >= len(self._plan.rounds):
@@ -338,6 +399,11 @@ class ScanController(QtCore.QObject):
         if not self.acquisition.stop_global():
             self._begin_fault("无法停止光谱仪扫描采集")
 
+    def _begin_return(self):
+        self._move_index = 0
+        self._set_state(ScanState.RETURNING)
+        self._advance_return()
+
     @Slot(str, object, object)
     def _on_task_finished(self, task_id: str, files, failed):
         if str(task_id) != self._current_task_id:
@@ -366,9 +432,7 @@ class ScanController(QtCore.QObject):
         if self._state is not ScanState.STOPPING_ACQUISITION:
             self._begin_fault("光谱仪任务提前结束")
             return
-        self._move_index = 0
-        self._set_state(ScanState.RETURNING)
-        self._advance_return()
+        self._begin_return()
 
     @Slot(str)
     def _on_acquisition_rejected(self, message: str):
@@ -414,30 +478,41 @@ class ScanController(QtCore.QObject):
         self._finish_fault()
 
     def _finish_fault(self):
-        if self._plan is not None and self._round_index < len(self._plan.rounds):
+        if (
+            self._manifest_active
+            and self._plan is not None
+            and self._round_index < len(self._plan.rounds)
+        ):
             self._manifest.return_finished(
                 self._current_round().index,
                 completed=False,
                 reason=self._failure_reason,
             )
-        self._manifest.finish("faulted", self._failure_reason)
+        if self._manifest_active:
+            self._manifest.finish("faulted", self._failure_reason)
         self._set_state(ScanState.FAULTED)
         self.operation_failed.emit(self._failure_reason)
         self._emit_finished(False, self._failure_reason)
 
     def _finish_stopped(self, reason: str):
-        if self._plan is not None and self._round_index < len(self._plan.rounds):
+        if (
+            self._manifest_active
+            and self._plan is not None
+            and self._round_index < len(self._plan.rounds)
+        ):
             self._manifest.return_finished(
                 self._current_round().index,
                 completed=False,
                 reason=reason,
             )
-        self._manifest.finish("stopped", reason)
+        if self._manifest_active:
+            self._manifest.finish("stopped", reason)
         self._set_state(ScanState.IDLE)
         self._emit_finished(False, reason)
 
     def _complete(self):
-        self._manifest.finish("completed")
+        if self._manifest_active:
+            self._manifest.finish("completed")
         self._set_state(ScanState.COMPLETED)
         self._emit_finished(True, "completed")
 
@@ -447,6 +522,19 @@ class ScanController(QtCore.QObject):
         if hasattr(self.motor, "set_scan_active"):
             self.motor.set_scan_active(False)
         self._finished_emitted = True
+        self._emit_scan_event(
+            "motor_scan_finished",
+            status=(
+                "completed"
+                if success
+                else "stopped" if reason == "user_stop" else "faulted"
+            ),
+            reason=str(reason),
+            completed_rounds=min(
+                self._round_index,
+                len(self._plan.rounds) if self._plan is not None else 0,
+            ),
+        )
         self.scan_finished.emit(
             bool(success),
             str(reason),
