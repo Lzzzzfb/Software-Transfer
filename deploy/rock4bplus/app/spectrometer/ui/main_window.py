@@ -162,6 +162,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._diagnostic_recent_by_device = {}
         self._diagnostic_recent_expected = set()
         self._diagnostic_export_pending = False
+        self._diagnostic_current_run_preferred = False
         self._diagnostic_observer = AcquisitionObserver()
         self._pending_missing_logs = {}
         self._pending_plot_frames = {}
@@ -462,6 +463,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_controller.scan_finished.connect(
             self._scan_finished
         )
+        self.scan_controller.scan_event.connect(self._scan_event)
 
     def _apply_settings(self):
         self.plot_widget.set_line_width(self.settings["line_width"])
@@ -640,9 +642,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         devices = self._global_devices()
         device_ids = [device.device_id for device in devices]
-        if not device_ids:
-            self._scan_operation_failed("没有参与扫描采集的光谱仪")
-            return False
+        acquisition_enabled = bool(device_ids)
+        self.motor_panel.set_scan_acquisition_enabled(acquisition_enabled)
         calibrated = (
             self.motor_controller.status.x.calibrated
             and self.motor_controller.status.y.calibrated
@@ -661,7 +662,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_controller.set_manifest_directory(
             Path(self.settings["storage_path"]) / "scan-manifests"
         )
-        self.acquisition.reset(device_ids)
+        if acquisition_enabled:
+            self.acquisition.reset(device_ids)
         return self.scan_controller.start(
             parameters,
             device_ids=device_ids,
@@ -692,8 +694,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 "扫描轮次完成，正在停止光谱仪并保存…"
             )
         elif state is ScanState.RETURNING:
+            if self.scan_controller.acquisition_enabled:
+                message = "光谱数据已保存，电机正在返回扫描起点…"
+            else:
+                message = "本轮电机扫描完成，正在返回扫描起点…"
+            self.status_panel.state_label.setText(message)
+        elif (
+            state is ScanState.SCANNING
+            and not self.scan_controller.acquisition_enabled
+        ):
             self.status_panel.state_label.setText(
-                "光谱数据已保存，电机正在返回扫描起点…"
+                "未连接光谱仪，本次仅执行电机扫描"
             )
 
     def _scan_operation_failed(self, message):
@@ -702,15 +713,74 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _scan_finished(self, success, reason, manifest_path):
         self._set_scan_ui_locked(False)
+        motor_only = manifest_path is None
         if success:
-            self._log(f"扫描任务完成；清单：{manifest_path}")
+            if motor_only:
+                self.status_panel.state_label.setText("纯电机扫描完成")
+            else:
+                self._log(f"扫描任务完成；清单：{manifest_path}")
         elif reason != "user_stop":
-            self._log(
-                f"扫描任务异常结束：{reason}；清单：{manifest_path}",
-                "ERROR",
-            )
+            if not motor_only:
+                self._log(
+                    f"扫描任务异常结束：{reason}；清单：{manifest_path}",
+                    "ERROR",
+                )
         else:
-            self._log(f"扫描任务已由用户停止；清单：{manifest_path}", "WARN")
+            if motor_only:
+                self.status_panel.state_label.setText("纯电机扫描已停止")
+            else:
+                self._log(
+                    f"扫描任务已由用户停止；清单：{manifest_path}",
+                    "WARN",
+                )
+
+    def _scan_event(self, event, payload):
+        payload = dict(payload or {})
+        motor_only = payload.get("mode") == "motor_only"
+        if motor_only:
+            self._diagnostic_current_run_preferred = True
+        if event == "motor_scan_started":
+            parameters = payload.get("parameters", {})
+            prefix = "纯电机扫描" if motor_only else "联动扫描"
+            message = (
+                f"{prefix}开始：X={parameters.get('x_mm')} mm，"
+                f"Y={parameters.get('y_mm')} mm，"
+                f"行程数={parameters.get('line_count')}，"
+                f"扫描次数={parameters.get('scan_count')}，"
+                f"X步数={parameters.get('x_steps')}，"
+                f"Y步数={parameters.get('y_steps')}，"
+                f"步时={parameters.get('dwell_seconds')} s"
+            )
+        elif event == "motor_scan_round_started":
+            message = (
+                f"扫描第 {payload.get('round_number')}/"
+                f"{payload.get('round_total')} 轮开始"
+            )
+        elif event == "motor_scan_round_completed":
+            message = (
+                f"扫描第 {payload.get('round_number')}/"
+                f"{payload.get('round_total')} 轮及返回完成"
+            )
+        elif event == "motor_scan_finished":
+            status = payload.get("status")
+            label = {
+                "completed": "完成",
+                "stopped": "由用户停止",
+                "faulted": "异常结束",
+            }.get(status, str(status))
+            prefix = "纯电机扫描" if motor_only else "联动扫描"
+            message = f"{prefix}{label}"
+            if payload.get("reason") not in ("", "completed", "user_stop"):
+                message += f"：{payload.get('reason')}"
+        else:
+            message = f"扫描事件：{event}"
+        level = (
+            "ERROR"
+            if payload.get("status") == "faulted"
+            else "WARN" if payload.get("status") == "stopped" else "INFO"
+        )
+        self.diagnostics.append(message, level)
+        self.diagnostic_recorder.record_event(event, payload, level=level)
 
     def _device_changed(self, device_id):
         device = self.device_manager.get_device(device_id)
@@ -1581,14 +1651,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         include = self.diagnostics.include_recent_frames.isChecked()
         self.diagnostics.set_export_state(True, "正在生成并校验 ZIP…")
-        run_dir = self.diagnostic_recorder.run_dir
-        acquisition_id = self.diagnostic_recorder.latest_acquisition_id
-        if not acquisition_id:
-            previous = latest_run_with_acquisition(
-                self._diagnostic_root, exclude=run_dir
-            )
-            if previous is not None:
-                run_dir, acquisition_id = previous
+        run_dir, acquisition_id = self._diagnostic_export_source()
         self._diagnostic_future = self._diagnostic_executor.submit(
             export_diagnostic_bundle,
             run_dir,
@@ -1602,6 +1665,17 @@ class MainWindow(QtWidgets.QMainWindow):
             acquisition_summary=dict(self._process_diagnostics),
         )
         QtCore.QTimer.singleShot(50, self._poll_diagnostic_export)
+
+    def _diagnostic_export_source(self):
+        run_dir = self.diagnostic_recorder.run_dir
+        acquisition_id = self.diagnostic_recorder.latest_acquisition_id
+        if not acquisition_id and not self._diagnostic_current_run_preferred:
+            previous = latest_run_with_acquisition(
+                self._diagnostic_root, exclude=run_dir
+            )
+            if previous is not None:
+                run_dir, acquisition_id = previous
+        return run_dir, acquisition_id
 
     def _poll_diagnostic_export(self):
         future = self._diagnostic_future
