@@ -3,7 +3,7 @@
 - 日期：2026-08-18
 - 依据：`docs/superpowers/specs/2026-08-18-lk-md2202-scan-smoothness-design.md`
 - 设计提交：`2e9e6cc`
-- 状态：已批准，待实施
+- 状态：代码与部署镜像已完成，待ROCK 4B+实机验收
 - 说明：当前会话没有 `writing-plans` 技能，本文件按项目既有格式提供等价的测试优先计划
 
 ## 1. 工作区保护与基线
