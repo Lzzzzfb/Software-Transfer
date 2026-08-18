@@ -14,6 +14,7 @@ from spectrometer.motor.lk_md2202 import (
     decode_communication,
     decode_identity,
     decode_supported_identity,
+    absolute_move_request,
     home_request,
     identity_request,
     relative_move_request,
@@ -89,6 +90,12 @@ def test_status_and_action_registers_are_mapped_per_axis():
     assert status.position_pulses == -4800
     assert relative_move_request(1, DriverAxis.X, 320)[:6] == bytes.fromhex("01 10 00 20 00 02")
     assert relative_move_request(1, DriverAxis.Y, -320)[:6] == bytes.fromhex("01 10 00 40 00 02")
+    assert absolute_move_request(1, DriverAxis.X, 320) == append_crc(
+        bytes.fromhex("01 10 00 22 00 02 04 00 00 01 40")
+    )
+    assert absolute_move_request(1, DriverAxis.Y, 4800) == append_crc(
+        bytes.fromhex("01 10 00 42 00 02 04 00 00 12 C0")
+    )
     assert stop_request(1, DriverAxis.X) == append_crc(bytes.fromhex("01 06 00 24 00 01"))
     assert home_request(1, DriverAxis.Y) == append_crc(bytes.fromhex("01 06 00 45 00 01"))
 
@@ -116,9 +123,22 @@ def test_velocity_mode_rejects_signed_32bit_overflow(speed):
         velocity_mode_request(1, DriverAxis.X, speed)
 
 
+@pytest.mark.parametrize("target", [0, 2**32 - 1])
+def test_absolute_move_accepts_unsigned_32bit_boundaries(target):
+    assert absolute_move_request(1, DriverAxis.X, target)[1] == 0x10
+
+
+@pytest.mark.parametrize("target", [-1, 2**32])
+def test_absolute_move_rejects_unsigned_32bit_overflow(target):
+    with pytest.raises(ValueError):
+        absolute_move_request(1, DriverAxis.X, target)
+
+
 def test_rejects_z_and_non_zero_limit_mode():
     with pytest.raises(ValueError, match="only X"):
         relative_move_request(1, "Z", 1)
+    with pytest.raises(ValueError, match="only X"):
+        absolute_move_request(1, "Z", 1)
     with pytest.raises(ValueError, match="only X"):
         velocity_mode_request(1, "Z", 1)
     with pytest.raises(ValueError, match="zero-point"):
