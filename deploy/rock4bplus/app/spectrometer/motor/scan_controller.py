@@ -78,12 +78,21 @@ class ScanController(QtCore.QObject):
         self._user_stopping = False
         self._finished_emitted = False
         self._scan_id = ""
+        self._waiting_round_verification = False
 
         self._dwell_timer = QtCore.QTimer(self)
         self._dwell_timer.setSingleShot(True)
         self._dwell_timer.timeout.connect(self._after_dwell)
 
         self.motor.motion_finished.connect(self._on_motion_finished)
+        if hasattr(self.motor, "scan_round_prepared"):
+            self.motor.scan_round_prepared.connect(
+                self._on_scan_round_prepared
+            )
+        if hasattr(self.motor, "scan_round_verified"):
+            self.motor.scan_round_verified.connect(
+                self._on_scan_round_verified
+            )
         if hasattr(self.motor, "connection_changed"):
             self.motor.connection_changed.connect(
                 self._on_motor_connection_changed
@@ -216,9 +225,13 @@ class ScanController(QtCore.QObject):
         self._user_stopping = False
         self._finished_emitted = False
         self._scan_id = uuid.uuid4().hex
+        self._waiting_round_verification = False
         self._manifest_active = config.enabled
         if hasattr(self.motor, "set_scan_active"):
-            self.motor.set_scan_active(True)
+            if self.motor.set_scan_active(True) is False:
+                self._set_state(ScanState.IDLE)
+                self.operation_failed.emit("电机扫描任务锁定失败")
+                return False
         if self._manifest_active:
             self._manifest.start(
                 plan,
@@ -245,6 +258,7 @@ class ScanController(QtCore.QObject):
         self._current_operation_id = ""
         self._current_task_id = ""
         self._round_files = []
+        self._waiting_round_verification = False
         self._emit_scan_event(
             "motor_scan_round_started",
             round_number=self._round_index + 1,
@@ -252,6 +266,28 @@ class ScanController(QtCore.QObject):
             scan_move_total=len(self._current_round().scan_moves),
             return_move_total=len(self._current_round().return_moves),
         )
+        self._set_state(ScanState.PRECHECK)
+        if hasattr(self.motor, "prepare_scan_round"):
+            if not self.motor.prepare_scan_round():
+                self._begin_fault("无法读取并锁定本轮电机原始起点")
+            return
+        self._begin_round_after_motor_prepared()
+
+    @Slot(bool, str)
+    def _on_scan_round_prepared(self, success: bool, reason: str):
+        if not self.active or self._state is not ScanState.PRECHECK:
+            return
+        if not success:
+            self._begin_fault(str(reason) or "电机扫描轮次准备失败")
+            return
+        self._emit_scan_event(
+            "motor_scan_round_prepared",
+            round_number=self._round_index + 1,
+            reason=str(reason),
+        )
+        self._begin_round_after_motor_prepared()
+
+    def _begin_round_after_motor_prepared(self):
         if not self.acquisition_enabled:
             self._set_state(ScanState.SCANNING)
             self._advance_scan()
@@ -302,17 +338,49 @@ class ScanController(QtCore.QObject):
         self._set_state(
             ScanState.RETURNING if returning else ScanState.SCANNING
         )
-        operation_id = self.motor.move_relative(
-            move.axis,
-            move.distance_mm,
-            move.direction,
-        )
+        if hasattr(self.motor, "move_scan_segment"):
+            final_scan_segment = (
+                not returning
+                and self._move_index
+                == len(self._current_round().scan_moves) - 1
+            )
+            operation_id = self.motor.move_scan_segment(
+                move.axis,
+                move.pulses,
+                move.direction,
+                predictive=not final_scan_segment and not returning,
+                returning=returning,
+            )
+        else:
+            operation_id = self.motor.move_relative(
+                move.axis,
+                move.distance_mm,
+                move.direction,
+            )
         if not operation_id:
             self._begin_fault(
                 f"{move.axis.value} 轴运动命令未被接受"
             )
             return
         self._current_operation_id = operation_id
+        self._emit_scan_event(
+            "motor_scan_segment_started",
+            round_number=self._round_index + 1,
+            segment_number=self._move_index + 1,
+            segment_total=(
+                len(self._current_round().return_moves)
+                if returning
+                else len(self._current_round().scan_moves)
+            ),
+            operation_id=str(operation_id),
+            axis=move.axis.value,
+            direction=move.direction.value,
+            pulses=int(move.pulses),
+            predictive=bool(not returning and not final_scan_segment)
+            if hasattr(self.motor, "move_scan_segment")
+            else False,
+            returning=bool(returning),
+        )
         round_number = self._round_index + 1
         self.progress_changed.emit(
             round_number,
@@ -330,10 +398,7 @@ class ScanController(QtCore.QObject):
             return
         moves = self._current_round().scan_moves
         if self._move_index >= len(moves):
-            if self.acquisition_enabled:
-                self._stop_round_acquisition()
-            else:
-                self._begin_return()
+            self._verify_scan_round()
             return
         self._begin_move(moves[self._move_index], returning=False)
 
@@ -375,8 +440,26 @@ class ScanController(QtCore.QObject):
         if self._user_stopping:
             return
         if not success:
+            self._emit_scan_event(
+                "motor_scan_segment_finished",
+                round_number=self._round_index + 1,
+                segment_number=self._move_index + 1,
+                operation_id=str(operation_id),
+                success=False,
+                reason=str(reason),
+                returning=bool(returning),
+            )
             self._begin_fault(str(reason) or "电机运动失败")
             return
+        self._emit_scan_event(
+            "motor_scan_segment_finished",
+            round_number=self._round_index + 1,
+            segment_number=self._move_index + 1,
+            operation_id=str(operation_id),
+            success=True,
+            reason=str(reason),
+            returning=bool(returning),
+        )
         self._move_index += 1
         if returning:
             self._advance_return()
@@ -398,6 +481,37 @@ class ScanController(QtCore.QObject):
         self._set_state(ScanState.STOPPING_ACQUISITION)
         if not self.acquisition.stop_global():
             self._begin_fault("无法停止光谱仪扫描采集")
+
+    def _verify_scan_round(self):
+        self._waiting_round_verification = True
+        self._emit_scan_event(
+            "motor_scan_round_verifying",
+            round_number=self._round_index + 1,
+        )
+        if hasattr(self.motor, "verify_scan_round"):
+            if not self.motor.verify_scan_round():
+                self._waiting_round_verification = False
+                self._begin_fault("无法启动扫描终点严格校验")
+            return
+        self._on_scan_round_verified(True, "legacy_verified")
+
+    @Slot(bool, str)
+    def _on_scan_round_verified(self, success: bool, reason: str):
+        if not self.active or not self._waiting_round_verification:
+            return
+        self._waiting_round_verification = False
+        if not success:
+            self._begin_fault(str(reason) or "扫描终点严格校验失败")
+            return
+        self._emit_scan_event(
+            "motor_scan_round_verified",
+            round_number=self._round_index + 1,
+            reason=str(reason),
+        )
+        if self.acquisition_enabled:
+            self._stop_round_acquisition()
+        else:
+            self._begin_return()
 
     def _begin_return(self):
         self._move_index = 0
@@ -454,6 +568,7 @@ class ScanController(QtCore.QObject):
         self._set_state(ScanState.STOPPING)
         self._current_operation_id = ""
         self._current_move = None
+        self._waiting_round_verification = False
         self.motor.stop()
         if self._current_task_id:
             if not self.acquisition.stop_global():
@@ -470,7 +585,11 @@ class ScanController(QtCore.QObject):
         self._set_state(ScanState.STOPPING)
         self._current_operation_id = ""
         self._current_move = None
-        if getattr(self.motor, "motion_active", False):
+        self._waiting_round_verification = False
+        if (
+            getattr(self.motor, "motion_active", False)
+            or getattr(self.motor, "scan_active", False)
+        ):
             self.motor.stop()
         if self._current_task_id:
             if self.acquisition.stop_global():

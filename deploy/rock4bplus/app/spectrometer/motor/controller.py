@@ -22,6 +22,7 @@ from .lk_md2202 import (
     decode_communication,
     decode_supported_identity,
     axis_configuration_request,
+    absolute_move_request,
     communication_request,
     configuration_changes,
     home_request,
@@ -47,6 +48,7 @@ from .models import (
 )
 from .modbus_rtu import build_write_single
 from .settings_store import HostMotorSettings, MotorSettingsStore
+from .scan_timing import MotionHandoffEstimator
 from .transport import MotorSerialTransport
 
 
@@ -56,6 +58,11 @@ RELEASE_STOP_MAX_CHECKS = 4
 MOTION_STATUS_TIMEOUT_MS = 100
 MOTION_STATUS_REPOLL_MS = 20
 MOTION_STATUS_READ_RETRIES = 0
+SCAN_ACK_TIMEOUT_MS = 60
+SCAN_ACCEPTANCE_SECONDS = 1.0
+SCAN_STATUS_TIMEOUT_MS = 150
+SCAN_STATUS_REPOLL_MS = 40
+SCAN_VERIFY_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +85,13 @@ class _ActiveMotion:
     started_at: float = 0.0
     status_query_count: int = 0
     status_failure_count: int = 0
+    predictive: bool = False
+    acceptance_deadline: float = 0.0
+    acceptance_retry_count: int = 0
+    command_accepted: bool = False
+    estimator: MotionHandoffEstimator | None = None
+    handoff_deadline: float = 0.0
+    scan_returning: bool = False
 
 
 def _unknown_axis(axis):
@@ -99,6 +113,8 @@ class MotorController(QtCore.QObject):
     motion_finished = Signal(str, bool, str)
     configuration_apply_finished = Signal(bool, str)
     speed_applied = Signal(object, int, int, str)
+    scan_round_prepared = Signal(bool, str)
+    scan_round_verified = Signal(bool, str)
 
     def __init__(self, parent=None, *, transport=None, settings_store=None, port_provider=available_port_records):
         super().__init__(parent)
@@ -125,6 +141,11 @@ class MotorController(QtCore.QObject):
         self._pending_configuration = {}
         self._initialization_step = ""
         self._scan_active = False
+        self._scan_round_baseline = None
+        self._scan_round_planned = None
+        self._scan_prepare_values = None
+        self._scan_verify_values = None
+        self._scan_verify_deadline = 0.0
         self._config_ops = []
         self._desired_configuration = None
         self._desired_host_settings = None
@@ -142,6 +163,9 @@ class MotorController(QtCore.QObject):
         self._idle_poll_timer = QtCore.QTimer(self)
         self._idle_poll_timer.setInterval(500)
         self._idle_poll_timer.timeout.connect(self._poll_idle_status)
+        self._scan_aux_timer = QtCore.QTimer(self)
+        self._scan_aux_timer.setSingleShot(True)
+        self._scan_aux_timer.timeout.connect(self._continue_scan_verification)
         self.transport.connection_changed.connect(self._on_transport_connection)
         self.transport.command_completed.connect(self._on_command_completed)
         self.transport.command_failed.connect(self._on_command_failed)
@@ -190,6 +214,16 @@ class MotorController(QtCore.QObject):
             )
             return False
         self._scan_active = bool(active)
+        if self._scan_active:
+            self._idle_poll_timer.stop()
+        else:
+            self._scan_round_baseline = None
+            self._scan_round_planned = None
+            self._scan_prepare_values = None
+            self._scan_verify_values = None
+            self._scan_aux_timer.stop()
+            if self._connected:
+                self._idle_poll_timer.start()
         return True
 
     def update_host_settings(self, settings):
@@ -640,6 +674,190 @@ class MotorController(QtCore.QObject):
         pulses = round(distance_mm * MOTOR_PULSES_PER_MM) * direction.sign
         return self._start_logical_move(axis, pulses)
 
+    def prepare_scan_round(self):
+        """Read both axes and freeze an idempotent raw-position baseline."""
+        if (
+            not self._connected
+            or not self._scan_active
+            or self.motion_active
+            or self._safety_locked
+            or not self.mechanics_valid
+            or self._scan_prepare_values is not None
+            or self._scan_verify_values is not None
+        ):
+            return False
+        self._scan_prepare_values = {}
+        accepted = self.transport.send_request(
+            status_request(self.host_settings.address, DriverAxis.X),
+            tag=("scan_prepare", Axis.X),
+            timeout_ms=SCAN_STATUS_TIMEOUT_MS,
+            read_retries=0,
+        )
+        if not accepted:
+            self._scan_prepare_values = None
+        return bool(accepted)
+
+    def _finish_scan_preparation(self, success, reason):
+        values = self._scan_prepare_values
+        if values is None:
+            return
+        self._scan_prepare_values = None
+        if success and values is not None:
+            baseline = {
+                Axis.X: values[Axis.X].position_pulses,
+                Axis.Y: values[Axis.Y].position_pulses,
+            }
+            self._scan_round_baseline = dict(baseline)
+            self._scan_round_planned = dict(baseline)
+            self.diagnostic_event.emit(
+                "扫描轮次原始起点已锁定："
+                f"X {baseline[Axis.X]} pulse，Y {baseline[Axis.Y]} pulse"
+            )
+        self.scan_round_prepared.emit(bool(success), str(reason))
+
+    def move_scan_segment(
+        self,
+        axis,
+        pulses,
+        direction,
+        *,
+        predictive=True,
+        returning=False,
+    ):
+        """Start a scan-only absolute move with safe command acceptance."""
+        axis, direction = Axis(axis), Direction(direction)
+        pulses = int(pulses)
+        if (
+            not self._connected
+            or not self._scan_active
+            or self.motion_active
+            or self._safety_locked
+            or self._scan_round_baseline is None
+            or self._scan_round_planned is None
+        ):
+            self.operation_failed.emit("扫描电机未就绪或已有运动正在执行")
+            return None
+        if pulses <= 0:
+            self.operation_failed.emit("扫描段脉冲数必须大于0")
+            return None
+        planned_start = int(self._scan_round_planned[axis])
+        if returning:
+            target = int(self._scan_round_baseline[axis])
+        else:
+            logical_delta = pulses * direction.sign
+            device_delta = -logical_delta if self._reverse(axis) else logical_delta
+            target = planned_start + device_delta
+        if not 0 <= target <= 0xFFFFFFFF:
+            self.operation_failed.emit(
+                f"{axis.value} 轴扫描绝对目标 {target} pulse 超出驱动器范围"
+            )
+            return None
+        if target == planned_start:
+            self.operation_failed.emit(f"{axis.value} 轴扫描段目标没有变化")
+            return None
+
+        operation_id = uuid.uuid4().hex
+        started_at = time.monotonic()
+        duration = abs(target - planned_start) / self._speeds[axis]
+        estimator = MotionHandoffEstimator(
+            start_pulses=planned_start,
+            target_pulses=target,
+            commanded_at=started_at,
+            configured_speed_pps=self._speeds[axis],
+        )
+        self._active_motion = _ActiveMotion(
+            operation_id=operation_id,
+            kind="scan_move",
+            axis=axis,
+            start_pulses=planned_start,
+            target_pulses=target,
+            deadline=started_at + max(5, duration * 3 + 2),
+            operation_kind=(
+                "scan_return_strict"
+                if returning
+                else "scan_predictive"
+                if predictive
+                else "scan_final_strict"
+            ),
+            started_at=started_at,
+            predictive=bool(predictive and not returning),
+            acceptance_deadline=started_at + SCAN_ACCEPTANCE_SECONDS,
+            estimator=estimator,
+            scan_returning=bool(returning),
+        )
+        # The target is deterministic and remains fixed even when the write
+        # acknowledgement is lost. It is safe to retry only after status proves
+        # that the axis is still stopped at planned_start.
+        self._scan_round_planned[axis] = target
+        self.diagnostic_event.emit(
+            f"{axis.value} 轴扫描绝对运动：起点 {planned_start} pulse，"
+            f"目标 {target} pulse，预测交接 {bool(predictive and not returning)}，"
+            f"操作 {operation_id}"
+        )
+        self.motion_started.emit(operation_id)
+        if not self._send_scan_absolute_command():
+            self._scan_round_planned[axis] = planned_start
+            self._finish_motion(False, "scan_command_not_queued")
+            return None
+        return operation_id
+
+    def _send_scan_absolute_command(self):
+        motion = self._active_motion
+        if motion is None or motion.kind != "scan_move":
+            return False
+        return self.transport.send_request(
+            absolute_move_request(
+                self.host_settings.address,
+                DriverAxis(motion.axis.motor_number),
+                motion.target_pulses,
+            ),
+            tag=("scan_move_ack", motion.operation_id),
+            timeout_ms=SCAN_ACK_TIMEOUT_MS,
+            read_retries=0,
+            action=True,
+        )
+
+    def verify_scan_round(self):
+        """Strictly verify both planned end targets before acquisition stops."""
+        if (
+            not self._connected
+            or not self._scan_active
+            or self.motion_active
+            or self._scan_round_planned is None
+            or self._scan_verify_values is not None
+        ):
+            return False
+        self._scan_verify_values = {}
+        self._scan_verify_deadline = time.monotonic() + SCAN_VERIFY_TIMEOUT_SECONDS
+        return self._send_scan_verify_axis(Axis.X)
+
+    def _send_scan_verify_axis(self, axis):
+        accepted = self.transport.send_request(
+            status_request(
+                self.host_settings.address,
+                DriverAxis(Axis(axis).motor_number),
+            ),
+            tag=("scan_verify", Axis(axis)),
+            timeout_ms=SCAN_STATUS_TIMEOUT_MS,
+            read_retries=0,
+        )
+        if not accepted:
+            self._finish_scan_verification(False, "scan_verify_not_queued")
+        return bool(accepted)
+
+    def _continue_scan_verification(self):
+        if self._scan_verify_values is not None:
+            self._scan_verify_values.clear()
+            self._send_scan_verify_axis(Axis.X)
+
+    def _finish_scan_verification(self, success, reason):
+        if self._scan_verify_values is None:
+            return
+        self._scan_aux_timer.stop()
+        self._scan_verify_values = None
+        self._scan_verify_deadline = 0.0
+        self.scan_round_verified.emit(bool(success), str(reason))
+
     def _start_logical_move(self, axis, logical_pulses):
         axis = Axis(axis)
         if not self._connected or self.motion_active or self._safety_locked:
@@ -1038,8 +1256,10 @@ class MotorController(QtCore.QObject):
         )
         self._finish_motion(False, "stop_unconfirmed")
 
-    def _schedule_motion_poll(self):
-        self._motion_poll_timer.start(MOTION_STATUS_REPOLL_MS)
+    def _schedule_motion_poll(self, delay_ms=None):
+        self._motion_poll_timer.start(
+            MOTION_STATUS_REPOLL_MS if delay_ms is None else max(1, int(delay_ms))
+        )
 
     def _send_motion_status_query(self):
         motion = self._active_motion
@@ -1049,14 +1269,20 @@ class MotorController(QtCore.QObject):
             motion,
             status_query_count=motion.status_query_count + 1,
         )
+        scan_motion = motion.kind == "scan_move"
         return self.transport.send_request(
             status_request(
                 self.host_settings.address,
                 DriverAxis(motion.axis.motor_number),
             ),
-            tag=("motion_status", motion.operation_id),
-            timeout_ms=MOTION_STATUS_TIMEOUT_MS,
-            read_retries=MOTION_STATUS_READ_RETRIES,
+            tag=(
+                "scan_motion_status" if scan_motion else "motion_status",
+                motion.operation_id,
+            ),
+            timeout_ms=(
+                SCAN_STATUS_TIMEOUT_MS if scan_motion else MOTION_STATUS_TIMEOUT_MS
+            ),
+            read_retries=(0 if scan_motion else MOTION_STATUS_READ_RETRIES),
         )
 
     def _handle_motion_deadline(self, motion):
@@ -1067,7 +1293,7 @@ class MotorController(QtCore.QObject):
                 )
             else:
                 self._begin_release_stop("stall_release_timeout", True)
-        elif motion.kind in ("home", "move"):
+        elif motion.kind in ("home", "move", "scan_move"):
             self._begin_position_stop("motion_timeout")
 
     def _poll_motion(self):
@@ -1087,13 +1313,249 @@ class MotorController(QtCore.QObject):
             else:
                 self._query_release_stop_status()
             return
-        if time.monotonic() > motion.deadline:
+        now = time.monotonic()
+        if motion.kind == "scan_move" and not motion.command_accepted:
+            if now >= motion.acceptance_deadline:
+                self._finish_motion(False, "scan_command_acceptance_timeout")
+            elif self.transport.busy:
+                self._schedule_motion_poll(SCAN_STATUS_REPOLL_MS)
+            else:
+                self._send_scan_acceptance_query()
+            return
+        if motion.kind == "scan_move" and motion.handoff_deadline:
+            if now >= motion.handoff_deadline:
+                self._finish_motion(True, "handoff_predicted")
+            else:
+                self._schedule_motion_poll(
+                    round((motion.handoff_deadline - now) * 1000)
+                )
+            return
+        if now > motion.deadline:
             self._handle_motion_deadline(motion)
             return
         if self.transport.busy:
             self._schedule_motion_poll()
             return
         self._send_motion_status_query()
+
+    def _send_scan_acceptance_query(self):
+        motion = self._active_motion
+        if motion is None or motion.kind != "scan_move":
+            return False
+        self._active_motion = replace(
+            motion,
+            status_query_count=motion.status_query_count + 1,
+        )
+        return self.transport.send_request(
+            status_request(
+                self.host_settings.address,
+                DriverAxis(motion.axis.motor_number),
+            ),
+            tag=("scan_accept_status", motion.operation_id),
+            timeout_ms=SCAN_STATUS_TIMEOUT_MS,
+            read_retries=0,
+        )
+
+    def _handle_scan_acceptance_status(self, response):
+        motion = self._active_motion
+        if motion is None or motion.kind != "scan_move":
+            return
+        raw = decode_axis_status(response.registers)
+        self._axis_device_status[motion.axis] = raw
+        self._axis_limit_known[motion.axis] = True
+        self._refresh_status()
+        now = time.monotonic()
+        start = int(motion.start_pulses)
+        target = int(motion.target_pulses)
+        direction = 1 if target > start else -1
+        progress = (raw.position_pulses - start) * direction
+        distance = abs(target - start)
+        if raw.limit_active and target != 0:
+            self._finish_motion(False, "unexpected_zero_limit")
+            return
+        if progress > distance:
+            self._finish_motion(False, "scan_target_overshoot")
+            return
+        if (
+            raw.moving
+            and progress < 0
+            and motion.estimator is not None
+            and abs(progress)
+            > motion.estimator.config.near_target_pulses
+        ):
+            self._finish_motion(False, "scan_reverse_motion")
+            return
+        if abs(raw.position_pulses - target) <= 1 and not raw.moving:
+            self._active_motion = replace(motion, command_accepted=True)
+            self._finish_motion(True, "completed_strict")
+            return
+        if raw.moving and progress > 0:
+            motion = replace(motion, command_accepted=True)
+            self._active_motion = motion
+            self._handle_scan_motion_status(motion, raw)
+            return
+        if not raw.moving and raw.position_pulses == start:
+            if now >= motion.acceptance_deadline:
+                self._finish_motion(False, "scan_command_acceptance_timeout")
+                return
+            self._active_motion = replace(
+                motion,
+                acceptance_retry_count=motion.acceptance_retry_count + 1,
+            )
+            self.diagnostic_event.emit(
+                f"{motion.axis.value} 轴扫描写入未执行，重发相同绝对目标 "
+                f"{target} pulse，操作 {motion.operation_id}"
+            )
+            if not self._send_scan_absolute_command():
+                self._finish_motion(False, "scan_command_retry_not_queued")
+            return
+        if raw.moving and progress <= 0 and now < motion.acceptance_deadline:
+            self._schedule_motion_poll(SCAN_STATUS_REPOLL_MS)
+            return
+        self._finish_motion(False, "scan_command_acceptance_ambiguous")
+
+    def _handle_scan_prepare_status(self, axis, response):
+        if self._scan_prepare_values is None:
+            return
+        axis = Axis(axis)
+        raw = decode_axis_status(response.registers)
+        self._axis_device_status[axis] = raw
+        self._axis_limit_known[axis] = True
+        self._refresh_status()
+        if raw.moving:
+            self._finish_scan_preparation(
+                False, f"{axis.value}_axis_still_moving_before_scan"
+            )
+            return
+        self._scan_prepare_values[axis] = raw
+        if axis is Axis.X:
+            accepted = self.transport.send_request(
+                status_request(self.host_settings.address, DriverAxis.Y),
+                tag=("scan_prepare", Axis.Y),
+                timeout_ms=SCAN_STATUS_TIMEOUT_MS,
+                read_retries=0,
+            )
+            if not accepted:
+                self._finish_scan_preparation(False, "scan_prepare_not_queued")
+        else:
+            self._finish_scan_preparation(True, "prepared")
+
+    def _handle_scan_verify_status(self, axis, response):
+        if self._scan_verify_values is None or self._scan_round_planned is None:
+            return
+        axis = Axis(axis)
+        raw = decode_axis_status(response.registers)
+        self._axis_device_status[axis] = raw
+        self._axis_limit_known[axis] = True
+        self._refresh_status()
+        now = time.monotonic()
+        target = int(self._scan_round_planned[axis])
+        if raw.moving:
+            if now >= self._scan_verify_deadline:
+                self._finish_scan_verification(
+                    False, f"{axis.value}_axis_scan_verify_timeout"
+                )
+            else:
+                self._scan_aux_timer.start(SCAN_STATUS_REPOLL_MS)
+            return
+        if abs(raw.position_pulses - target) > 1:
+            self._finish_scan_verification(
+                False,
+                f"{axis.value}_axis_scan_end_mismatch_{raw.position_pulses}_{target}",
+            )
+            return
+        if raw.limit_active and target != 0:
+            self._finish_scan_verification(
+                False, f"{axis.value}_axis_unexpected_zero_limit"
+            )
+            return
+        self._scan_verify_values[axis] = raw
+        if axis is Axis.X:
+            self._send_scan_verify_axis(Axis.Y)
+        else:
+            self.diagnostic_event.emit(
+                "扫描终点严格校验通过："
+                f"X {self._scan_round_planned[Axis.X]} pulse，"
+                f"Y {self._scan_round_planned[Axis.Y]} pulse"
+            )
+            self._finish_scan_verification(True, "verified")
+
+    def _record_scan_sample(self, motion, raw, captured_at):
+        estimator = motion.estimator
+        if estimator is None:
+            return motion
+        last = estimator.last_sample
+        if last is not None:
+            direction = estimator.direction
+            if (raw.position_pulses - last.position_pulses) * direction <= 0:
+                return motion
+        try:
+            estimator.add_sample(raw.position_pulses, captured_at)
+        except ValueError:
+            return motion
+        return replace(motion, estimator=estimator)
+
+    def _handle_scan_motion_status(self, motion, raw):
+        now = time.monotonic()
+        start = int(motion.start_pulses)
+        target = int(motion.target_pulses)
+        direction = 1 if target > start else -1
+        distance = abs(target - start)
+        progress = (raw.position_pulses - start) * direction
+        if raw.limit_active and target != 0:
+            self._finish_motion(False, "unexpected_zero_limit")
+            return
+        if progress > distance:
+            self._finish_motion(False, "scan_target_overshoot")
+            return
+        if raw.moving:
+            # Same-direction substeps can be handed off while the previous
+            # absolute target is still being approached. Such a pre-start
+            # sample is not trusted for prediction, but it is not reversal.
+            estimator = motion.estimator
+            if (
+                progress < 0
+                and estimator is not None
+                and abs(progress) > estimator.config.near_target_pulses
+            ):
+                self._finish_motion(False, "scan_reverse_motion")
+                return
+            if estimator is not None and estimator.last_sample is not None:
+                incremental = (
+                    raw.position_pulses
+                    - estimator.last_sample.position_pulses
+                ) * direction
+                if incremental < 0:
+                    self._finish_motion(False, "scan_reverse_motion")
+                    return
+            if progress > 0:
+                motion = self._record_scan_sample(motion, raw, now)
+                self._active_motion = motion
+            estimator = motion.estimator
+            if (
+                motion.predictive
+                and estimator is not None
+                and estimator.is_near_target
+            ):
+                handoff = estimator.handoff_deadline(now)
+                self._active_motion = replace(
+                    motion, handoff_deadline=float(handoff)
+                )
+                self.diagnostic_event.emit(
+                    f"{motion.axis.value} 轴扫描进入预测交接区："
+                    f"剩余 {estimator.remaining_pulses} pulse，操作 {motion.operation_id}"
+                )
+                self._schedule_motion_poll(round((handoff - now) * 1000))
+            else:
+                self._schedule_motion_poll(SCAN_STATUS_REPOLL_MS)
+            return
+        if abs(raw.position_pulses - target) <= 1:
+            self._finish_motion(
+                True,
+                "completed_strict" if not motion.predictive else "completed_observed",
+            )
+            return
+        self._finish_motion(False, "scan_position_mismatch")
 
     def _handle_motion_status(self, response):
         motion = self._active_motion
@@ -1111,6 +1573,9 @@ class MotorController(QtCore.QObject):
             motion = replace(motion, limit_transition_seen=True)
             self._active_motion = motion
         self._refresh_status()
+        if motion.kind == "scan_move":
+            self._handle_scan_motion_status(motion, raw)
+            return
         if motion.kind == "stall_release":
             if motion.initial_limit_active and not raw.limit_active:
                 self._begin_release_stop(
@@ -1227,8 +1692,29 @@ class MotorController(QtCore.QObject):
                 self.disconnect()
         elif kind in ("move_ack", "home_ack", "release_ack"):
             self._schedule_motion_poll()
+        elif kind == "scan_move_ack":
+            motion = self._active_motion
+            if (
+                motion is not None
+                and len(tag) > 1
+                and tag[1] == motion.operation_id
+            ):
+                self._active_motion = replace(
+                    motion, command_accepted=True
+                )
+                # Query promptly after the write ACK so short 1 mm segments
+                # still have a chance to produce a trusted moving sample.
+                self._schedule_motion_poll(1)
         elif kind == "motion_status":
             self._handle_motion_status(response)
+        elif kind == "scan_motion_status":
+            self._handle_motion_status(response)
+        elif kind == "scan_accept_status":
+            self._handle_scan_acceptance_status(response)
+        elif kind == "scan_prepare":
+            self._handle_scan_prepare_status(tag[1], response)
+        elif kind == "scan_verify":
+            self._handle_scan_verify_status(tag[1], response)
         elif kind == "release_stop":
             self._query_release_stop_status()
         elif kind == "release_fallback_stop":
@@ -1350,7 +1836,7 @@ class MotorController(QtCore.QObject):
         kind = tag[0] if isinstance(tag, tuple) and tag else ""
         if kind == "probe" and self._probing:
             self._try_next_candidate()
-        elif kind == "motion_status":
+        elif kind in ("motion_status", "scan_motion_status"):
             motion = self._active_motion
             if (
                 motion is None
@@ -1368,10 +1854,72 @@ class MotorController(QtCore.QObject):
                 or reason in ("not_connected", "disconnected")
             ):
                 self._finish_motion(False, reason)
+            elif (
+                kind == "scan_motion_status"
+                and motion.predictive
+                and motion.estimator is not None
+                and (
+                    motion.estimator.timeout_is_end_phase
+                    or motion.estimator.prediction_due(time.monotonic())
+                )
+            ):
+                deadline = motion.estimator.handoff_deadline(
+                    time.monotonic()
+                )
+                self._active_motion = replace(
+                    motion, handoff_deadline=float(deadline)
+                )
+                self._schedule_motion_poll(
+                    round(max(0.0, deadline - time.monotonic()) * 1000)
+                )
             elif time.monotonic() >= motion.deadline:
                 self._handle_motion_deadline(motion)
             else:
-                self._schedule_motion_poll()
+                self._schedule_motion_poll(
+                    SCAN_STATUS_REPOLL_MS
+                    if kind == "scan_motion_status"
+                    else None
+                )
+        elif kind == "scan_accept_status":
+            motion = self._active_motion
+            if (
+                motion is None
+                or len(tag) < 2
+                or tag[1] != motion.operation_id
+            ):
+                return
+            self._active_motion = replace(
+                motion,
+                status_failure_count=motion.status_failure_count + 1,
+            )
+            if time.monotonic() >= motion.acceptance_deadline:
+                self._finish_motion(
+                    False, "scan_command_acceptance_timeout"
+                )
+            else:
+                # A missing read cannot prove whether the write executed, so
+                # do not resend it; read status again within the 1 s window.
+                self._schedule_motion_poll(SCAN_STATUS_REPOLL_MS)
+        elif kind == "scan_move_ack":
+            if reason == "result_unknown" and self._active_motion is not None:
+                self.diagnostic_event.emit(
+                    "扫描绝对目标写入应答超时，正在只读确认是否已执行"
+                )
+                self._send_scan_acceptance_query()
+            else:
+                self._finish_motion(False, reason)
+        elif kind == "scan_prepare":
+            self._finish_scan_preparation(False, f"scan_prepare_{reason}")
+        elif kind == "scan_verify":
+            if (
+                self._scan_verify_values is not None
+                and time.monotonic() < self._scan_verify_deadline
+            ):
+                self._scan_aux_timer.start(SCAN_STATUS_REPOLL_MS)
+            else:
+                self._finish_scan_verification(
+                    False, f"scan_verify_{reason}"
+                )
         elif kind in ("move_ack", "home_ack"):
             if (
                 kind in ("move_ack", "home_ack")

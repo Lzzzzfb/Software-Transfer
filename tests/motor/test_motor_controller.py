@@ -7,6 +7,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import spectrometer.motor.controller as motor_controller_module
 from spectrometer.motor.controller import MotorController
 from spectrometer.motor.lk_md2202 import (
     AxisConfiguration,
@@ -16,6 +17,7 @@ from spectrometer.motor.lk_md2202 import (
     DriverAxis,
     LEGACY_IDENTITY_REGISTERS,
     RunCurrent,
+    absolute_move_request,
     relative_move_request,
     position_speed_request,
     stop_request,
@@ -127,6 +129,20 @@ def connect_controller(tmp_path, identity_response=None):
     transport.complete_last([0, 0, 0, 0])
     assert controller.connected
     return controller, transport
+
+
+def prepare_scan_round(controller, transport, *, x=0, y=0):
+    prepared = []
+    controller.scan_round_prepared.connect(
+        lambda success, reason: prepared.append((success, reason))
+    )
+    assert controller.set_scan_active(True)
+    assert controller.prepare_scan_round()
+    assert transport.sent[-1][1]["tag"] == ("scan_prepare", Axis.X)
+    transport.complete_last([0, 0, (x >> 16) & 0xFFFF, x & 0xFFFF])
+    assert transport.sent[-1][1]["tag"] == ("scan_prepare", Axis.Y)
+    transport.complete_last([0, 0, (y >> 16) & 0xFFFF, y & 0xFFFF])
+    assert prepared == [(True, "prepared")]
 
 
 def test_auto_connect_uses_read_only_identity_then_reads_configuration(tmp_path):
@@ -631,6 +647,192 @@ def test_scan_lease_rejects_configuration_write(tmp_path):
     before = len(transport.sent)
     assert not controller.apply_configuration(DeviceConfiguration(), controller.host_settings)
     assert len(transport.sent) == before
+
+
+def test_scan_round_preparation_freezes_fresh_raw_axis_positions(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    prepare_scan_round(controller, transport, x=320, y=640)
+
+    assert controller._scan_round_baseline == {
+        Axis.X: 320,
+        Axis.Y: 640,
+    }
+    assert controller._scan_round_planned == {
+        Axis.X: 320,
+        Axis.Y: 640,
+    }
+
+
+def test_predictive_scan_segment_hands_off_from_trusted_near_sample(
+    tmp_path, monkeypatch
+):
+    controller, transport = connect_controller(tmp_path)
+    prepare_scan_round(controller, transport)
+    clock = [0.0]
+    monkeypatch.setattr(
+        motor_controller_module.time, "monotonic", lambda: clock[0]
+    )
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+
+    operation_id = controller.move_scan_segment(
+        Axis.X, 320, Direction.POSITIVE, predictive=True
+    )
+    request, options = transport.sent[-1]
+    assert request == absolute_move_request(1, DriverAxis.X, 320)
+    assert options["timeout_ms"] == 60
+    assert options["read_retries"] == 0
+    transport.complete_last(())
+
+    clock[0] = 0.05
+    controller._poll_motion()
+    assert transport.sent[-1][1]["tag"] == (
+        "scan_motion_status",
+        operation_id,
+    )
+    assert transport.sent[-1][1]["timeout_ms"] == 150
+    transport.complete_last([0, 1, 0, 200])
+    assert controller.motion_active
+    assert controller._active_motion.handoff_deadline == pytest.approx(0.2)
+
+    clock[0] = 0.2
+    controller._poll_motion()
+    assert finished[-1] == (operation_id, True, "handoff_predicted")
+    assert not controller.motion_active
+
+
+def test_unknown_scan_write_retries_only_after_stopped_start_is_observed(
+    tmp_path, monkeypatch
+):
+    controller, transport = connect_controller(tmp_path)
+    prepare_scan_round(controller, transport)
+    clock = [0.0]
+    monkeypatch.setattr(
+        motor_controller_module.time, "monotonic", lambda: clock[0]
+    )
+    operation_id = controller.move_scan_segment(
+        Axis.X, 320, Direction.POSITIVE
+    )
+    absolute_request = transport.sent[-1][0]
+    ack_tag = transport.sent[-1][1]["tag"]
+
+    transport.command_failed.emit(ack_tag, "result_unknown")
+    assert transport.sent[-1][1]["tag"] == (
+        "scan_accept_status",
+        operation_id,
+    )
+    accept_tag = transport.sent[-1][1]["tag"]
+    transport.command_failed.emit(accept_tag, "timeout")
+    assert sum(item[0] == absolute_request for item in transport.sent) == 1
+
+    clock[0] = 0.2
+    controller._poll_motion()
+    transport.complete_last([0, 0, 0, 0])
+    assert sum(item[0] == absolute_request for item in transport.sent) == 2
+    assert controller._active_motion.acceptance_retry_count == 1
+
+
+def test_final_scan_segment_and_round_verification_are_strict(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    prepare_scan_round(controller, transport)
+    finished = []
+    verified = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    controller.scan_round_verified.connect(
+        lambda success, reason: verified.append((success, reason))
+    )
+
+    operation_id = controller.move_scan_segment(
+        Axis.X, 320, Direction.POSITIVE, predictive=False
+    )
+    transport.complete_last(())
+    controller._poll_motion()
+    transport.complete_last([0, 1, 0, 200])
+    assert controller.motion_active
+    controller._poll_motion()
+    transport.complete_last([0, 0, 0, 320])
+    assert finished[-1] == (operation_id, True, "completed_strict")
+
+    assert controller.verify_scan_round()
+    transport.complete_last([0, 0, 0, 320])
+    transport.complete_last([0, 0, 0, 0])
+    assert verified == [(True, "verified")]
+
+
+def test_predictive_scan_never_predicts_without_trusted_motion_sample(
+    tmp_path, monkeypatch
+):
+    controller, transport = connect_controller(tmp_path)
+    prepare_scan_round(controller, transport)
+    clock = [0.0]
+    monkeypatch.setattr(
+        motor_controller_module.time, "monotonic", lambda: clock[0]
+    )
+    controller.move_scan_segment(
+        Axis.X, 320, Direction.POSITIVE, predictive=True
+    )
+    transport.complete_last(())
+    clock[0] = 0.05
+    controller._poll_motion()
+    transport.command_failed.emit(
+        transport.sent[-1][1]["tag"], "timeout"
+    )
+
+    assert controller.motion_active
+    assert controller._active_motion.handoff_deadline == 0.0
+    assert controller._motion_poll_timer.interval() == 40
+
+
+def test_scan_moving_far_away_from_target_fails_as_reverse_motion(tmp_path):
+    controller, transport = connect_controller(tmp_path)
+    prepare_scan_round(controller, transport, x=320)
+    finished = []
+    controller.motion_finished.connect(
+        lambda operation_id, success, reason: finished.append(
+            (operation_id, success, reason)
+        )
+    )
+    operation_id = controller.move_scan_segment(
+        Axis.X, 320, Direction.POSITIVE
+    )
+    transport.complete_last(())
+    controller._poll_motion()
+    transport.complete_last([0, 1, 0, 100])
+
+    assert finished[-1] == (
+        operation_id,
+        False,
+        "scan_reverse_motion",
+    )
+
+
+def test_scan_return_uses_frozen_round_start_as_strict_absolute_target(
+    tmp_path,
+):
+    controller, transport = connect_controller(tmp_path)
+    prepare_scan_round(controller, transport, x=320, y=640)
+    controller._scan_round_planned[Axis.X] = 960
+
+    operation_id = controller.move_scan_segment(
+        Axis.X,
+        640,
+        Direction.NEGATIVE,
+        predictive=True,
+        returning=True,
+    )
+    request, _options = transport.sent[-1]
+    assert request == absolute_move_request(1, DriverAxis.X, 320)
+    assert controller._active_motion.predictive is False
+    assert controller._active_motion.scan_returning is True
+    assert operation_id
 
 
 def test_reversed_axis_checks_logical_travel_and_accepts_negative_driver_position(tmp_path):
