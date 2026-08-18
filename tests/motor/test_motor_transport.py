@@ -1,4 +1,5 @@
 import os
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,6 +19,16 @@ def application():
     global _APPLICATION
     _APPLICATION = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     return _APPLICATION
+
+
+def wait_until(predicate, *, timeout=1.0):
+    app = application()
+    deadline = time.monotonic() + timeout
+    while not predicate() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    app.processEvents()
+    return predicate()
 
 
 def read_response(address, *registers):
@@ -98,15 +109,15 @@ def test_read_timeout_retries_but_action_timeout_does_not():
     read = build_read_holding(1, 0, 1)
     transport.send_request(read, tag="read", read_retries=1)
     app.processEvents()
-    transport._on_timeout()
-    transport._on_timeout()
+    transport._engine._on_timeout()
+    transport._engine._on_timeout()
     assert worker.writes == [read, read]
     assert failures == [("read", "timeout")]
 
     action = build_write_single(1, 0x24, 1)
     transport.send_request(action, tag="move", read_retries=5, action=True)
     app.processEvents()
-    transport._on_timeout()
+    transport._engine._on_timeout()
     assert worker.writes[-1] == action
     assert worker.writes.count(action) == 1
     assert failures[-1] == ("move", "result_unknown")
@@ -139,3 +150,26 @@ def test_read_response_register_count_must_match_request():
     assert failures
     assert failures[-1][0] == "read-two"
     assert "register count" in failures[-1][1]
+
+
+def test_complete_transaction_engine_runs_in_serial_thread():
+    application()
+    worker = FakeSerialWorker()
+    transport = MotorSerialTransport(worker=worker, own_thread=True)
+    try:
+        transport.connect_port("COM8", 9600)
+        assert wait_until(lambda: transport.connected)
+        assert transport._thread is not None
+        assert transport._engine.thread() is transport._thread
+        assert transport._engine._timer.thread() is transport._thread
+        assert transport._worker.thread() is transport._thread
+
+        request = build_read_holding(1, 0, 1)
+        assert transport.send_request(request, tag="threaded-read")
+        assert wait_until(lambda: worker.writes == [request])
+        assert transport.busy
+
+        worker.bytes_received.emit(read_response(1, 0x1234))
+        assert wait_until(lambda: not transport.busy)
+    finally:
+        transport.shutdown()

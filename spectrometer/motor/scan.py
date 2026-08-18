@@ -29,6 +29,7 @@ class ScanMove:
     pulses: int
     dwell_after_seconds: float
     acquiring: bool
+    logical_substeps: int = 1
 
     @property
     def distance_mm(self):
@@ -67,16 +68,25 @@ def _validate(parameters, start, calibrated):
             raise ValueError(f"{name} must be a positive integer")
     if parameters.y_mm * parameters.line_count > MOTOR_TRAVEL_MM + 1e-9:
         raise ValueError("Y scan matrix exceeds 15 mm travel")
+    if (
+        not math.isfinite(parameters.dwell_seconds)
+        or parameters.dwell_seconds < 0
+    ):
+        raise ValueError("dwell_seconds must be non-negative")
+    x_execution_steps = (
+        1 if parameters.dwell_seconds == 0 else parameters.x_steps
+    )
+    y_execution_steps = (
+        1 if parameters.dwell_seconds == 0 else parameters.y_steps
+    )
     move_count = parameters.scan_count * (
-        (parameters.line_count + 1) * parameters.x_steps
-        + parameters.line_count * parameters.y_steps
+        (parameters.line_count + 1) * x_execution_steps
+        + parameters.line_count * y_execution_steps
     )
     if move_count > MAX_SCAN_MOVES:
         raise ValueError(
             f"scan plan contains {move_count} moves; maximum is {MAX_SCAN_MOVES}"
         )
-    if not math.isfinite(parameters.dwell_seconds) or parameters.dwell_seconds < 0:
-        raise ValueError("dwell_seconds must be non-negative")
     x_pulses, y_pulses = round(parameters.x_mm * MOTOR_PULSES_PER_MM), round(parameters.y_mm * MOTOR_PULSES_PER_MM)
     if x_pulses < parameters.x_steps or y_pulses < parameters.y_steps:
         raise ValueError("each scan substep must contain at least one pulse")
@@ -93,7 +103,21 @@ def _split_pulses(total, count):
 
 
 def _substeps(axis, direction, total_pulses, count, dwell):
-    return [ScanMove(axis, direction, pulses, dwell, True) for pulses in _split_pulses(total_pulses, count)]
+    if dwell == 0:
+        return [
+            ScanMove(
+                axis,
+                direction,
+                total_pulses,
+                0.0,
+                True,
+                logical_substeps=count,
+            )
+        ]
+    return [
+        ScanMove(axis, direction, pulses, dwell, True)
+        for pulses in _split_pulses(total_pulses, count)
+    ]
 
 
 def _apply(position, move):

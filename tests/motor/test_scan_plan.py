@@ -51,10 +51,39 @@ def test_substeps_preserve_geometry_and_apply_one_wait_per_substep():
 
     assert len(x_moves) == 30
     assert {move.distance_mm for move in x_moves} == {1.0}
+    assert {move.logical_substeps for move in x_moves} == {1}
     assert len(y_moves) == 4
     assert {move.distance_mm for move in y_moves} == {0.5}
+    assert {move.logical_substeps for move in y_moves} == {1}
     assert all(move.dwell_after_seconds == 1.0 for move in scan_moves[:-1])
     assert scan_moves[-1].dwell_after_seconds == 0.0
+    assert plan.rounds[0].scan_end == Position(10, 2)
+
+
+def test_zero_dwell_coalesces_each_complete_axis_stroke():
+    plan = build_scan_plan(
+        ScanParameters(
+            x_mm=10,
+            y_mm=1,
+            line_count=2,
+            scan_count=1,
+            x_steps=10,
+            y_steps=2,
+            dwell_seconds=0,
+        ),
+        start=Position(0, 0),
+    )
+    scan_moves = plan.rounds[0].scan_moves
+    x_moves = [move for move in scan_moves if move.axis is Axis.X]
+    y_moves = [move for move in scan_moves if move.axis is Axis.Y]
+
+    assert len(x_moves) == 3
+    assert [move.pulses for move in x_moves] == [3200, 3200, 3200]
+    assert {move.logical_substeps for move in x_moves} == {10}
+    assert len(y_moves) == 2
+    assert [move.pulses for move in y_moves] == [320, 320]
+    assert {move.logical_substeps for move in y_moves} == {2}
+    assert all(move.dwell_after_seconds == 0 for move in scan_moves)
     assert plan.rounds[0].scan_end == Position(10, 2)
 
 
@@ -89,7 +118,15 @@ def test_scan_preflight_rejects_invalid_or_out_of_bounds_path(
 
 def test_non_divisible_substeps_preserve_exact_integer_pulses():
     plan = build_scan_plan(
-        ScanParameters(1.0, 0.1, 1, 1, x_steps=3, y_steps=3)
+        ScanParameters(
+            1.0,
+            0.1,
+            1,
+            1,
+            x_steps=3,
+            y_steps=3,
+            dwell_seconds=0.1,
+        )
     )
     x_pulses = [
         move.pulses

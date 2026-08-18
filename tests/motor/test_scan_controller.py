@@ -212,12 +212,30 @@ def test_each_round_acquires_continuously_then_returns_without_acquisition(
 ):
     application()
     controller, motor, acquisition = _controller(tmp_path)
+    events = []
+    controller.scan_event.connect(
+        lambda event, payload: events.append((event, dict(payload)))
+    )
 
     assert controller.state is ScanState.STARTING_ACQUISITION
     assert acquisition.starts[0][3]["auto_store"] is True
     assert motor.moves == []
 
     acquisition.start_task()
+    links = [
+        payload
+        for event, payload in events
+        if event == "motor_scan_acquisition_link"
+    ]
+    assert links == [
+        {
+            "scan_id": controller.scan_id,
+            "mode": "acquisition",
+            "round_number": 1,
+            "acquisition_id": "spectrum-1",
+            "task_id": "spectrum-1",
+        }
+    ]
     assert controller.state is ScanState.SCANNING
     for _ in range(3):
         motor.finish_motion()
@@ -340,7 +358,7 @@ def test_motor_only_scan_runs_and_returns_without_acquisition_or_manifest(
     )
 
     assert controller.start(
-        ScanParameters(1, 1, 1, 1),
+        ScanParameters(1, 1, 1, 1, x_steps=10, y_steps=2),
         device_ids=(),
         storage_format=StorageFormat.CSV,
         batch_size=50,
@@ -381,6 +399,14 @@ def test_motor_only_scan_runs_and_returns_without_acquisition_or_manifest(
     ]
     assert event_names.count("motor_scan_segment_started") == 4
     assert event_names.count("motor_scan_segment_finished") == 4
+    started = [
+        payload
+        for event, payload in events
+        if event == "motor_scan_segment_started"
+    ]
+    assert started[0]["logical_substeps"] == 10
+    assert started[0]["coalesced"] is True
+    assert started[1]["logical_substeps"] == 2
     assert events[0][1]["mode"] == "motor_only"
     assert events[-1][1]["status"] == "completed"
 

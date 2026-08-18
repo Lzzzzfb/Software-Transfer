@@ -323,6 +323,12 @@ class ScanController(QtCore.QObject):
             self._current_task_id = task_id
         if task_id != self._current_task_id:
             return
+        self._emit_scan_event(
+            "motor_scan_acquisition_link",
+            round_number=self._current_round().index,
+            acquisition_id=task_id,
+            task_id=task_id,
+        )
         self._manifest.acquisition_started(
             self._current_round().index, task_id
         )
@@ -376,6 +382,8 @@ class ScanController(QtCore.QObject):
             axis=move.axis.value,
             direction=move.direction.value,
             pulses=int(move.pulses),
+            logical_substeps=int(move.logical_substeps),
+            coalesced=bool(move.logical_substeps > 1),
             predictive=bool(not returning and not final_scan_segment)
             if hasattr(self.motor, "move_scan_segment")
             else False,
@@ -445,6 +453,9 @@ class ScanController(QtCore.QObject):
                 round_number=self._round_index + 1,
                 segment_number=self._move_index + 1,
                 operation_id=str(operation_id),
+                logical_substeps=int(move.logical_substeps)
+                if move is not None
+                else 1,
                 success=False,
                 reason=str(reason),
                 returning=bool(returning),
@@ -456,6 +467,9 @@ class ScanController(QtCore.QObject):
             round_number=self._round_index + 1,
             segment_number=self._move_index + 1,
             operation_id=str(operation_id),
+            logical_substeps=int(move.logical_substeps)
+            if move is not None
+            else 1,
             success=True,
             reason=str(reason),
             returning=bool(returning),
