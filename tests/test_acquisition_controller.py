@@ -663,3 +663,119 @@ def test_unchecked_cleanup_failure_is_warned_without_failing_capture(
     assert warning in diagnostics
     assert controller.pending_manual_capture is not None
     assert finished == [(task_id, [], False)]
+
+
+def _seal_scan_capture(controller, manager, *, complete=1, persisted=1):
+    assert controller.start_scan_global(
+        [0],
+        AcquisitionMode.CONTINUOUS,
+        SyncMode.INDEPENDENT,
+        auto_store=True,
+    )
+    task_id = controller.active_task_for_device(0).task_id
+    acknowledge_local_start(manager)
+    assert controller.stop_global()
+    manager.ack(0, CmdCode.STOP_ACQUISITION)
+    spool = manager.complete_persistent_session(
+        complete=complete,
+        persisted=persisted,
+    )
+    return task_id, spool
+
+
+def test_scan_capture_releases_hardware_after_seal_without_starting_export(
+    tmp_path,
+):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    sealed = []
+    finished = []
+    controller.scan_capture_sealed.connect(
+        lambda task_id, files, failed: sealed.append(
+            (task_id, list(files), bool(failed))
+        )
+    )
+    controller.task_finished.connect(
+        lambda task_id, files, failed: finished.append(
+            (task_id, list(files), bool(failed))
+        )
+    )
+
+    task_id, spool = _seal_scan_capture(controller, manager)
+
+    assert sealed == [(task_id, [str(spool)], False)]
+    assert finished == []
+    assert controller.global_task_id is None
+    assert controller.device_state(0) is ControlState.IDLE
+    assert storage.prepared_contexts[0].request.task_id == task_id
+    assert storage.sealed_exports == []
+    assert storage.prepared_exports == []
+    assert controller.deferred_scan_export_ids == (task_id,)
+    assert controller.start_scan_global(
+        [0],
+        AcquisitionMode.CONTINUOUS,
+        SyncMode.INDEPENDENT,
+        auto_store=True,
+    )
+
+
+def test_deferred_scan_exports_run_sequentially_and_finish_tasks(tmp_path):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    finished = []
+    controller.task_finished.connect(
+        lambda task_id, files, failed: finished.append(
+            (task_id, list(files), bool(failed))
+        )
+    )
+
+    first_id, _first_spool = _seal_scan_capture(controller, manager)
+    second_id, second_spool = _seal_scan_capture(controller, manager)
+
+    assert controller.start_deferred_scan_exports((first_id, second_id))
+    assert [
+        item[0].request.task_id for item in storage.prepared_exports
+    ] == [first_id]
+
+    first_output = tmp_path / "first.csv"
+    storage.session_closed.emit(first_id, [str(first_output)], [])
+    assert [
+        item[0].request.task_id for item in storage.prepared_exports
+    ] == [first_id, second_id]
+    assert finished == [(first_id, [str(first_output)], False)]
+
+    second_output = tmp_path / "second.csv"
+    storage.session_closed.emit(
+        second_id, [str(second_output)], ["injected export error"]
+    )
+    assert finished[-1] == (
+        second_id,
+        [str(second_output), str(second_spool)],
+        True,
+    )
+    assert controller.deferred_scan_export_ids == ()
+
+
+def test_failed_scan_integrity_is_reported_and_recovery_source_is_retained(
+    tmp_path,
+):
+    manager = FakeProcessDeviceManager()
+    storage = FakeStorageManager(tmp_path)
+    controller = AcquisitionController(manager, storage, tail_quiet_ms=0)
+    sealed = []
+    controller.scan_capture_sealed.connect(
+        lambda task_id, files, failed: sealed.append(
+            (task_id, list(files), bool(failed))
+        )
+    )
+
+    task_id, spool = _seal_scan_capture(
+        controller, manager, complete=2, persisted=1
+    )
+
+    assert sealed == [(task_id, [str(spool)], True)]
+    assert spool.exists()
+    assert controller.start_deferred_scan_exports((task_id,))
+    assert storage.prepared_exports[0][1] is False

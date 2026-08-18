@@ -43,6 +43,13 @@ class _ActiveTask:
     external_export_started: bool = False
 
 
+@dataclass
+class _DeferredScanExport:
+    context: object | None
+    recovery_files: tuple[str, ...]
+    capture_failed: bool = False
+
+
 class AcquisitionController(QtCore.QObject):
     """Serializes unsafe actions while allowing independent devices to run."""
 
@@ -52,6 +59,7 @@ class AcquisitionController(QtCore.QObject):
     diagnostic_event = Signal(str)
     task_started = Signal(str, object)
     task_finished = Signal(str, object, object)
+    scan_capture_sealed = Signal(str, object, bool)
     reference_captured = Signal(str, object)
     manual_capture_changed = Signal(object)
     manual_export_started = Signal(str)
@@ -85,6 +93,9 @@ class AcquisitionController(QtCore.QObject):
         self._global_state = ControlState.IDLE
         self._pending_manual_capture = None
         self._manual_export_task_id = None
+        self._deferred_scan_exports: Dict[str, _DeferredScanExport] = {}
+        self._deferred_scan_export_queue: list[str] = []
+        self._active_deferred_scan_export: Optional[str] = None
 
         self.device_manager.command_completed.connect(self._on_command_completed)
         if hasattr(self.device_manager, "device_updated"):
@@ -120,7 +131,15 @@ class AcquisitionController(QtCore.QObject):
 
     @property
     def busy(self) -> bool:
-        return bool(self._tasks) or self.manual_export_active
+        return (
+            bool(self._tasks)
+            or self.manual_export_active
+            or self._active_deferred_scan_export is not None
+        )
+
+    @property
+    def deferred_scan_export_ids(self) -> tuple[str, ...]:
+        return tuple(self._deferred_scan_exports)
 
     @property
     def pending_manual_capture(self):
@@ -758,6 +777,13 @@ class AcquisitionController(QtCore.QObject):
                 task.failed = True
                 self.diagnostic_event.emit(f"背景或参考提交失败：{exc}")
         if (
+            task.request.owner is AcquisitionOwner.SCAN
+            and task.request.auto_store
+            and task.process_spool_devices
+        ):
+            self._defer_scan_export(task)
+            return
+        if (
             task.request.auto_store
             and not task.process_spool_devices
             and self.storage_manager is not None
@@ -856,6 +882,102 @@ class AcquisitionController(QtCore.QObject):
                         )
         self._release_task(task, files)
 
+    def _defer_scan_export(self, task: _ActiveTask) -> None:
+        task_id = task.request.task_id
+        recovery_files = tuple(self._existing_spool_files(task))
+        context = None
+        try:
+            if self.storage_manager is None:
+                raise RuntimeError("存储服务不可用")
+            devices = [
+                self.device_manager.get_device(device_id)
+                for device_id in task.request.device_ids
+            ]
+            if any(device is None for device in devices):
+                raise RuntimeError("导出前设备信息不完整")
+            context = self.storage_manager.prepare_sealed_export(
+                task.request,
+                devices,
+                task.sealed_results,
+            )
+        except Exception as exc:
+            task.failed = True
+            self.diagnostic_event.emit(f"扫描封存数据准备失败：{exc}")
+        self._deferred_scan_exports[task_id] = _DeferredScanExport(
+            context=context,
+            recovery_files=recovery_files,
+            capture_failed=bool(task.failed),
+        )
+        self._release_task_resources(task)
+        self.diagnostic_event.emit(
+            "本轮光谱数据已封存，正式 CSV/Excel 将在全部电机运动结束后生成"
+        )
+        self.scan_capture_sealed.emit(
+            task_id,
+            list(recovery_files),
+            bool(task.failed),
+        )
+
+    def start_deferred_scan_exports(self, task_ids) -> bool:
+        if self._active_deferred_scan_export is not None:
+            return self._reject("扫描数据正在导出")
+        task_ids = tuple(str(task_id) for task_id in task_ids)
+        if not task_ids or len(set(task_ids)) != len(task_ids):
+            return self._reject("待导出的扫描任务列表无效")
+        missing = [
+            task_id
+            for task_id in task_ids
+            if task_id not in self._deferred_scan_exports
+        ]
+        if missing:
+            return self._reject(
+                "找不到待导出的扫描封存任务：" + "、".join(missing)
+            )
+        self._deferred_scan_export_queue = list(task_ids)
+        self.diagnostic_event.emit(
+            f"全部电机运动已完成，开始顺序导出 {len(task_ids)} 轮扫描数据"
+        )
+        self._start_next_deferred_scan_export()
+        return True
+
+    def _start_next_deferred_scan_export(self) -> None:
+        if self._active_deferred_scan_export is not None:
+            return
+        while self._deferred_scan_export_queue:
+            task_id = self._deferred_scan_export_queue.pop(0)
+            deferred = self._deferred_scan_exports.get(task_id)
+            if deferred is None:
+                continue
+            if deferred.context is None or self.storage_manager is None:
+                self._deferred_scan_exports.pop(task_id, None)
+                self.task_finished.emit(
+                    task_id,
+                    list(deferred.recovery_files),
+                    True,
+                )
+                continue
+            try:
+                self._active_deferred_scan_export = task_id
+                self.diagnostic_event.emit(
+                    f"正在导出扫描光谱任务 {task_id}"
+                )
+                self.storage_manager.start_prepared_export(
+                    deferred.context,
+                    cleanup_sources=not deferred.capture_failed,
+                )
+                return
+            except Exception as exc:
+                self._active_deferred_scan_export = None
+                self._deferred_scan_exports.pop(task_id, None)
+                self.diagnostic_event.emit(
+                    f"扫描光谱任务 {task_id} 导出启动失败：{exc}"
+                )
+                self.task_finished.emit(
+                    task_id,
+                    list(deferred.recovery_files),
+                    True,
+                )
+
     @staticmethod
     def _existing_spool_files(task: _ActiveTask):
         return [
@@ -913,6 +1035,22 @@ class AcquisitionController(QtCore.QObject):
                 task_id, list(files), failed
             )
             return
+        deferred = self._deferred_scan_exports.get(task_id)
+        if deferred is not None:
+            failed = bool(errors) or deferred.capture_failed
+            for error in errors:
+                self.diagnostic_event.emit(f"扫描存储错误：{error}")
+            result_files = list(files)
+            if failed:
+                for path in deferred.recovery_files:
+                    if Path(path).exists() and path not in result_files:
+                        result_files.append(path)
+            self._deferred_scan_exports.pop(task_id, None)
+            if self._active_deferred_scan_export == task_id:
+                self._active_deferred_scan_export = None
+            self.task_finished.emit(task_id, result_files, failed)
+            self._start_next_deferred_scan_export()
+            return
         task = self._tasks.get(task_id)
         if task is None:
             return
@@ -942,10 +1080,10 @@ class AcquisitionController(QtCore.QObject):
         )
         self._request_stop(task)
 
-    def _release_task(self, task: _ActiveTask, files=None) -> None:
+    def _release_task_resources(self, task: _ActiveTask) -> bool:
         task_id = task.request.task_id
         if task_id not in self._tasks:
-            return
+            return False
         for device_id in task.request.device_ids:
             if self._device_tasks.get(device_id) == task_id:
                 self._device_tasks.pop(device_id, None)
@@ -957,6 +1095,12 @@ class AcquisitionController(QtCore.QObject):
             self._global_task_id = None
             self._set_global_state(ControlState.IDLE)
         self._tasks.pop(task_id, None)
+        return True
+
+    def _release_task(self, task: _ActiveTask, files=None) -> None:
+        if not self._release_task_resources(task):
+            return
+        task_id = task.request.task_id
         self.task_finished.emit(task_id, files or [], task.failed)
 
     def _global_trigger_modes(self, task: _ActiveTask) -> Dict[int, int]:

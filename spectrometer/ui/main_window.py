@@ -29,10 +29,9 @@ from ..domain.enums import (
     control_state_label,
 )
 from ..domain.models import SpectrumFrame, SpectrumReference
-from ..motor.controller import MotorController
+from ..motor.factory import create_motor_controller
 from ..motor.models import Axis
 from ..motor.scan_controller import ScanController, ScanState
-from ..motor.settings_store import MotorSettingsStore
 from ..processing.calibration_repository import IntensityCalibrationRepository
 from ..processing.display_service import DisplayProcessingService
 from ..processing.formula import FormulaError, validate_formula
@@ -131,11 +130,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.storage_manager,
             reference_commit=self._commit_reference_frames,
         )
-        self.motor_controller = motor_controller or MotorController(
+        self.motor_controller = motor_controller or create_motor_controller(
             self,
-            settings_store=MotorSettingsStore(
-                self._configuration_root / "motor-settings.json"
-            ),
+            settings_path=self._configuration_root / "motor-settings.json",
+            simulation=self.simulation,
         )
         self.scan_controller = scan_controller or ScanController(
             self.motor_controller,
@@ -691,14 +689,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(f"扫描状态：{state.value}")
         if state is ScanState.STOPPING_ACQUISITION:
             self.status_panel.state_label.setText(
-                "扫描轮次完成，正在停止光谱仪并保存…"
+                "扫描轮次完成，正在停止光谱仪并封存本轮数据…"
             )
         elif state is ScanState.RETURNING:
             if self.scan_controller.acquisition_enabled:
-                message = "光谱数据已保存，电机正在返回扫描起点…"
+                message = "本轮光谱数据已安全封存，电机正在返回扫描起点…"
             else:
                 message = "本轮电机扫描完成，正在返回扫描起点…"
             self.status_panel.state_label.setText(message)
+        elif state is ScanState.EXPORTING:
+            self.status_panel.state_label.setText(
+                "全部电机运动已完成，正在生成并核对正式光谱文件…"
+            )
         elif (
             state is ScanState.SCANNING
             and not self.scan_controller.acquisition_enabled
@@ -1228,6 +1230,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_control_status(self):
         self._refresh_save_spectrum_state()
+        if (
+            hasattr(self, "scan_controller")
+            and self.scan_controller.active
+        ):
+            return
         if self.control.manual_export_active:
             self.status_panel.state_label.setText("正在保存光谱…")
             return

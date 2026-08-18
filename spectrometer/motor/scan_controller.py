@@ -27,6 +27,7 @@ class ScanState(str, Enum):
     DWELLING = "dwelling"
     STOPPING_ACQUISITION = "stopping_acquisition"
     RETURNING = "returning"
+    EXPORTING = "exporting"
     STOPPING = "stopping"
     COMPLETED = "completed"
     FAULTED = "faulted"
@@ -79,6 +80,13 @@ class ScanController(QtCore.QObject):
         self._finished_emitted = False
         self._scan_id = ""
         self._waiting_round_verification = False
+        self._active_path_id = ""
+        self._path_returning = False
+        self._deferred_export_task_ids: list[str] = []
+        self._deferred_task_rounds: dict[str, int] = {}
+        self._pending_export_task_ids: set[str] = set()
+        self._finish_after_exports = ""
+        self._export_failure_reason = ""
 
         self._dwell_timer = QtCore.QTimer(self)
         self._dwell_timer.setSingleShot(True)
@@ -97,8 +105,22 @@ class ScanController(QtCore.QObject):
             self.motor.connection_changed.connect(
                 self._on_motor_connection_changed
             )
+        if hasattr(self.motor, "path_segment_started"):
+            self.motor.path_segment_started.connect(
+                self._on_path_segment_started
+            )
+        if hasattr(self.motor, "path_segment_finished"):
+            self.motor.path_segment_finished.connect(
+                self._on_path_segment_finished
+            )
+        if hasattr(self.motor, "path_finished"):
+            self.motor.path_finished.connect(self._on_path_finished)
         self.acquisition.task_started.connect(self._on_task_started)
         self.acquisition.task_finished.connect(self._on_task_finished)
+        if hasattr(self.acquisition, "scan_capture_sealed"):
+            self.acquisition.scan_capture_sealed.connect(
+                self._on_scan_capture_sealed
+            )
         self.acquisition.operation_rejected.connect(
             self._on_acquisition_rejected
         )
@@ -226,6 +248,13 @@ class ScanController(QtCore.QObject):
         self._finished_emitted = False
         self._scan_id = uuid.uuid4().hex
         self._waiting_round_verification = False
+        self._active_path_id = ""
+        self._path_returning = False
+        self._deferred_export_task_ids = []
+        self._deferred_task_rounds = {}
+        self._pending_export_task_ids = set()
+        self._finish_after_exports = ""
+        self._export_failure_reason = ""
         self._manifest_active = config.enabled
         if hasattr(self.motor, "set_scan_active"):
             if self.motor.set_scan_active(True) is False:
@@ -259,6 +288,8 @@ class ScanController(QtCore.QObject):
         self._current_task_id = ""
         self._round_files = []
         self._waiting_round_verification = False
+        self._active_path_id = ""
+        self._path_returning = False
         self._emit_scan_event(
             "motor_scan_round_started",
             round_number=self._round_index + 1,
@@ -290,7 +321,7 @@ class ScanController(QtCore.QObject):
     def _begin_round_after_motor_prepared(self):
         if not self.acquisition_enabled:
             self._set_state(ScanState.SCANNING)
-            self._advance_scan()
+            self._start_scan_motion()
             return
         self._set_state(ScanState.STARTING_ACQUISITION)
         accepted = self.acquisition.start_scan_global(
@@ -337,7 +368,37 @@ class ScanController(QtCore.QObject):
             return
         self._move_index = 0
         self._set_state(ScanState.SCANNING)
-        self._advance_scan()
+        self._start_scan_motion()
+
+    @property
+    def _uses_process_path(self) -> bool:
+        return all(
+            hasattr(self.motor, name)
+            for name in (
+                "start_scan_path",
+                "path_segment_started",
+                "path_segment_finished",
+                "path_finished",
+            )
+        )
+
+    def _start_scan_motion(self):
+        if not self._uses_process_path:
+            self._advance_scan()
+            return
+        self._move_index = 0
+        path_id = (
+            f"{self._scan_id}:round:{self._round_index + 1}:scan"
+        )
+        self._active_path_id = path_id
+        self._path_returning = False
+        if not self.motor.start_scan_path(
+            path_id,
+            self._current_round().scan_moves,
+            returning=False,
+        ):
+            self._active_path_id = ""
+            self._begin_fault("电机扫描路径未被接受")
 
     def _begin_move(self, move: ScanMove, *, returning: bool):
         self._current_move = move
@@ -415,23 +476,7 @@ class ScanController(QtCore.QObject):
             return
         moves = self._current_round().return_moves
         if self._move_index >= len(moves):
-            if self._manifest_active:
-                self._manifest.return_finished(
-                    self._current_round().index,
-                    completed=True,
-                )
-            self._emit_scan_event(
-                "motor_scan_round_completed",
-                round_number=self._round_index + 1,
-                round_total=len(self._plan.rounds),
-                scan_move_total=len(self._current_round().scan_moves),
-                return_move_total=len(self._current_round().return_moves),
-            )
-            self._round_index += 1
-            if self._round_index >= len(self._plan.rounds):
-                self._complete()
-            else:
-                self._start_round()
+            self._finish_return_path()
             return
         self._begin_move(moves[self._move_index], returning=True)
 
@@ -530,11 +575,197 @@ class ScanController(QtCore.QObject):
     def _begin_return(self):
         self._move_index = 0
         self._set_state(ScanState.RETURNING)
+        if self._uses_process_path:
+            path_id = (
+                f"{self._scan_id}:round:{self._round_index + 1}:return"
+            )
+            self._active_path_id = path_id
+            self._path_returning = True
+            if not self.motor.start_scan_path(
+                path_id,
+                self._current_round().return_moves,
+                returning=True,
+            ):
+                self._active_path_id = ""
+                self._begin_fault("电机返回路径未被接受")
+            return
         self._advance_return()
+
+    def _finish_return_path(self):
+        if self._manifest_active:
+            self._manifest.return_finished(
+                self._current_round().index,
+                completed=True,
+            )
+        self._emit_scan_event(
+            "motor_scan_round_completed",
+            round_number=self._round_index + 1,
+            round_total=len(self._plan.rounds),
+            scan_move_total=len(self._current_round().scan_moves),
+            return_move_total=len(self._current_round().return_moves),
+        )
+        self._round_index += 1
+        if self._round_index >= len(self._plan.rounds):
+            if self._deferred_export_task_ids:
+                self._start_deferred_exports("completed")
+            else:
+                self._complete()
+        else:
+            self._start_round()
+
+    @Slot(object)
+    def _on_path_segment_started(self, payload):
+        values = dict(payload)
+        if values.get("path_id") != self._active_path_id:
+            return
+        self._move_index = max(0, int(values["segment_number"]) - 1)
+        self._emit_scan_event(
+            "motor_scan_segment_started",
+            round_number=self._round_index + 1,
+            **values,
+        )
+        self.progress_changed.emit(
+            self._round_index + 1,
+            len(self._plan.rounds),
+            int(values["segment_number"]),
+            int(values["segment_total"]),
+        )
+
+    @Slot(object)
+    def _on_path_segment_finished(self, payload):
+        values = dict(payload)
+        if values.get("path_id") != self._active_path_id:
+            return
+        self._emit_scan_event(
+            "motor_scan_segment_finished",
+            round_number=self._round_index + 1,
+            **values,
+        )
+
+    @Slot(str, bool, str)
+    def _on_path_finished(self, path_id: str, success: bool, reason: str):
+        if str(path_id) != self._active_path_id:
+            return
+        returning = self._path_returning
+        self._active_path_id = ""
+        self._path_returning = False
+        if self._user_stopping:
+            return
+        if not success:
+            self._begin_fault(str(reason) or "电机路径执行失败")
+            return
+        if returning:
+            self._finish_return_path()
+        else:
+            self._verify_scan_round()
+
+    @Slot(str, object, bool)
+    def _on_scan_capture_sealed(self, task_id: str, files, failed: bool):
+        task_id = str(task_id)
+        if task_id != self._current_task_id:
+            return
+        round_index = self._current_round().index
+        recovery_files = [str(path) for path in files]
+        self._deferred_export_task_ids.append(task_id)
+        self._deferred_task_rounds[task_id] = round_index
+        self._current_task_id = ""
+        reason = "光谱仪采集封存或完整性校验失败" if failed else ""
+        if self._manifest_active:
+            self._manifest.acquisition_sealed(
+                round_index,
+                recovery_files,
+                failed=bool(failed),
+                reason=reason,
+            )
+        self._emit_scan_event(
+            "motor_scan_capture_sealed",
+            round_number=round_index,
+            acquisition_id=task_id,
+            recovery_files=recovery_files,
+            failed=bool(failed),
+        )
+        if self._user_stopping:
+            self._start_deferred_exports("stopped")
+            return
+        if failed or self._failure_reason:
+            if failed and not self._failure_reason:
+                self._failure_reason = reason
+            if getattr(self.motor, "motion_active", False):
+                self.motor.stop()
+            self._start_deferred_exports("faulted")
+            return
+        if self._state is not ScanState.STOPPING_ACQUISITION:
+            self._begin_fault("光谱仪任务在非预期状态完成封存")
+            return
+        self._begin_return()
+
+    def _start_deferred_exports(self, finish_mode: str):
+        if self._state is ScanState.EXPORTING:
+            if finish_mode != "completed":
+                self._finish_after_exports = str(finish_mode)
+            return
+        task_ids = tuple(self._deferred_export_task_ids)
+        if not task_ids:
+            if finish_mode == "completed":
+                self._complete()
+            elif finish_mode == "stopped":
+                self._finish_stopped("user_stop")
+            else:
+                self._finish_fault()
+            return
+        self._finish_after_exports = str(finish_mode)
+        self._pending_export_task_ids = set(task_ids)
+        self._set_state(ScanState.EXPORTING)
+        self._emit_scan_event(
+            "motor_scan_exports_started",
+            acquisition_ids=list(task_ids),
+            export_total=len(task_ids),
+        )
+        if not hasattr(self.acquisition, "start_deferred_scan_exports") or not (
+            self.acquisition.start_deferred_scan_exports(task_ids)
+        ):
+            self._failure_reason = "无法启动扫描光谱数据导出"
+            self._finish_fault()
 
     @Slot(str, object, object)
     def _on_task_finished(self, task_id: str, files, failed):
-        if str(task_id) != self._current_task_id:
+        task_id = str(task_id)
+        if task_id in self._deferred_task_rounds:
+            round_index = self._deferred_task_rounds[task_id]
+            result_files = [str(path) for path in files]
+            reason = "光谱仪扫描数据导出失败" if bool(failed) else ""
+            if self._manifest_active:
+                self._manifest.acquisition_finished(
+                    round_index,
+                    result_files,
+                    failed=bool(failed),
+                    reason=reason,
+                )
+            self._emit_scan_event(
+                "motor_scan_export_finished",
+                round_number=round_index,
+                acquisition_id=task_id,
+                files=result_files,
+                failed=bool(failed),
+            )
+            if failed and not self._export_failure_reason:
+                self._export_failure_reason = reason
+            self._pending_export_task_ids.discard(task_id)
+            if (
+                self._state is ScanState.EXPORTING
+                and not self._pending_export_task_ids
+            ):
+                if self._export_failure_reason:
+                    self._failure_reason = self._export_failure_reason
+                    self._finish_fault()
+                elif self._finish_after_exports == "completed":
+                    self._complete()
+                elif self._finish_after_exports == "stopped":
+                    self._finish_stopped("user_stop")
+                else:
+                    self._finish_fault()
+            return
+        if task_id != self._current_task_id:
             return
         self._round_files = [str(path) for path in files]
         reason = self._failure_reason or (
@@ -578,15 +809,22 @@ class ScanController(QtCore.QObject):
         if not self.active:
             return False
         self._user_stopping = True
+        if self._state is ScanState.EXPORTING:
+            self._finish_after_exports = "stopped"
+            return True
         self._dwell_timer.stop()
         self._set_state(ScanState.STOPPING)
         self._current_operation_id = ""
         self._current_move = None
         self._waiting_round_verification = False
+        self._active_path_id = ""
+        self._path_returning = False
         self.motor.stop()
         if self._current_task_id:
             if not self.acquisition.stop_global():
                 self._finish_stopped("user_stop")
+        elif self._deferred_export_task_ids:
+            self._start_deferred_exports("stopped")
         else:
             self._finish_stopped("user_stop")
         return True
@@ -595,11 +833,16 @@ class ScanController(QtCore.QObject):
         if self._finished_emitted:
             return
         self._failure_reason = str(reason) or "scan_fault"
+        if self._state is ScanState.EXPORTING:
+            self._finish_after_exports = "faulted"
+            return
         self._dwell_timer.stop()
         self._set_state(ScanState.STOPPING)
         self._current_operation_id = ""
         self._current_move = None
         self._waiting_round_verification = False
+        self._active_path_id = ""
+        self._path_returning = False
         if (
             getattr(self.motor, "motion_active", False)
             or getattr(self.motor, "scan_active", False)
@@ -608,6 +851,9 @@ class ScanController(QtCore.QObject):
         if self._current_task_id:
             if self.acquisition.stop_global():
                 return
+        if self._deferred_export_task_ids:
+            self._start_deferred_exports("faulted")
+            return
         self._finish_fault()
 
     def _finish_fault(self):

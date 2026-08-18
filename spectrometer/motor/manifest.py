@@ -11,7 +11,7 @@ import uuid
 from .scan import ScanPlan
 
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 
 
 def _now() -> str:
@@ -53,11 +53,13 @@ class ScanManifestWriter:
                     "index": round_plan.index,
                     "task_id": "",
                     "acquisition_started": False,
+                    "capture_sealed": False,
                     "acquisition_completed": False,
                     "return_completed": False,
                     "completed": False,
                     "failed": False,
                     "reason": "",
+                    "recovery_files": [],
                     "files": [],
                 }
                 for round_plan in plan.rounds
@@ -90,6 +92,29 @@ class ScanManifestWriter:
         record["failed"] = bool(failed)
         record["reason"] = str(reason)
         record["files"] = [str(path) for path in files]
+        record["completed"] = (
+            record["return_completed"]
+            and record["acquisition_completed"]
+            and not record["failed"]
+        )
+        self._write()
+
+    def acquisition_sealed(
+        self,
+        index: int,
+        recovery_files,
+        *,
+        failed: bool,
+        reason: str = "",
+    ):
+        record = self._round(index)
+        record["capture_sealed"] = True
+        record["recovery_files"] = [
+            str(path) for path in recovery_files
+        ]
+        if failed:
+            record["failed"] = True
+            record["reason"] = str(reason)
         self._write()
 
     def return_finished(

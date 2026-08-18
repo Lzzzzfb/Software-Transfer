@@ -432,6 +432,7 @@ class MotorPanel(QtWidgets.QWidget):
             ScanState.DWELLING: "步进等待",
             ScanState.STOPPING_ACQUISITION: "正在停止并保存",
             ScanState.RETURNING: "正在返回扫描起点",
+            ScanState.EXPORTING: "运动完成，正在导出光谱",
             ScanState.STOPPING: "正在安全停止",
             ScanState.COMPLETED: (
                 "扫描完成"

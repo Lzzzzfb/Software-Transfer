@@ -188,6 +188,79 @@ class FailedPreparationMotorController(FakeMotorController):
         return True
 
 
+class PathMotorController(FakeMotorController):
+    path_segment_started = Signal(object)
+    path_segment_finished = Signal(object)
+    path_finished = Signal(str, bool, str)
+
+    def __init__(self, start=Position(0, 0)):
+        super().__init__(start)
+        self.paths = []
+        self._path = None
+
+    def start_scan_path(self, path_id, moves, *, returning):
+        frozen = tuple(moves)
+        self.paths.append((str(path_id), frozen, bool(returning)))
+        self._path = self.paths[-1]
+        self.motion_active = True
+        return True
+
+    def finish_path(self, *, success=True, reason="completed"):
+        path_id, moves, returning = self._path
+        for index, move in enumerate(moves):
+            payload = {
+                "path_id": path_id,
+                "segment_number": index + 1,
+                "segment_total": len(moves),
+                "operation_id": f"{path_id}-{index + 1}",
+                "axis": move.axis.value,
+                "direction": move.direction.value,
+                "pulses": move.pulses,
+                "logical_substeps": move.logical_substeps,
+                "coalesced": move.logical_substeps > 1,
+                "predictive": not returning and index < len(moves) - 1,
+                "returning": returning,
+                "scheduled_monotonic_ns": index + 1,
+                "completed_monotonic_ns": index + 2,
+                "success": bool(success),
+                "reason": str(reason),
+            }
+            self.path_segment_started.emit(dict(payload))
+            self.path_segment_finished.emit(dict(payload))
+            if not success:
+                break
+        self.motion_active = False
+        self._path = None
+        self.path_finished.emit(path_id, bool(success), str(reason))
+
+    def stop(self):
+        self.stop_count += 1
+        self.motion_active = False
+        self._path = None
+
+
+class DeferredScanAcquisitionController(FakeAcquisitionController):
+    scan_capture_sealed = Signal(str, object, bool)
+
+    def __init__(self):
+        super().__init__()
+        self.deferred_task_ids = []
+        self.export_starts = []
+
+    def seal_task(self, files=(), failed=False):
+        task_id = self.global_task_id
+        self.global_task_id = None
+        self.deferred_task_ids.append(task_id)
+        self.scan_capture_sealed.emit(task_id, list(files), bool(failed))
+
+    def start_deferred_scan_exports(self, task_ids):
+        self.export_starts.append(tuple(task_ids))
+        return True
+
+    def finish_export(self, task_id, files=(), failed=False):
+        self.task_finished.emit(str(task_id), list(files), bool(failed))
+
+
 def _controller(tmp_path, parameters=None):
     motor = FakeMotorController()
     acquisition = FakeAcquisitionController()
@@ -528,3 +601,200 @@ def test_synchronous_task_started_signal_is_not_lost(tmp_path):
     )
     assert controller.state is ScanState.SCANNING
     assert len(motor.moves) == 1
+
+
+def test_process_path_and_sealed_capture_return_before_final_export(tmp_path):
+    application()
+    motor = PathMotorController()
+    acquisition = DeferredScanAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+    events = []
+    controller.scan_event.connect(
+        lambda event, payload: events.append((event, dict(payload)))
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1, x_steps=10),
+        device_ids=(0,),
+        storage_format=StorageFormat.CSV,
+    )
+    acquisition.start_task()
+    assert len(motor.paths) == 1
+    assert motor.paths[0][2] is False
+    assert motor.moves == []
+
+    motor.finish_path()
+    assert acquisition.stop_count == 1
+    assert controller.state is ScanState.STOPPING_ACQUISITION
+    acquisition.seal_task(files=["round-1.zgs"])
+
+    assert controller.state is ScanState.RETURNING
+    assert len(motor.paths) == 2
+    assert motor.paths[1][2] is True
+    assert acquisition.export_starts == []
+
+    motor.finish_path()
+    assert controller.state is ScanState.EXPORTING
+    assert acquisition.export_starts == [("spectrum-1",)]
+
+    acquisition.finish_export("spectrum-1", files=["round-1.csv"])
+    assert controller.state is ScanState.COMPLETED
+    segment_events = [
+        event
+        for event, _payload in events
+        if event in (
+            "motor_scan_segment_started",
+            "motor_scan_segment_finished",
+        )
+    ]
+    assert len(segment_events) == 8
+    manifest = json.loads(controller.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["rounds"][0]["capture_sealed"] is True
+    assert manifest["rounds"][0]["recovery_files"] == ["round-1.zgs"]
+    assert manifest["rounds"][0]["files"] == ["round-1.csv"]
+    assert manifest["rounds"][0]["completed"] is True
+
+
+def test_all_rounds_move_before_any_deferred_export_starts(tmp_path):
+    application()
+    motor = PathMotorController()
+    acquisition = DeferredScanAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 2),
+        device_ids=(0,),
+        storage_format=StorageFormat.CSV,
+    )
+
+    acquisition.start_task()
+    motor.finish_path()
+    acquisition.seal_task(files=["round-1.zgs"])
+    motor.finish_path()
+    assert controller.state is ScanState.STARTING_ACQUISITION
+    assert acquisition.export_starts == []
+
+    acquisition.start_task()
+    motor.finish_path()
+    acquisition.seal_task(files=["round-2.zgs"])
+    motor.finish_path()
+
+    assert controller.state is ScanState.EXPORTING
+    assert acquisition.export_starts == [("spectrum-1", "spectrum-2")]
+    acquisition.finish_export("spectrum-1", files=["round-1.csv"])
+    assert controller.state is ScanState.EXPORTING
+    acquisition.finish_export("spectrum-2", files=["round-2.csv"])
+    assert controller.state is ScanState.COMPLETED
+
+
+def test_user_stop_during_return_exports_sealed_capture_before_finishing(
+    tmp_path,
+):
+    application()
+    motor = PathMotorController()
+    acquisition = DeferredScanAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+    finished = []
+    controller.scan_finished.connect(
+        lambda success, reason, manifest: finished.append(
+            (success, reason, manifest)
+        )
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(0,),
+        storage_format=StorageFormat.CSV,
+    )
+    acquisition.start_task()
+    motor.finish_path()
+    acquisition.seal_task(files=["round-1.zgs"])
+    assert controller.state is ScanState.RETURNING
+
+    assert controller.stop()
+    assert controller.state is ScanState.EXPORTING
+    assert motor.stop_count == 1
+    assert acquisition.export_starts == [("spectrum-1",)]
+    assert finished == []
+
+    acquisition.finish_export("spectrum-1", files=["round-1.csv"])
+    assert controller.state is ScanState.IDLE
+    assert finished[-1][0:2] == (False, "user_stop")
+
+
+def test_user_stop_during_final_export_waits_for_export_result(tmp_path):
+    application()
+    motor = PathMotorController()
+    acquisition = DeferredScanAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+    finished = []
+    controller.scan_finished.connect(
+        lambda success, reason, manifest: finished.append(
+            (success, reason, manifest)
+        )
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(0,),
+        storage_format=StorageFormat.CSV,
+    )
+    acquisition.start_task()
+    motor.finish_path()
+    acquisition.seal_task(files=["round-1.zgs"])
+    motor.finish_path()
+    assert controller.state is ScanState.EXPORTING
+
+    assert controller.stop()
+    assert controller.state is ScanState.EXPORTING
+    assert finished == []
+
+    acquisition.finish_export("spectrum-1", files=["round-1.csv"])
+    assert controller.state is ScanState.IDLE
+    assert finished[-1][0:2] == (False, "user_stop")
+
+
+def test_deferred_export_failure_finishes_scan_as_faulted(tmp_path):
+    application()
+    motor = PathMotorController()
+    acquisition = DeferredScanAcquisitionController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        manifest_directory=tmp_path,
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(0,),
+        storage_format=StorageFormat.CSV,
+    )
+    acquisition.start_task()
+    motor.finish_path()
+    acquisition.seal_task(files=["round-1.zgs"])
+    motor.finish_path()
+    acquisition.finish_export(
+        "spectrum-1", files=["round-1.zgs"], failed=True
+    )
+
+    assert controller.state is ScanState.FAULTED
+    manifest = json.loads(controller.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "faulted"
+    assert manifest["rounds"][0]["completed"] is False
+    assert manifest["rounds"][0]["files"] == ["round-1.zgs"]
