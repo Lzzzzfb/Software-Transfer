@@ -80,5 +80,5 @@ if [[ -d "${DESKTOP_DIR}" ]]; then
     "${DESKTOP_DIR}/zgcai-spectrometer.desktop"
 fi
 
-echo "安装完成。请注销并重新登录，然后重新插拔光谱仪和电机控制器。"
+echo "安装完成。请注销并重新登录，然后重新插拔光谱仪、电机控制器和方波发生器。"
 echo "可从应用菜单或 ${INSTALL_DIR}/run.sh 手动启动。"

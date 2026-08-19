@@ -23,6 +23,9 @@ def test_deploy_app_matches_runtime_source():
     assert Path("spectrometer/qt.py") in expected_relatives()
     assert Path("spectrometer/motor/probe.py") in expected_relatives()
     assert Path("spectrometer/ui/motor_settings_dialog.py") in expected_relatives()
+    assert Path("spectrometer/square_wave/probe.py") in expected_relatives()
+    assert Path("spectrometer/square_wave/controller.py") in expected_relatives()
+    assert Path("spectrometer/ui/square_wave_panel.py") in expected_relatives()
     assert not check()
 
 
@@ -52,10 +55,11 @@ def test_udev_rule_is_scoped_and_not_world_writable():
     rule = (DEPLOY / "99-zgcai-spectrometer.rules").read_text(encoding="utf-8")
     assert 'idVendor}=="1a86"' in rule
     assert 'idProduct}=="fe0c"' in rule
-    assert 'idVendor}=="0483"' not in rule
-    assert 'idProduct}=="5740"' not in rule
-    assert rule.count('GROUP="dialout"') == 1
-    assert rule.count('MODE="0660"') == 1
+    assert 'idVendor}=="0483"' in rule
+    assert 'idProduct}=="5740"' in rule
+    assert 'idProduct}=="7523"' in rule
+    assert rule.count('GROUP="dialout"') == 3
+    assert rule.count('MODE="0660"') == 3
     assert 'GROUP="dialout"' in rule
     assert 'MODE="0660"' in rule
     assert "0666" not in rule
