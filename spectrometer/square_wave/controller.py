@@ -117,6 +117,18 @@ class SquareWaveController(QtCore.QObject):
         return self._identity
 
     @property
+    def candidates(self):
+        return self._candidates
+
+    @property
+    def serial_number(self):
+        return (
+            self._confirmed_candidate.serial_number
+            if self._confirmed_candidate is not None
+            else ""
+        )
+
+    @property
     def output_state(self):
         return self._output_state
 

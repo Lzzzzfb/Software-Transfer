@@ -15,6 +15,7 @@ from ..motor.scan import ScanParameters
 from ..motor.scan_controller import ScanState
 from ..qt import QtCore, QtWidgets, Signal
 from .input_controls import DirectDoubleSpinBox, DirectSpinBox
+from .square_wave_panel import SquareWavePanel
 
 
 class MotorPanel(QtWidgets.QWidget):
@@ -36,7 +37,7 @@ class MotorPanel(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("motorPanel")
-        self.setMinimumHeight(285)
+        self.setMinimumHeight(335)
         self._connected = False
         self._motion_active = False
         self._scan_active = False
@@ -48,6 +49,8 @@ class MotorPanel(QtWidgets.QWidget):
         outer.setContentsMargins(10, 8, 10, 8)
         outer.setSpacing(7)
         outer.addLayout(self._build_connection_row())
+        self.square_wave_panel = SquareWavePanel(self)
+        outer.addWidget(self.square_wave_panel)
 
         content = QtWidgets.QHBoxLayout()
         content.setSpacing(8)
@@ -442,6 +445,7 @@ class MotorPanel(QtWidgets.QWidget):
             ScanState.FAULTED: "扫描故障",
         }
         self.scan_progress.setText(labels[state])
+        self.square_wave_panel.set_scan_active(self._scan_active)
         self._refresh_enabled_state()
 
     def set_scan_acquisition_enabled(self, enabled: bool):

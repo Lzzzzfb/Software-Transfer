@@ -41,6 +41,8 @@ from ..processing.processor import ProcessingSnapshot, SpectrumProcessor
 from ..processing.references import ReferenceRepository
 from ..qt import QT_API, QtCore, QtWidgets, dialog_exec
 from ..services.settings_service import SettingsService
+from ..square_wave.controller import SquareWaveController
+from ..square_wave.settings_store import SquareWaveSettingsStore
 from ..services.platform_paths import (
     config_directory,
     diagnostic_directory,
@@ -65,6 +67,7 @@ from .motor_settings_dialog import (
 from .plot_backend import create_spectrum_plot_widget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
+from .square_wave_settings_dialog import SquareWaveSettingsDialog
 from .status_panel import StatusPanel
 from .y_axis_dialog import YAxisDialog, YAxisSettings
 
@@ -82,6 +85,7 @@ class MainWindow(QtWidgets.QMainWindow):
         port_allowlist=None,
         motor_controller=None,
         scan_controller=None,
+        square_wave_controller=None,
     ):
         super().__init__()
         self.simulation = simulation
@@ -134,6 +138,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             settings_path=self._configuration_root / "motor-settings.json",
             simulation=self.simulation,
+        )
+        self.square_wave_controller = (
+            square_wave_controller
+            or SquareWaveController(
+                self,
+                settings_store=SquareWaveSettingsStore(
+                    self._configuration_root / "square-wave-settings.json"
+                ),
+            )
         )
         self.scan_controller = scan_controller or ScanController(
             self.motor_controller,
@@ -225,7 +238,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_workspace.addWidget(self.motor_panel)
         self.live_workspace.setStretchFactor(0, 1)
         self.live_workspace.setStretchFactor(1, 0)
-        self.live_workspace.setSizes([530, 300])
+        self.live_workspace.setSizes([480, 350])
         self.tabs.addTab(self.live_workspace, "实时光谱")
         self.history_viewer = HistoryViewer(); self.tabs.addTab(self.history_viewer, "历史数据")
         self.diagnostics = DiagnosticsPanel(); self.tabs.addTab(self.diagnostics, "诊断")
@@ -420,6 +433,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self.motor_panel.settings_requested.connect(
             self.open_motor_settings
         )
+        square_wave_panel = self.motor_panel.square_wave_panel
+        square_wave_panel.discover_requested.connect(
+            self._discover_square_wave
+        )
+        square_wave_panel.connect_requested.connect(
+            self._connect_square_wave
+        )
+        square_wave_panel.disconnect_requested.connect(
+            self.square_wave_controller.disconnect
+        )
+        square_wave_panel.apply_requested.connect(
+            self.square_wave_controller.apply_parameters
+        )
+        square_wave_panel.start_requested.connect(
+            self.square_wave_controller.start_output
+        )
+        square_wave_panel.stop_requested.connect(
+            self.square_wave_controller.stop_output
+        )
+        square_wave_panel.settings_requested.connect(
+            self.open_square_wave_settings
+        )
+        square_wave_panel.link_changed.connect(
+            lambda enabled: self._log(
+                "扫描联动方波已开启（仅本次运行）"
+                if enabled
+                else "扫描联动方波已关闭"
+            )
+        )
+        self.square_wave_controller.candidates_changed.connect(
+            square_wave_panel.set_candidates
+        )
+        self.square_wave_controller.status_changed.connect(
+            square_wave_panel.set_controller_state
+        )
+        self.square_wave_controller.connection_changed.connect(
+            self._square_wave_connection_changed
+        )
+        self.square_wave_controller.parameters_applied.connect(
+            self._square_wave_parameters_applied
+        )
+        self.square_wave_controller.operation_failed.connect(
+            self._square_wave_operation_failed
+        )
+        self.square_wave_controller.diagnostic_event.connect(
+            lambda message: self._log(f"方波：{message}")
+        )
+        square_wave_panel.set_controller_state(
+            self.square_wave_controller.state
+        )
         self.motor_controller.candidates_changed.connect(
             self.motor_panel.set_candidates
         )
@@ -475,17 +538,119 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.simulation: return
         ports = DeviceFinder.list_available_ports()
         existing = {device.port_name for device in self.device_manager.devices.values()}
+        occupied = {
+            str(port).replace("\\", "/").casefold()
+            for port in (
+                getattr(self.square_wave_controller, "port_name", ""),
+                (
+                    getattr(self.motor_controller.host_settings, "port_name", "")
+                    if self.motor_controller.connected
+                    else ""
+                ),
+            )
+            if port
+        }
         for port in ports:
             allowed = not self.port_allowlist or port["port_name"].upper() in self.port_allowlist
-            if allowed and port["port_name"] not in existing and DeviceFinder.is_likely_spectrometer(port):
+            port_names = {
+                str(port.get("port_name", "")).replace("\\", "/").casefold(),
+                str(port.get("system_location", "")).replace("\\", "/").casefold(),
+            }
+            if (
+                allowed
+                and not port_names.intersection(occupied)
+                and port["port_name"] not in existing
+                and DeviceFinder.is_likely_spectrometer(port)
+            ):
                 self.device_manager.add_and_connect(port["port_name"], 115200)
 
     def _motor_excluded_ports(self):
-        return {
+        excluded = {
             str(device.port_name)
             for device in self.device_manager.devices.values()
             if device.port_name
         }
+        if self.square_wave_controller.connected:
+            excluded.add(self.square_wave_controller.port_name)
+        return excluded
+
+    def _square_wave_excluded_ports(self):
+        excluded = {
+            str(device.port_name)
+            for device in self.device_manager.devices.values()
+            if device.port_name
+        }
+        if self.motor_controller.connected:
+            motor_port = getattr(
+                self.motor_controller.host_settings, "port_name", ""
+            )
+            if motor_port:
+                excluded.add(str(motor_port))
+        return excluded
+
+    def _discover_square_wave(self):
+        candidates = self.square_wave_controller.discover(
+            self._square_wave_excluded_ports()
+        )
+        if candidates:
+            self._log(
+                "发现方波候选串口："
+                + "、".join(candidate.port_name for candidate in candidates)
+            )
+        else:
+            self._log("未发现可探测的方波发生器串口", "WARN")
+        return candidates
+
+    def _connect_square_wave(self):
+        self.status_panel.state_label.setText("正在识别方波发生器串口……")
+        host = self.square_wave_controller.host_settings
+        if not host.automatic_port and host.port_name:
+            return self.square_wave_controller.connect_manual(host.port_name)
+        return self.square_wave_controller.connect_auto(
+            self._square_wave_excluded_ports()
+        )
+
+    def open_square_wave_settings(self):
+        dialog = SquareWaveSettingsDialog(
+            self.square_wave_controller.host_settings,
+            identity=self.square_wave_controller.identity,
+            serial_number=self.square_wave_controller.serial_number,
+            parent=self,
+        )
+        dialog.set_candidates(
+            self.square_wave_controller.candidates
+        )
+        dialog.refresh_requested.connect(
+            lambda: dialog.set_candidates(self._discover_square_wave())
+        )
+
+        def apply_settings(settings):
+            if self.square_wave_controller.update_host_settings(settings):
+                self.status_panel.state_label.setText("方波连接设置已保存")
+
+        dialog.apply_requested.connect(apply_settings)
+        dialog_exec(dialog)
+
+    def _square_wave_connection_changed(self, connected, detail):
+        if connected:
+            self._log(f"方波发生器已连接：{detail}")
+            self.status_panel.state_label.setText(f"方波已连接：{detail}")
+        elif detail:
+            self._log(f"方波发生器未连接：{detail}", "WARN")
+            self.status_panel.state_label.setText(str(detail))
+        else:
+            self.status_panel.state_label.setText("方波发生器已断开")
+
+    def _square_wave_parameters_applied(self, success, detail):
+        self.status_panel.state_label.setText(str(detail))
+        self._log(
+            f"方波：{detail}",
+            "INFO" if success else "ERROR",
+        )
+
+    def _square_wave_operation_failed(self, message):
+        self.status_panel.state_label.setText(f"方波操作失败：{message}")
+        self._log(f"方波操作失败：{message}", "ERROR")
 
     def _discover_motor(self):
         candidates = self.motor_controller.discover(
@@ -1743,6 +1908,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control.finish_pending_stops()
         if not self.control.manual_export_active:
             self.control.discard_pending_capture("shutdown")
+        self.square_wave_controller.shutdown()
         self.motor_controller.shutdown()
         self.storage_manager.shutdown(timeout=10.0)
         if not self.control.manual_export_active:
