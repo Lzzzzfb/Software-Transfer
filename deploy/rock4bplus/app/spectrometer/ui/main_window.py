@@ -290,7 +290,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _plot_view_reset(self):
         self.auto_range.blockSignals(True)
-        self.auto_range.setChecked(True)
+        self.auto_range.setChecked(self.plot_widget.auto_range_enabled)
         self.auto_range.blockSignals(False)
 
     def _plot_data_painted(self):
