@@ -29,6 +29,9 @@ from ..domain.enums import (
     control_state_label,
 )
 from ..domain.models import SpectrumFrame, SpectrumReference
+from ..motor.factory import create_motor_controller
+from ..motor.models import Axis
+from ..motor.scan_controller import ScanController, ScanState
 from ..processing.calibration_repository import IntensityCalibrationRepository
 from ..processing.display_service import DisplayProcessingService
 from ..processing.formula import FormulaError, validate_formula
@@ -36,8 +39,10 @@ from ..processing.profile_repository import ProcessingProfileRepository
 from ..processing.profiles import AirplsProfile, resolve_effective_profile
 from ..processing.processor import ProcessingSnapshot, SpectrumProcessor
 from ..processing.references import ReferenceRepository
-from ..qt import QtCore, QtWidgets, dialog_exec
+from ..qt import QT_API, QtCore, QtWidgets, dialog_exec
 from ..services.settings_service import SettingsService
+from ..square_wave.controller import SquareWaveController
+from ..square_wave.settings_store import SquareWaveSettingsStore
 from ..services.platform_paths import (
     config_directory,
     diagnostic_directory,
@@ -54,9 +59,15 @@ from .device_parameters import DeviceParametersDialog
 from .diagnostics import DiagnosticsPanel
 from .history_viewer import HistoryViewer
 from .input_controls import NoWheelComboBox
+from .motor_panel import MotorPanel
+from .motor_settings_dialog import (
+    MotorSettingsDialog,
+    configuration_differences,
+)
 from .plot_backend import create_spectrum_plot_widget
 from .ribbon import MainRibbon
 from .settings_dialog import SettingsDialog
+from .square_wave_settings_dialog import SquareWaveSettingsDialog
 from .status_panel import StatusPanel
 from .y_axis_dialog import YAxisDialog, YAxisSettings
 
@@ -72,6 +83,9 @@ class MainWindow(QtWidgets.QMainWindow):
         auto_start_simulation: bool = True,
         settings_path=None,
         port_allowlist=None,
+        motor_controller=None,
+        scan_controller=None,
+        square_wave_controller=None,
     ):
         super().__init__()
         self.simulation = simulation
@@ -120,6 +134,29 @@ class MainWindow(QtWidgets.QMainWindow):
             self.storage_manager,
             reference_commit=self._commit_reference_frames,
         )
+        self.motor_controller = motor_controller or create_motor_controller(
+            self,
+            settings_path=self._configuration_root / "motor-settings.json",
+            simulation=self.simulation,
+        )
+        self.square_wave_controller = (
+            square_wave_controller
+            or SquareWaveController(
+                self,
+                settings_store=SquareWaveSettingsStore(
+                    self._configuration_root / "square-wave-settings.json"
+                ),
+            )
+        )
+        self.scan_controller = scan_controller or ScanController(
+            self.motor_controller,
+            self.control,
+            square_wave_controller=self.square_wave_controller,
+            manifest_directory=(
+                Path(self.settings["storage_path"]) / "scan-manifests"
+            ),
+            parent=self,
+        )
         self._initializing_devices = set()
         self._task_requests = {}
         self._processing_by_device = {}
@@ -137,6 +174,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._diagnostic_recent_by_device = {}
         self._diagnostic_recent_expected = set()
         self._diagnostic_export_pending = False
+        self._diagnostic_current_run_preferred = False
         self._diagnostic_observer = AcquisitionObserver()
         self._pending_missing_logs = {}
         self._pending_plot_frames = {}
@@ -158,6 +196,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "active": self._plot_backend_info.active,
                 "fallback_reason": self._plot_backend_info.fallback_reason,
             },
+        )
+        self.diagnostic_recorder.record_event(
+            "qt_binding_selected", {"qt_api": QT_API}
         )
         self.diagnostics.append(
             f"实时绘图后端：{self._plot_backend_info.active}",
@@ -191,7 +232,15 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.sidebar = DeviceSidebar(); splitter.addWidget(self.sidebar)
         self.tabs = QtWidgets.QTabWidget(); self.tabs.setObjectName("workspaceTabs")
-        self.tabs.addTab(self.plot_widget, "实时光谱")
+        self.live_workspace = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.live_workspace.setObjectName("liveWorkspace")
+        self.live_workspace.addWidget(self.plot_widget)
+        self.motor_panel = MotorPanel()
+        self.live_workspace.addWidget(self.motor_panel)
+        self.live_workspace.setStretchFactor(0, 1)
+        self.live_workspace.setStretchFactor(1, 0)
+        self.live_workspace.setSizes([480, 350])
+        self.tabs.addTab(self.live_workspace, "实时光谱")
         self.history_viewer = HistoryViewer(); self.tabs.addTab(self.history_viewer, "历史数据")
         self.diagnostics = DiagnosticsPanel(); self.tabs.addTab(self.diagnostics, "诊断")
         splitter.addWidget(self.tabs); splitter.setStretchFactor(0, 0); splitter.setStretchFactor(1, 1)
@@ -255,7 +304,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _plot_view_reset(self):
         self.auto_range.blockSignals(True)
-        self.auto_range.setChecked(True)
+        self.auto_range.setChecked(self.plot_widget.auto_range_enabled)
         self.auto_range.blockSignals(False)
 
     def _plot_data_painted(self):
@@ -351,6 +400,132 @@ class MainWindow(QtWidgets.QMainWindow):
             self._display_processing_failed
         )
         self.tabs.currentChanged.connect(self._diagnostic_tab_changed)
+        self.motor_panel.discover_requested.connect(self._discover_motor)
+        self.motor_panel.connect_requested.connect(self._connect_motor)
+        self.motor_panel.disconnect_requested.connect(
+            self.motor_controller.disconnect
+        )
+        self.motor_panel.speed_requested.connect(
+            self.motor_controller.set_speed
+        )
+        self.motor_panel.stall_release_requested.connect(
+            self.motor_controller.release_stall
+        )
+        self.motor_panel.move_requested.connect(
+            self.motor_controller.move_relative
+        )
+        self.motor_panel.position_clear_requested.connect(
+            lambda axis: self.motor_controller.set_position(Axis(axis), 0.0)
+        )
+        self.motor_panel.software_return_requested.connect(
+            self.motor_controller.return_axis_to_zero
+        )
+        self.motor_panel.home_requested.connect(self.motor_controller.home)
+        self.motor_panel.stop_requested.connect(self._stop_motor_motion)
+        self.motor_panel.clear_fault_requested.connect(
+            self.motor_controller.clear_faults
+        )
+        self.motor_panel.scan_start_requested.connect(
+            self._start_motor_scan
+        )
+        self.motor_panel.scan_stop_requested.connect(
+            self.scan_controller.stop
+        )
+        self.motor_panel.settings_requested.connect(
+            self.open_motor_settings
+        )
+        square_wave_panel = self.motor_panel.square_wave_panel
+        square_wave_panel.discover_requested.connect(
+            self._discover_square_wave
+        )
+        square_wave_panel.connect_requested.connect(
+            self._connect_square_wave
+        )
+        square_wave_panel.disconnect_requested.connect(
+            self.square_wave_controller.disconnect
+        )
+        square_wave_panel.apply_requested.connect(
+            self.square_wave_controller.apply_parameters
+        )
+        square_wave_panel.start_requested.connect(
+            self.square_wave_controller.start_output
+        )
+        square_wave_panel.stop_requested.connect(
+            self.square_wave_controller.stop_output
+        )
+        square_wave_panel.settings_requested.connect(
+            self.open_square_wave_settings
+        )
+        square_wave_panel.link_changed.connect(
+            lambda enabled: self._log(
+                "扫描联动方波已开启（仅本次运行）"
+                if enabled
+                else "扫描联动方波已关闭"
+            )
+        )
+        self.square_wave_controller.candidates_changed.connect(
+            square_wave_panel.set_candidates
+        )
+        self.square_wave_controller.status_changed.connect(
+            square_wave_panel.set_controller_state
+        )
+        self.square_wave_controller.connection_changed.connect(
+            self._square_wave_connection_changed
+        )
+        self.square_wave_controller.parameters_applied.connect(
+            self._square_wave_parameters_applied
+        )
+        self.square_wave_controller.operation_failed.connect(
+            self._square_wave_operation_failed
+        )
+        self.square_wave_controller.diagnostic_event.connect(
+            lambda message: self._log(f"方波：{message}")
+        )
+        square_wave_panel.set_controller_state(
+            self.square_wave_controller.state
+        )
+        self.motor_controller.candidates_changed.connect(
+            self.motor_panel.set_candidates
+        )
+        self.motor_controller.connection_changed.connect(
+            self._motor_connection_changed
+        )
+        self.motor_controller.status_changed.connect(
+            self._motor_status_changed
+        )
+        if hasattr(self.motor_controller, "configuration_changed"):
+            self.motor_controller.configuration_changed.connect(
+                self._motor_configuration_changed
+            )
+        if hasattr(self.motor_controller, "speed_applied"):
+            self.motor_controller.speed_applied.connect(
+                self._motor_speed_applied
+            )
+        self.motor_controller.operation_failed.connect(
+            self._motor_operation_failed
+        )
+        self.motor_controller.diagnostic_event.connect(
+            lambda message: self._log(f"电机：{message}", "WARN")
+        )
+        self.motor_controller.motion_started.connect(
+            lambda _operation_id: self.motor_panel.set_motion_active(True)
+        )
+        self.motor_controller.motion_finished.connect(
+            self._motor_motion_finished
+        )
+        self.scan_controller.state_changed.connect(
+            self._scan_state_changed
+        )
+        self.scan_controller.progress_changed.connect(
+            self.motor_panel.set_scan_progress
+        )
+        self.scan_controller.operation_failed.connect(
+            self._scan_operation_failed
+        )
+        self.scan_controller.scan_finished.connect(
+            self._scan_finished
+        )
+        self.scan_controller.scan_event.connect(self._scan_event)
 
     def _apply_settings(self):
         self.plot_widget.set_line_width(self.settings["line_width"])
@@ -364,10 +539,430 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.simulation: return
         ports = DeviceFinder.list_available_ports()
         existing = {device.port_name for device in self.device_manager.devices.values()}
+        occupied = {
+            str(port).replace("\\", "/").casefold()
+            for port in (
+                getattr(self.square_wave_controller, "port_name", ""),
+                (
+                    getattr(self.motor_controller.host_settings, "port_name", "")
+                    if self.motor_controller.connected
+                    else ""
+                ),
+            )
+            if port
+        }
         for port in ports:
             allowed = not self.port_allowlist or port["port_name"].upper() in self.port_allowlist
-            if allowed and port["port_name"] not in existing and DeviceFinder.is_likely_spectrometer(port):
+            port_names = {
+                str(port.get("port_name", "")).replace("\\", "/").casefold(),
+                str(port.get("system_location", "")).replace("\\", "/").casefold(),
+            }
+            if (
+                allowed
+                and not port_names.intersection(occupied)
+                and port["port_name"] not in existing
+                and DeviceFinder.is_likely_spectrometer(port)
+            ):
                 self.device_manager.add_and_connect(port["port_name"], 115200)
+
+    def _motor_excluded_ports(self):
+        excluded = {
+            str(device.port_name)
+            for device in self.device_manager.devices.values()
+            if device.port_name
+        }
+        if self.square_wave_controller.connected:
+            excluded.add(self.square_wave_controller.port_name)
+        return excluded
+
+    def _square_wave_excluded_ports(self):
+        excluded = {
+            str(device.port_name)
+            for device in self.device_manager.devices.values()
+            if device.port_name
+        }
+        if self.motor_controller.connected:
+            motor_port = getattr(
+                self.motor_controller.host_settings, "port_name", ""
+            )
+            if motor_port:
+                excluded.add(str(motor_port))
+        return excluded
+
+    def _discover_square_wave(self):
+        candidates = self.square_wave_controller.discover(
+            self._square_wave_excluded_ports()
+        )
+        if candidates:
+            self._log(
+                "发现方波候选串口："
+                + "、".join(candidate.port_name for candidate in candidates)
+            )
+        else:
+            self._log("未发现可探测的方波发生器串口", "WARN")
+        return candidates
+
+    def _connect_square_wave(self):
+        self.status_panel.state_label.setText("正在识别方波发生器串口……")
+        host = self.square_wave_controller.host_settings
+        if not host.automatic_port and host.port_name:
+            return self.square_wave_controller.connect_manual(host.port_name)
+        return self.square_wave_controller.connect_auto(
+            self._square_wave_excluded_ports()
+        )
+
+    def open_square_wave_settings(self):
+        dialog = SquareWaveSettingsDialog(
+            self.square_wave_controller.host_settings,
+            identity=self.square_wave_controller.identity,
+            serial_number=self.square_wave_controller.serial_number,
+            parent=self,
+        )
+        dialog.set_candidates(
+            self.square_wave_controller.candidates
+        )
+        dialog.refresh_requested.connect(
+            lambda: dialog.set_candidates(self._discover_square_wave())
+        )
+
+        def apply_settings(settings):
+            if self.square_wave_controller.update_host_settings(settings):
+                self.status_panel.state_label.setText("方波连接设置已保存")
+
+        dialog.apply_requested.connect(apply_settings)
+        dialog_exec(dialog)
+
+    def _square_wave_connection_changed(self, connected, detail):
+        if connected:
+            self._log(f"方波发生器已连接：{detail}")
+            self.status_panel.state_label.setText(f"方波已连接：{detail}")
+        elif detail:
+            self._log(f"方波发生器未连接：{detail}", "WARN")
+            self.status_panel.state_label.setText(str(detail))
+        else:
+            self.status_panel.state_label.setText("方波发生器已断开")
+
+    def _square_wave_parameters_applied(self, success, detail):
+        self.status_panel.state_label.setText(str(detail))
+        self._log(
+            f"方波：{detail}",
+            "INFO" if success else "ERROR",
+        )
+
+    def _square_wave_operation_failed(self, message):
+        self.status_panel.state_label.setText(f"方波操作失败：{message}")
+        self._log(f"方波操作失败：{message}", "ERROR")
+
+    def _discover_motor(self):
+        candidates = self.motor_controller.discover(
+            self._motor_excluded_ports()
+        )
+        if candidates:
+            self._log(
+                "发现电机候选串口："
+                + "、".join(candidate.port_name for candidate in candidates)
+            )
+        else:
+            self._log("未发现可探测的电机串口", "WARN")
+        return candidates
+
+    def _connect_motor(self):
+        self.status_panel.state_label.setText("正在识别电机串口……")
+        host = self.motor_controller.host_settings
+        if not host.automatic_port and host.port_name:
+            return self.motor_controller.connect_manual(
+                host.port_name, host.address, host.baud_rate
+            )
+        return self.motor_controller.connect_auto(
+            self._motor_excluded_ports()
+        )
+
+    def open_motor_settings(self):
+        dialog = MotorSettingsDialog(
+            self.motor_controller.host_settings,
+            self.motor_controller.configuration,
+            self,
+        )
+
+        def apply_settings(host_settings, device_configuration):
+            if self.motor_controller.connected:
+                differences = configuration_differences(
+                    self.motor_controller.configuration,
+                    device_configuration,
+                    self.motor_controller.host_settings,
+                    host_settings,
+                )
+                if differences:
+                    answer = QtWidgets.QMessageBox.question(
+                        dialog,
+                        "确认电机参数修改",
+                        "将应用以下修改：\n\n" + "\n".join(differences),
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No,
+                    )
+                    if answer != QtWidgets.QMessageBox.Yes:
+                        dialog.set_apply_result(False, "已取消，未写入驱动板")
+                        return
+                self.motor_controller.apply_configuration(
+                    device_configuration, host_settings
+                )
+            else:
+                self.motor_controller.update_host_settings(host_settings)
+
+        dialog.apply_requested.connect(apply_settings)
+        self.motor_controller.configuration_apply_finished.connect(
+            dialog.set_apply_result
+        )
+        dialog_exec(dialog)
+        try:
+            self.motor_controller.configuration_apply_finished.disconnect(
+                dialog.set_apply_result
+            )
+        except (RuntimeError, TypeError):
+            pass
+
+    def _motor_connection_changed(self, connected, detail):
+        self.motor_panel.set_connection_state(connected, detail)
+        if connected:
+            self._log(f"电机控制器已连接：{detail}")
+            self.status_panel.state_label.setText(f"电机已连接：{detail}")
+        elif detail:
+            self._log(f"电机控制器未连接：{detail}", "WARN")
+            self.status_panel.state_label.setText(str(detail))
+        else:
+            self.status_panel.state_label.setText("电机已断开")
+
+    def _motor_configuration_changed(self, configuration):
+        if configuration is None:
+            return
+        self.motor_panel.set_axis_speed(
+            Axis.X, configuration.x.position_speed_pps, device_refresh=True
+        )
+        self.motor_panel.set_axis_speed(
+            Axis.Y, configuration.y.position_speed_pps, device_refresh=True
+        )
+
+    def _motor_speed_applied(self, axis, signed_speed, absolute_speed, message):
+        self.motor_panel.set_axis_speed(Axis(axis), signed_speed)
+        self._log(str(message))
+        self.status_panel.state_label.setText(str(message))
+
+    def _motor_status_changed(self, status):
+        self.motor_panel.set_motor_status(status)
+        if status.fault_latched and status.fault_reason:
+            self.status_panel.state_label.setText(str(status.fault_reason))
+        elif self.status_panel.state_label.text() in {
+            "正在确认急停结果",
+            "急停写入结果未知，正在读取两轴状态",
+            "电机停止状态未知，请切断驱动板电源",
+        }:
+            self.status_panel.state_label.setText("电机停止已确认")
+
+    def _motor_operation_failed(self, message):
+        self.motor_panel.set_motion_active(False)
+        self._log(f"电机操作失败：{message}", "ERROR")
+        self.status_panel.state_label.setText(f"电机操作失败：{message}")
+
+    def _motor_motion_finished(self, _operation_id, success, reason):
+        self.motor_panel.set_motion_active(False)
+        messages = {
+            "stall_release_limit_released": "脱离卡死完成：限位已释放，请重新机械回零",
+            "stall_release_timeout": "脱离卡死命令已结束，请确认实际位置并重新机械回零",
+            "stall_release_limit_not_released": "脱离卡死失败：限位未释放",
+            "stall_release_wrong_direction": "脱离卡死已停止：检测到零点限位闭合，请检查速度正负号",
+            "stop_unconfirmed": "电机停止状态未知，请切断驱动板电源",
+        }
+        if reason in messages:
+            self.status_panel.state_label.setText(messages[reason])
+        if not success and reason != "user_stop":
+            self._log(f"电机运动异常结束：{reason}", "ERROR")
+
+    def _stop_motor_motion(self):
+        if self.scan_controller.active:
+            return self.scan_controller.stop()
+        self.motor_controller.stop()
+        return True
+
+    def _start_motor_scan(self, parameters):
+        if getattr(self.motor_controller, "safety_locked", False):
+            self._scan_operation_failed(
+                "电机停止状态未知，确认两轴停止前不能启动扫描"
+            )
+            return False
+        if self.control.busy:
+            self._scan_operation_failed(
+                "已有光谱仪任务未完全结束，不能启动扫描"
+            )
+            return False
+        pending = [
+            device.port_name
+            for device in self.device_manager.get_connected_devices()
+            if device.device_id in self._initializing_devices
+        ]
+        if pending:
+            self._scan_operation_failed(
+                f"光谱仪正在初始化：{', '.join(pending)}"
+            )
+            return False
+        devices = self._global_devices()
+        device_ids = [device.device_id for device in devices]
+        acquisition_enabled = bool(device_ids)
+        self.motor_panel.set_scan_acquisition_enabled(acquisition_enabled)
+        calibrated = (
+            self.motor_controller.status.x.calibrated
+            and self.motor_controller.status.y.calibrated
+        )
+        if not calibrated:
+            answer = QtWidgets.QMessageBox.warning(
+                self,
+                "坐标未校准",
+                "X/Y 尚未完成机械回零，软件无法保证扫描矩阵不会越程。"
+                "是否仍要继续扫描？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return False
+        self.scan_controller.set_manifest_directory(
+            Path(self.settings["storage_path"]) / "scan-manifests"
+        )
+        if acquisition_enabled:
+            self.acquisition.reset(device_ids)
+        return self.scan_controller.start(
+            parameters,
+            device_ids=device_ids,
+            sync_mode=SyncMode(self.ribbon.sync_combo.currentData()),
+            master_device_id=self.sidebar.selected_device_id,
+            storage_format=StorageFormat(
+                self.settings["storage_format"]
+            ),
+            batch_size=int(self.settings["batch_size"]),
+            allow_uncalibrated=not calibrated,
+            square_wave_enabled=(
+                self.motor_panel.square_wave_panel.scan_link_enabled
+            ),
+            square_wave_parameters=(
+                self.motor_panel.square_wave_panel.parameters()
+            ),
+        )
+
+    def _set_scan_ui_locked(self, locked):
+        locked = bool(locked)
+        for key in ("acquisition", "background", "reference"):
+            self.ribbon.buttons[key].setEnabled(not locked)
+        self.ribbon.sync_combo.setEnabled(not locked)
+        self.acquisition_mode.setEnabled(not locked)
+        self.sidebar.set_scan_locked(locked)
+
+    def _scan_state_changed(self, state):
+        state = ScanState(state)
+        self.motor_panel.set_scan_state(state)
+        self._set_scan_ui_locked(self.scan_controller.active)
+        self._log(f"扫描状态：{state.value}")
+        if state is ScanState.STOPPING_ACQUISITION:
+            self.status_panel.state_label.setText(
+                "扫描轮次完成，正在停止光谱仪并封存本轮数据…"
+            )
+        elif state is ScanState.STARTING_SIGNAL:
+            self.status_panel.state_label.setText(
+                "正在应用方波参数并确认输出开启…"
+            )
+        elif state is ScanState.STOPPING_SIGNAL:
+            self.status_panel.state_label.setText(
+                "光谱数据已封存，正在确认方波输出关闭…"
+            )
+        elif state is ScanState.RETURNING:
+            if self.scan_controller.acquisition_enabled:
+                message = "本轮光谱数据已安全封存，电机正在返回扫描起点…"
+            else:
+                message = "本轮电机扫描完成，正在返回扫描起点…"
+            self.status_panel.state_label.setText(message)
+        elif state is ScanState.EXPORTING:
+            self.status_panel.state_label.setText(
+                "全部电机运动已完成，正在生成并核对正式光谱文件…"
+            )
+        elif (
+            state is ScanState.SCANNING
+            and not self.scan_controller.acquisition_enabled
+        ):
+            self.status_panel.state_label.setText(
+                "未连接光谱仪，本次仅执行电机扫描"
+            )
+
+    def _scan_operation_failed(self, message):
+        self._log(f"扫描任务失败：{message}", "ERROR")
+        self.status_panel.state_label.setText(f"扫描任务失败：{message}")
+
+    def _scan_finished(self, success, reason, manifest_path):
+        self._set_scan_ui_locked(False)
+        motor_only = manifest_path is None
+        if success:
+            if motor_only:
+                self.status_panel.state_label.setText("纯电机扫描完成")
+            else:
+                self._log(f"扫描任务完成；清单：{manifest_path}")
+        elif reason != "user_stop":
+            if not motor_only:
+                self._log(
+                    f"扫描任务异常结束：{reason}；清单：{manifest_path}",
+                    "ERROR",
+                )
+        else:
+            if motor_only:
+                self.status_panel.state_label.setText("纯电机扫描已停止")
+            else:
+                self._log(
+                    f"扫描任务已由用户停止；清单：{manifest_path}",
+                    "WARN",
+                )
+
+    def _scan_event(self, event, payload):
+        payload = dict(payload or {})
+        motor_only = payload.get("mode") == "motor_only"
+        if motor_only:
+            self._diagnostic_current_run_preferred = True
+        if event == "motor_scan_started":
+            parameters = payload.get("parameters", {})
+            prefix = "纯电机扫描" if motor_only else "联动扫描"
+            message = (
+                f"{prefix}开始：X={parameters.get('x_mm')} mm，"
+                f"Y={parameters.get('y_mm')} mm，"
+                f"行程数={parameters.get('line_count')}，"
+                f"扫描次数={parameters.get('scan_count')}，"
+                f"X步数={parameters.get('x_steps')}，"
+                f"Y步数={parameters.get('y_steps')}，"
+                f"步时={parameters.get('dwell_seconds')} s"
+            )
+        elif event == "motor_scan_round_started":
+            message = (
+                f"扫描第 {payload.get('round_number')}/"
+                f"{payload.get('round_total')} 轮开始"
+            )
+        elif event == "motor_scan_round_completed":
+            message = (
+                f"扫描第 {payload.get('round_number')}/"
+                f"{payload.get('round_total')} 轮及返回完成"
+            )
+        elif event == "motor_scan_finished":
+            status = payload.get("status")
+            label = {
+                "completed": "完成",
+                "stopped": "由用户停止",
+                "faulted": "异常结束",
+            }.get(status, str(status))
+            prefix = "纯电机扫描" if motor_only else "联动扫描"
+            message = f"{prefix}{label}"
+            if payload.get("reason") not in ("", "completed", "user_stop"):
+                message += f"：{payload.get('reason')}"
+        else:
+            message = f"扫描事件：{event}"
+        level = (
+            "ERROR"
+            if payload.get("status") == "faulted"
+            else "WARN" if payload.get("status") == "stopped" else "INFO"
+        )
+        self.diagnostics.append(message, level)
+        self.diagnostic_recorder.record_event(event, payload, level=level)
 
     def _device_changed(self, device_id):
         device = self.device_manager.get_device(device_id)
@@ -660,7 +1255,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _plot_tick(self):
         self._pending_plot_frames.update(self.acquisition.take_latest_frames())
-        if self.tabs.currentWidget() is not self.plot_widget:
+        if self.tabs.currentWidget() is not self.live_workspace:
             return
         frames = self._pending_plot_frames
         self._pending_plot_frames = {}
@@ -723,7 +1318,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _display_processing_ready(self, result):
         if (
-            self.tabs.currentWidget() is not self.plot_widget
+            self.tabs.currentWidget() is not self.live_workspace
             or self._processing_generation_by_device.get(
                 result.device_id, 0
             )
@@ -815,6 +1410,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_control_status(self):
         self._refresh_save_spectrum_state()
+        if (
+            hasattr(self, "scan_controller")
+            and self.scan_controller.active
+        ):
+            return
         if self.control.manual_export_active:
             self.status_panel.state_label.setText("正在保存光谱…")
             return
@@ -869,7 +1469,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         if missing:
             self._processing_snapshots(missing)
-        scope = "总控" if request.owner is AcquisitionOwner.GLOBAL else "单机"
+        if request.owner is AcquisitionOwner.SCAN:
+            scope = "扫描"
+        elif request.owner is AcquisitionOwner.GLOBAL:
+            scope = "总控"
+        else:
+            scope = "单机"
         mode = "连续" if request.mode is AcquisitionMode.CONTINUOUS else "单次"
         self._log(f"{scope}{mode}采集已启动，共 {len(request.device_ids)} 台设备")
 
@@ -1038,6 +1643,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.settings.update(dialog.values()); self.plot_widget.set_line_width(self.settings["line_width"])
             self.storage_manager.set_output_directory(self.settings["storage_path"])
             self.reference_repository = ReferenceRepository(Path(self.settings["storage_path"]) / "references")
+            self.scan_controller.set_manifest_directory(
+                Path(self.settings["storage_path"]) / "scan-manifests"
+            )
             self.settings_service.save(self.settings); self._log("设置已保存")
 
     def open_device_parameters(self, device_id):
@@ -1168,7 +1776,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "workspace_tab_changed",
             {"index": int(index), "label": self.tabs.tabText(index)},
         )
-        if self.tabs.widget(index) is self.plot_widget:
+        if self.tabs.widget(index) is self.live_workspace:
             QtCore.QTimer.singleShot(0, self._plot_tick)
 
     def _diagnostic_frame_summary(self, _device_id, values):
@@ -1230,14 +1838,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         include = self.diagnostics.include_recent_frames.isChecked()
         self.diagnostics.set_export_state(True, "正在生成并校验 ZIP…")
-        run_dir = self.diagnostic_recorder.run_dir
-        acquisition_id = self.diagnostic_recorder.latest_acquisition_id
-        if not acquisition_id:
-            previous = latest_run_with_acquisition(
-                self._diagnostic_root, exclude=run_dir
-            )
-            if previous is not None:
-                run_dir, acquisition_id = previous
+        run_dir, acquisition_id = self._diagnostic_export_source()
         self._diagnostic_future = self._diagnostic_executor.submit(
             export_diagnostic_bundle,
             run_dir,
@@ -1251,6 +1852,17 @@ class MainWindow(QtWidgets.QMainWindow):
             acquisition_summary=dict(self._process_diagnostics),
         )
         QtCore.QTimer.singleShot(50, self._poll_diagnostic_export)
+
+    def _diagnostic_export_source(self):
+        run_dir = self.diagnostic_recorder.run_dir
+        acquisition_id = self.diagnostic_recorder.latest_acquisition_id
+        if not acquisition_id and not self._diagnostic_current_run_preferred:
+            previous = latest_run_with_acquisition(
+                self._diagnostic_root, exclude=run_dir
+            )
+            if previous is not None:
+                run_dir, acquisition_id = previous
+        return run_dir, acquisition_id
 
     def _poll_diagnostic_export(self):
         future = self._diagnostic_future
@@ -1299,6 +1911,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_manager.inject_simulated_frame(SpectrumFrame.create(device_id, sequence << 8, pixels))
 
     def closeEvent(self, event):
+        if self.scan_controller.active:
+            self.scan_controller.stop()
         if self.control.global_state is not ControlState.IDLE:
             self.control.stop_global()
         else:
@@ -1309,6 +1923,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.control.finish_pending_stops()
         if not self.control.manual_export_active:
             self.control.discard_pending_capture("shutdown")
+        self.square_wave_controller.shutdown()
+        self.motor_controller.shutdown()
         self.storage_manager.shutdown(timeout=10.0)
         if not self.control.manual_export_active:
             self.control.discard_pending_capture("shutdown")

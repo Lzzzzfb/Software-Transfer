@@ -49,17 +49,17 @@ class DeviceCard(QtWidgets.QFrame):
         self.acquisition_button.clicked.connect(
             lambda: self.acquisition_requested.emit(self.device_id)
         )
-        background_button = QtWidgets.QPushButton("背景")
-        background_button.clicked.connect(
+        self.background_button = QtWidgets.QPushButton("背景")
+        self.background_button.clicked.connect(
             lambda: self.background_requested.emit(self.device_id)
         )
-        reference_button = QtWidgets.QPushButton("参考")
-        reference_button.clicked.connect(
+        self.reference_button = QtWidgets.QPushButton("参考")
+        self.reference_button.clicked.connect(
             lambda: self.reference_requested.emit(self.device_id)
         )
         acquisition_controls.addWidget(self.acquisition_button, 2)
-        acquisition_controls.addWidget(background_button, 1)
-        acquisition_controls.addWidget(reference_button, 1)
+        acquisition_controls.addWidget(self.background_button, 1)
+        acquisition_controls.addWidget(self.reference_button, 1)
         layout.addLayout(acquisition_controls)
         self.update_device(device)
 
@@ -90,6 +90,12 @@ class DeviceCard(QtWidgets.QFrame):
         }
         self.acquisition_button.setText(labels.get(str(state), "开始"))
 
+    def set_scan_locked(self, locked: bool):
+        enabled = not bool(locked)
+        self.acquisition_button.setEnabled(enabled)
+        self.background_button.setEnabled(enabled)
+        self.reference_button.setEnabled(enabled)
+
 
 class DeviceSidebar(QtWidgets.QWidget):
     selection_changed = Signal(int)
@@ -105,6 +111,7 @@ class DeviceSidebar(QtWidgets.QWidget):
         super().__init__(parent)
         self.setObjectName("deviceSidebar"); self.setMinimumWidth(290); self.setMaximumWidth(370)
         self.cards = {}; self.selected_device_id = None
+        self._scan_locked = False
         layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(8, 8, 8, 8)
         title = QtWidgets.QLabel("设备")
         title.setObjectName("sectionTitle")
@@ -125,6 +132,7 @@ class DeviceSidebar(QtWidgets.QWidget):
             card.acquisition_requested.connect(self.acquisition_requested)
             card.background_requested.connect(self.background_requested)
             card.reference_requested.connect(self.reference_requested)
+            card.set_scan_locked(self._scan_locked)
             self.card_layout.insertWidget(self.card_layout.count() - 1, card)
         else:
             card.update_device(device)
@@ -149,3 +157,8 @@ class DeviceSidebar(QtWidgets.QWidget):
         card = self.cards.get(device_id)
         if card:
             card.set_acquisition_state(state)
+
+    def set_scan_locked(self, locked: bool):
+        self._scan_locked = bool(locked)
+        for card in self.cards.values():
+            card.set_scan_locked(self._scan_locked)

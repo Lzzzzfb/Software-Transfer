@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+import pytest
 
 from spectrometer.qt import QtCore, QtWidgets
 from spectrometer.ui.plot_widget import SpectrumPlotWidget
@@ -43,6 +44,31 @@ class MouseEvent:
 
     def accept(self):
         self.accepted = True
+
+
+class RecordingPainter:
+    def __init__(self):
+        self.polygons = []
+
+    def save(self):
+        pass
+
+    def restore(self):
+        pass
+
+    def setClipRect(self, _rect):
+        pass
+
+    def setRenderHint(self, _hint, _enabled):
+        pass
+
+    def setPen(self, _pen):
+        pass
+
+    def drawPolyline(self, polygon):
+        self.polygons.append(
+            [(float(point.x()), float(point.y())) for point in polygon]
+        )
 
 
 def test_left_drag_selection_zooms_both_axes():
@@ -117,6 +143,7 @@ def test_wheel_is_ignored_and_double_click_still_restores_base():
     plot.update_device_curve(0, np.arange(101), np.linspace(-1e6, 1e6, 101), "设备")
     plot.mouseDoubleClickEvent(MouseEvent(rect.center()))
     assert plot._effective_range()[2:] == (0, 1000)
+    assert not plot.auto_range_enabled
 
 
 def test_right_button_is_ignored_without_starting_selection():
@@ -171,6 +198,78 @@ def test_unchanged_axis_labels_do_not_schedule_redundant_repaint():
     assert updates == [True]
 
 
-def test_curve_rendering_uses_at_most_one_point_per_horizontal_pixel():
-    assert SpectrumPlotWidget._curve_point_limit(1400) == 1400
-    assert SpectrumPlotWidget._curve_point_limit(300) == 400
+def test_curve_storage_keeps_all_adjacent_peaks_at_any_frame_length():
+    plot = plot_widget()
+    x = np.arange(6144, dtype=np.float64)
+    y = np.zeros(x.size, dtype=np.float64)
+    y[[1945, 1948, 1951]] = [60000, 50000, 40000]
+    y[[618, 624, 633]] = [45000, 30000, 15000]
+
+    plot.update_device_curve(0, x, y, "多峰")
+
+    curve = plot.device_curves[0]
+    assert curve.x.size == 6144
+    assert curve.y[[1945, 1948, 1951]].tolist() == [60000, 50000, 40000]
+    assert curve.y[[618, 624, 633]].tolist() == [45000, 30000, 15000]
+
+
+def test_invalid_curve_update_preserves_previous_legacy_frame():
+    plot = plot_widget()
+    previous = plot.device_curves[0]
+
+    with pytest.raises(ValueError, match="X.*有限"):
+        plot.update_device_curve(0, (0, np.nan), (1, 2), "错误帧")
+
+    assert plot.device_curves[0] is previous
+
+
+def test_legacy_reference_and_baseline_share_shape_validation():
+    plot = plot_widget()
+
+    with pytest.raises(ValueError, match="一维且长度相同"):
+        plot.add_reference_curve((0, 1), (1,), "错误参考")
+    with pytest.raises(ValueError, match="一维且长度相同"):
+        plot.set_baseline_curve(0, (0, 1), (1,), True)
+
+
+def test_legacy_all_nonfinite_y_uses_safe_default_bounds():
+    plot = SpectrumPlotWidget()
+    plot.update_device_curve(0, (), (), "空曲线")
+    assert plot._calculate_bounds() == (0.0, 4095.0, 0.0, 65535.0)
+    plot.update_device_curve(0, np.arange(3), (np.nan, np.inf, np.nan), "断点")
+
+    assert plot._calculate_bounds() == (0.0, 4095.0, 0.0, 65535.0)
+
+
+def test_legacy_draw_curve_sends_every_full_view_point_to_painter():
+    plot = SpectrumPlotWidget()
+    x = np.arange(6144, dtype=np.float64)
+    plot.update_device_curve(0, x, x, "完整曲线")
+    painter = RecordingPainter()
+
+    plot._draw_curve(
+        painter,
+        QtCore.QRectF(0, 0, 1000, 500),
+        (-1, 6144, -1, 6144),
+        plot.device_curves[0],
+    )
+
+    assert [len(polygon) for polygon in painter.polygons] == [6144]
+
+
+def test_legacy_draw_curve_never_bridges_nonfinite_y():
+    plot = SpectrumPlotWidget()
+    x = np.arange(10, dtype=np.float64)
+    y = x.copy()
+    y[5] = np.nan
+    plot.update_device_curve(0, x, y, "断点曲线")
+    painter = RecordingPainter()
+
+    plot._draw_curve(
+        painter,
+        QtCore.QRectF(0, 0, 1000, 500),
+        (-1, 10, -1, 10),
+        plot.device_curves[0],
+    )
+
+    assert [len(polygon) for polygon in painter.polygons] == [5, 4]

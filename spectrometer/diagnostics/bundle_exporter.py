@@ -37,18 +37,60 @@ def _read_prefix(path: Path) -> bytes:
         return b""
 
 
-def _filter_jsonl(data: bytes, acquisition_id: str) -> bytes:
-    if not acquisition_id:
+def _filter_jsonl(data: bytes, acquisition_ids) -> bytes:
+    acquisition_ids = tuple(str(value) for value in acquisition_ids if value)
+    if not acquisition_ids:
         return data
+    allowed = set(acquisition_ids)
     output = []
     for raw in data.splitlines():
         try:
             item = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
             continue
-        if item.get("acquisition_id", "") in ("", acquisition_id):
+        item_acquisition_id = item.get("acquisition_id", "")
+        if item_acquisition_id == "" or item_acquisition_id in allowed:
             output.append(raw)
     return b"\n".join(output) + (b"\n" if output else b"")
+
+
+def _scan_association(
+    timeline: bytes, acquisition_id: str
+) -> tuple[str, tuple[str, ...]]:
+    if not acquisition_id:
+        return "", ()
+    links = []
+    for raw in timeline.splitlines():
+        try:
+            item = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if item.get("event") != "motor_scan_acquisition_link":
+            continue
+        payload = item.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        scan_id = str(payload.get("scan_id", ""))
+        linked_id = str(
+            payload.get("acquisition_id", payload.get("task_id", ""))
+        )
+        if scan_id and linked_id:
+            links.append((scan_id, linked_id))
+
+    target_scan_id = next(
+        (scan_id for scan_id, linked_id in links if linked_id == acquisition_id),
+        "",
+    )
+    if not target_scan_id:
+        return "", (acquisition_id,)
+
+    related = []
+    for scan_id, linked_id in links:
+        if scan_id == target_scan_id and linked_id not in related:
+            related.append(linked_id)
+    if acquisition_id not in related:
+        related.append(acquisition_id)
+    return target_scan_id, tuple(related)
 
 
 def _diagnostic_text(timeline: bytes) -> bytes:
@@ -112,14 +154,18 @@ def export_diagnostic_bundle(
         target = target.with_suffix(".zip")
     temporary = target.with_suffix(target.suffix + ".tmp")
 
-    timeline = _filter_jsonl(
-        _read_prefix(run_dir / "timeline.jsonl"), acquisition_id
+    full_timeline = _read_prefix(run_dir / "timeline.jsonl")
+    scan_id, related_acquisition_ids = _scan_association(
+        full_timeline, acquisition_id
     )
+    timeline = _filter_jsonl(full_timeline, related_acquisition_ids)
     performance = _filter_jsonl(
-        _read_prefix(run_dir / "performance.jsonl"), acquisition_id
+        _read_prefix(run_dir / "performance.jsonl"),
+        related_acquisition_ids,
     )
     summaries = _filter_jsonl(
-        _read_prefix(run_dir / "frame-summaries.jsonl"), acquisition_id
+        _read_prefix(run_dir / "frame-summaries.jsonl"),
+        related_acquisition_ids,
     )
     members = {
         "system.json": json.dumps(
@@ -163,6 +209,8 @@ def export_diagnostic_bundle(
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "run_id": run_dir.name,
         "acquisition_id": acquisition_id,
+        "scan_id": scan_id,
+        "related_acquisition_ids": list(related_acquisition_ids),
         "live_snapshot": bool(live_snapshot),
         "recent_frames": sample_status,
         "members": {

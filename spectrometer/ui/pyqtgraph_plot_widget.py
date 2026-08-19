@@ -8,6 +8,7 @@ import pyqtgraph as pg
 from pyqtgraph.exporters import ImageExporter
 
 from ..qt import QtCore, QtGui, Signal
+from .plot_data import finite_curve_bounds, validated_plot_arrays
 from .plot_widget import COLOR_PALETTE, SpectrumPlotWidget
 
 
@@ -162,22 +163,12 @@ class PyQtGraphSpectrumPlotWidget(pg.PlotWidget):
         )
 
         self._view_box.user_zoomed.connect(self._manual_zoomed)
-        self._view_box.reset_requested.connect(self.reset_initial_view)
+        self._view_box.reset_requested.connect(self.restore_initial_view)
         self.viewport().installEventFilter(self)
 
     @staticmethod
     def format_axis_value(value: float, prefer_integer: bool = False) -> str:
         return SpectrumPlotWidget.format_axis_value(value, prefer_integer)
-
-    @staticmethod
-    def _validated_arrays(x, y):
-        x_array = np.ascontiguousarray(x, dtype=np.float64)
-        y_array = np.ascontiguousarray(y, dtype=np.float64)
-        if x_array.ndim != 1 or x_array.shape != y_array.shape:
-            raise ValueError("绘图 x/y 必须是一维且长度相同")
-        if not np.isfinite(x_array).all() or not np.isfinite(y_array).all():
-            raise ValueError("绘图 x/y 必须全部为有限数值")
-        return x_array, y_array
 
     def _create_item(self, x, y, color: str, label: str) -> pg.PlotDataItem:
         item = self.plotItem.plot(
@@ -186,21 +177,21 @@ class PyQtGraphSpectrumPlotWidget(pg.PlotWidget):
             pen=pg.mkPen(color, width=self.line_width),
             name=label,
             antialias=False,
-            connect="all",
+            connect="finite",
         )
         item.setClipToView(True)
-        item.setDownsampling(auto=True, method="peak")
+        item.setDownsampling(auto=False)
         if hasattr(item, "setSkipFiniteCheck"):
-            item.setSkipFiniteCheck(True)
+            item.setSkipFiniteCheck(False)
         return item
 
     def _update_item(self, curve: _PlotCurve, x, y):
         curve.x = x
         curve.y = y
-        curve.item.setData(x, y, connect="all")
+        curve.item.setData(x, y, connect="finite")
 
     def update_device_curve(self, device_id: int, x, y, label: str = ""):
-        x_array, y_array = self._validated_arrays(x, y)
+        x_array, y_array = validated_plot_arrays(x, y)
         device_id = int(device_id)
         curve = self.device_curves.get(device_id)
         is_new = curve is None
@@ -236,7 +227,7 @@ class PyQtGraphSpectrumPlotWidget(pg.PlotWidget):
     def add_reference_curve(self, x, y, label: str = "对比光谱") -> bool:
         if len(self.reference_curves) >= 64:
             return False
-        x_array, y_array = self._validated_arrays(x, y)
+        x_array, y_array = validated_plot_arrays(x, y)
         self._reference_index += 1
         key = f"reference_{self._reference_index}"
         color = COLOR_PALETTE[
@@ -254,7 +245,7 @@ class PyQtGraphSpectrumPlotWidget(pg.PlotWidget):
         return True
 
     def set_baseline_curve(self, device_id: int, x, y, visible: bool = True):
-        x_array, y_array = self._validated_arrays(x, y)
+        x_array, y_array = validated_plot_arrays(x, y)
         device_id = int(device_id)
         curve = self.baseline_curves.get(device_id)
         if curve is None:
@@ -348,6 +339,9 @@ class PyQtGraphSpectrumPlotWidget(pg.PlotWidget):
 
     def reset_initial_view(self):
         self.auto_range_enabled = True
+        self.restore_initial_view()
+
+    def restore_initial_view(self):
         self._update_auto_range(force=True)
         self.view_reset.emit()
 
@@ -385,17 +379,19 @@ class PyQtGraphSpectrumPlotWidget(pg.PlotWidget):
         )
 
     def _calculate_bounds(self):
-        curves = [
-            curve
-            for curve in self._all_curves()
-            if curve.visible and curve.x.size
-        ]
-        if not curves:
+        bounds = []
+        for curve in self._all_curves():
+            if not curve.visible:
+                continue
+            bound = finite_curve_bounds(curve.x, curve.y)
+            if bound is not None:
+                bounds.append(bound)
+        if not bounds:
             return 0.0, 4095.0, 0.0, 65535.0
-        x_min = min(float(curve.x.min()) for curve in curves)
-        x_max = max(float(curve.x.max()) for curve in curves)
-        y_min = min(float(curve.y.min()) for curve in curves)
-        y_max = max(float(curve.y.max()) for curve in curves)
+        x_min = min(bound[0] for bound in bounds)
+        x_max = max(bound[1] for bound in bounds)
+        y_min = min(bound[2] for bound in bounds)
+        y_max = max(bound[3] for bound in bounds)
         if x_max <= x_min:
             x_max = x_min + 1.0
         if y_max <= y_min:

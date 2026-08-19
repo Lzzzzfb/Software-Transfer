@@ -35,11 +35,29 @@ def expected_relatives():
 
 
 def sync():
-    APP_TARGET.mkdir(parents=True, exist_ok=True)
+    staging = APP_TARGET.with_name(f"{APP_TARGET.name}.next")
+    previous = APP_TARGET.with_name(f"{APP_TARGET.name}.previous")
+    for path in (staging, previous):
+        if path.exists():
+            shutil.rmtree(path)
+    staging.mkdir(parents=True, exist_ok=True)
     for source, relative in source_files():
-        target = APP_TARGET / relative
+        target = staging / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
+    try:
+        if APP_TARGET.exists():
+            APP_TARGET.replace(previous)
+        staging.replace(APP_TARGET)
+    except OSError:
+        if not APP_TARGET.exists() and previous.exists():
+            previous.replace(APP_TARGET)
+        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    if previous.exists():
+        shutil.rmtree(previous)
 
 
 def check():

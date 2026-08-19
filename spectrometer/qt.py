@@ -4,11 +4,7 @@ import sys
 
 
 def _load_qt():
-    candidates = ("PyQt6", "PySide6", "PyQt5") if sys.platform.startswith("linux") else (
-        "PySide6",
-        "PyQt6",
-        "PyQt5",
-    )
+    candidates = ("PyQt6", "PySide6", "PyQt5")
     errors = []
     for candidate in candidates:
         try:
@@ -69,18 +65,27 @@ def _install_flat_enum_aliases():
             {
                 "QueuedConnection": ("ConnectionType", "QueuedConnection"),
                 "Horizontal": ("Orientation", "Horizontal"),
+                "Vertical": ("Orientation", "Vertical"),
                 "ToolButtonTextOnly": ("ToolButtonStyle", "ToolButtonTextOnly"),
                 "PointingHandCursor": ("CursorShape", "PointingHandCursor"),
                 "Key_Up": ("Key", "Key_Up"),
                 "Key_Down": ("Key", "Key_Down"),
                 "Key_PageUp": ("Key", "Key_PageUp"),
                 "Key_PageDown": ("Key", "Key_PageDown"),
+                "NoModifier": ("KeyboardModifier", "NoModifier"),
+                "PreciseTimer": ("TimerType", "PreciseTimer"),
                 "StrongFocus": ("FocusPolicy", "StrongFocus"),
                 "AlignCenter": ("AlignmentFlag", "AlignCenter"),
                 "AlignRight": ("AlignmentFlag", "AlignRight"),
                 "AlignVCenter": ("AlignmentFlag", "AlignVCenter"),
                 "DashLine": ("PenStyle", "DashLine"),
                 "LeftButton": ("MouseButton", "LeftButton"),
+            },
+        ),
+        (
+            QtCore.QEvent,
+            {
+                "KeyPress": ("Type", "KeyPress"),
             },
         ),
         (
@@ -92,10 +97,26 @@ def _install_flat_enum_aliases():
             },
         ),
         (
+            QtWidgets.QDialog,
+            {
+                "Accepted": ("DialogCode", "Accepted"),
+                "Rejected": ("DialogCode", "Rejected"),
+            },
+        ),
+        (
             QtWidgets.QDialogButtonBox,
             {
                 "Apply": ("StandardButton", "Apply"),
                 "Close": ("StandardButton", "Close"),
+                "Ok": ("StandardButton", "Ok"),
+                "Cancel": ("StandardButton", "Cancel"),
+            },
+        ),
+        (
+            QtWidgets.QMessageBox,
+            {
+                "Yes": ("StandardButton", "Yes"),
+                "No": ("StandardButton", "No"),
                 "Ok": ("StandardButton", "Ok"),
                 "Cancel": ("StandardButton", "Cancel"),
             },

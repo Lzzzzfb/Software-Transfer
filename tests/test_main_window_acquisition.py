@@ -154,7 +154,7 @@ def test_hidden_live_page_defers_processing_and_keeps_only_latest_frame(tmp_path
     item._plot_tick()
     assert item._pending_plot_frames[0].sequence == 2
 
-    item.tabs.setCurrentWidget(item.plot_widget)
+    item.tabs.setCurrentWidget(item.live_workspace)
     item._plot_tick()
 
     assert 0 in item.plot_widget.device_curves

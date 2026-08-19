@@ -20,6 +20,7 @@ class AcquisitionOwner(str, Enum):
     GLOBAL = "global"
     LOCAL = "local"
     CALIBRATION = "calibration"
+    SCAN = "scan"
 
 
 class ControlState(str, Enum):

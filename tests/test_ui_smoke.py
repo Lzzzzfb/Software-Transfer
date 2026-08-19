@@ -25,6 +25,9 @@ def test_main_window_follows_ribbon_sidebar_plot_status_layout(tmp_path):
     assert window.ribbon.objectName() == "mainRibbon"
     assert window.sidebar.objectName() == "deviceSidebar"
     assert window.plot_widget.objectName() == "spectrumPlot"
+    assert window.motor_panel.objectName() == "motorPanel"
+    assert window.live_workspace.widget(0) is window.plot_widget
+    assert window.live_workspace.widget(1) is window.motor_panel
     expected_backend = (
         "pyqtgraph"
         if os.environ.get("ZGCAI_PLOT_BACKEND") == "pyqtgraph"
@@ -168,6 +171,23 @@ def test_custom_plot_runs_without_pyqtgraph_and_preserves_manual_range():
     plot.set_view_range(10, 30, -1, 1)
     assert plot._effective_range() == (10, 30, -1, 1)
     assert plot.add_reference_curve(x, np.cos(x / 10), "参考")
+
+
+def test_plot_view_reset_mirrors_backend_auto_range_state(tmp_path):
+    app = application()
+    window = MainWindow(
+        simulation=True,
+        auto_start_simulation=False,
+        settings_path=tmp_path / "settings.json",
+    )
+    window.plot_widget.auto_range_enabled = False
+    window.auto_range.setChecked(True)
+
+    window._plot_view_reset()
+
+    assert not window.auto_range.isChecked()
+    window.close()
+    app.processEvents()
 
 
 def test_plot_reports_completed_new_data_paint():

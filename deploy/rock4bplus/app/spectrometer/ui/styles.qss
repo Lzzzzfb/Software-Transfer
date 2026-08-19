@@ -8,7 +8,7 @@ QPushButton { background: #FFFFFF; border: 1px solid #C8D4E5; border-radius: 5px
 QPushButton:hover { border-color: #3978C8; color: #1556A1; background: #F5F9FF; }
 QPushButton:pressed { background: #DDEBFD; }
 QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit { background: #FFFFFF; border: 1px solid #C8D4E5; border-radius: 5px; padding: 5px 7px; min-height: 20px; }
-QComboBox:focus, QSpinBox:focus, QLineEdit:focus { border-color: #2E73C5; }
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus { border-color: #2E73C5; }
 #deviceSidebar { background: #EAF2FD; border-right: 1px solid #B8C9DE; }
 #sectionTitle { font-size: 15px; font-weight: 700; color: #174C8F; padding: 4px; }
 #storageBox { background: #FFFFFF; border: 1px solid #C9D6E7; border-radius: 7px; }
@@ -20,6 +20,23 @@ QComboBox:focus, QSpinBox:focus, QLineEdit:focus { border-color: #2E73C5; }
 QTabBar::tab { background: #DDE9F8; border: 1px solid #B9C8DB; padding: 7px 18px; }
 QTabBar::tab:selected { background: #FFFFFF; color: #1759A5; border-bottom-color: #FFFFFF; }
 #spectrumPlot { background: #FFFFFF; }
+#liveWorkspace::handle { background: #C7D6E8; height: 4px; }
+#motorPanel { background: #EEF4FC; border-top: 1px solid #B9CBE2; }
+#motorPanelTitle { color: #174C8F; font-size: 15px; font-weight: 700; }
+#motorGroup { background: #FFFFFF; border: 1px solid #C7D5E7; border-radius: 7px; margin-top: 7px; padding-top: 7px; }
+#motorGroup::title { subcontrol-origin: margin; left: 9px; padding: 0 5px; color: #174C8F; font-weight: 700; }
+#motorConnectionState { border-radius: 9px; padding: 3px 9px; font-weight: 700; }
+#motorConnectionState[state="offline"] { background: #E4EAF2; color: #59697D; }
+#motorConnectionState[state="online"] { background: #D7F2E4; color: #16734A; }
+#motorPortLabel, #motorHint { color: #5B6B82; }
+#motorColumnHeader { color: #4D6078; font-size: 11px; font-weight: 600; }
+#motorAxisLabel { color: #174C8F; font-size: 15px; font-weight: 700; }
+#motorLimitIndicator { border-radius: 7px; padding: 2px 6px; background: #E8EDF4; color: #64748B; }
+#motorLimitIndicator[active="true"] { background: #FDE2E2; color: #B42318; font-weight: 700; }
+#motorStopButton { background: #FFF1F0; border-color: #F0A19B; color: #B42318; font-weight: 700; }
+#scanStartButton { background: #1F6FC3; border-color: #1F6FC3; color: #FFFFFF; font-weight: 700; }
+#scanStartButton:hover { background: #185CA4; color: #FFFFFF; }
+#scanProgress { color: #1759A5; font-weight: 700; }
 QStatusBar { background: #E2EEFC; border-top: 1px solid #B8C9DE; color: #24486F; }
 QStatusBar QLabel { padding: 2px 10px; border-left: 1px solid #C0D0E3; }
 QLabel[warning="true"] { color: #B54708; font-weight: 700; background: #FEF0C7; }

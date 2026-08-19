@@ -1,0 +1,1 @@
+"""Square-wave controller tests."""
