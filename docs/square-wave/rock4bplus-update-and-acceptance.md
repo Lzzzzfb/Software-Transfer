@@ -15,14 +15,17 @@ cd "D:\codex\光谱仪 - Linux转移版"
 .\.venv\Scripts\python.exe tools\build_rock4bplus_deploy.py --check
 
 $updateId = "square-wave-$(Get-Date -Format yyyyMMdd-HHmmss)"
-$remoteRoot = "/home/radxa/zgcai-update-$updateId"
-ssh radxa@192.168.1.247 "mkdir -p '$remoteRoot'"
-scp -r .\deploy\rock4bplus\* "radxa@192.168.1.247:$remoteRoot/"
+$remoteParent = "/home/radxa/zgcai-upload-$updateId"
+$remoteRoot = "$remoteParent/rock4bplus"
+ssh radxa@192.168.1.247 "mkdir -p '$remoteParent'"
+scp -r ".\deploy\rock4bplus" "radxa@192.168.1.247:$remoteParent/"
+ssh radxa@192.168.1.247 "test -f '$remoteRoot/install.sh' && echo UPLOAD_OK '$remoteRoot'"
 
 Write-Host "板端更新目录：$remoteRoot"
 ```
 
-`scp` 在 Windows PowerShell 中执行，不要粘贴到 ROCK 4B+ 的 Bash 终端。
+`scp` 在 Windows PowerShell 中执行，不要粘贴到 ROCK 4B+ 的 Bash 终端。这里上传整个
+`rock4bplus` 目录，不使用 `*` 通配符；安装前必须看到 `UPLOAD_OK`，否则不要继续。
 
 ## 2. ROCK 4B+ 备份并安装
 
@@ -36,15 +39,19 @@ pgrep -af '/opt/zgcai-spectrometer/main.py' || true
 把上一节显示的实际更新目录填入 `update_root`：
 
 ```bash
-update_root=/home/radxa/zgcai-update-square-wave-YYYYMMDD-HHMMSS
+update_root=/home/radxa/zgcai-upload-square-wave-YYYYMMDD-HHMMSS/rock4bplus
 backup_dir="/home/radxa/zgcai-backups/pre-square-wave-$(date +%Y%m%d-%H%M%S)"
+
+test -f "$update_root/install.sh" || {
+  echo "未找到 $update_root/install.sh，请停止安装并检查 Windows 上传结果"
+  exit 1
+}
 
 mkdir -p "$backup_dir"
 sudo cp -a /opt/zgcai-spectrometer "$backup_dir/application"
 printf '%s\n' "$backup_dir" | tee /home/radxa/zgcai-last-backup.txt
 
-cd "$update_root"
-sudo ./install.sh
+sudo bash "$update_root/install.sh"
 ```
 
 安装脚本保留用户配置、历史数据和诊断目录；会同步主程序、创建/更新虚拟环境，并安装

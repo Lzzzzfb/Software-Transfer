@@ -8,7 +8,7 @@
 
 ```bash
 cd rock4bplus
-sudo ./install.sh
+sudo bash ./install.sh
 ```
 
 安装脚本要求 Debian 12 ARM64 和 Python 3.11，安装 PyQt6、QtSerialPort、
