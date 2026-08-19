@@ -173,6 +173,23 @@ def test_custom_plot_runs_without_pyqtgraph_and_preserves_manual_range():
     assert plot.add_reference_curve(x, np.cos(x / 10), "参考")
 
 
+def test_plot_view_reset_mirrors_backend_auto_range_state(tmp_path):
+    app = application()
+    window = MainWindow(
+        simulation=True,
+        auto_start_simulation=False,
+        settings_path=tmp_path / "settings.json",
+    )
+    window.plot_widget.auto_range_enabled = False
+    window.auto_range.setChecked(True)
+
+    window._plot_view_reset()
+
+    assert not window.auto_range.isChecked()
+    window.close()
+    app.processEvents()
+
+
 def test_plot_reports_completed_new_data_paint():
     app = application()
     plot = SpectrumPlotWidget()

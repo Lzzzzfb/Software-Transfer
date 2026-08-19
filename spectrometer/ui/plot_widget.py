@@ -6,6 +6,11 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 from ..qt import QT_API, QtCore, QtGui, QtWidgets, Signal
+from .plot_data import (
+    finite_curve_bounds,
+    validated_plot_arrays,
+    visible_finite_segments,
+)
 
 
 COLOR_PALETTE = [
@@ -65,15 +70,11 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         self._selection_current = None
         self._cursor_pos = None
         self._show_crosshair = True
-        self._sample_index_cache = {}
         self._data_generation = 0
         self._painted_generation = 0
 
     def update_device_curve(self, device_id: int, x, y, label: str = ""):
-        x_array = np.asarray(x, dtype=np.float64)
-        y_array = np.asarray(y, dtype=np.float64)
-        if x_array.shape != y_array.shape or x_array.ndim != 1:
-            raise ValueError("绘图 x/y 必须是一维且长度相同")
+        x_array, y_array = validated_plot_arrays(x, y)
         color = QtGui.QColor(COLOR_PALETTE[device_id % len(COLOR_PALETTE)])
         existing = self.device_curves.get(device_id)
         self.device_curves[device_id] = _Curve(
@@ -97,11 +98,12 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
     def add_reference_curve(self, x, y, label: str = "对比光谱") -> bool:
         if len(self.reference_curves) >= 64:
             return False
+        x_array, y_array = validated_plot_arrays(x, y)
         key = f"reference_{len(self.reference_curves) + 1}"
         color = QtGui.QColor(COLOR_PALETTE[(len(self.reference_curves) + 5) % len(COLOR_PALETTE)])
         self.reference_curves[key] = _Curve(
-            np.asarray(x, dtype=np.float64).copy(),
-            np.asarray(y, dtype=np.float64).copy(),
+            x_array.copy(),
+            y_array.copy(),
             color,
             label,
         )
@@ -109,9 +111,10 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         return True
 
     def set_baseline_curve(self, device_id: int, x, y, visible: bool = True):
+        x_array, y_array = validated_plot_arrays(x, y)
         self.baseline_curves[device_id] = _Curve(
-            np.asarray(x, dtype=np.float64).copy(),
-            np.asarray(y, dtype=np.float64).copy(),
+            x_array.copy(),
+            y_array.copy(),
             QtGui.QColor("#8894A4"),
             f"设备 {device_id} 基线",
             visible,
@@ -170,6 +173,9 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
 
     def reset_initial_view(self):
         self.auto_range_enabled = True
+        self.restore_initial_view()
+
+    def restore_initial_view(self):
         self._view_range = self._initial_view_range()
         self.view_reset.emit()
         self.update()
@@ -203,13 +209,19 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
         return list(self.device_curves.values()) + list(self.reference_curves.values()) + list(self.baseline_curves.values())
 
     def _calculate_bounds(self):
-        visible = [curve for curve in self._all_curves() if curve.visible and curve.x.size]
-        if not visible:
+        bounds = []
+        for curve in self._all_curves():
+            if not curve.visible:
+                continue
+            bound = finite_curve_bounds(curve.x, curve.y)
+            if bound is not None:
+                bounds.append(bound)
+        if not bounds:
             return (0.0, 4095.0, 0.0, 65535.0)
-        x_min = min(float(np.nanmin(curve.x)) for curve in visible)
-        x_max = max(float(np.nanmax(curve.x)) for curve in visible)
-        y_min = min(float(np.nanmin(curve.y)) for curve in visible)
-        y_max = max(float(np.nanmax(curve.y)) for curve in visible)
+        x_min = min(bound[0] for bound in bounds)
+        x_max = max(bound[1] for bound in bounds)
+        y_min = min(bound[2] for bound in bounds)
+        y_max = max(bound[3] for bound in bounds)
         if x_max <= x_min: x_max = x_min + 1
         if y_max <= y_min: y_max = y_min + 1
         x_pad = (x_max - x_min) * 0.02
@@ -344,37 +356,34 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
     def _draw_curve(self, painter, rect, view, curve):
         if curve.x.size < 2:
             return
-        finite = np.isfinite(curve.x) & np.isfinite(curve.y)
-        x, y = curve.x[finite], curve.y[finite]
-        if x.size < 2:
-            return
-        max_points = self._curve_point_limit(rect.width())
-        if x.size > max_points:
-            cache_key = (x.size, max_points)
-            indices = self._sample_index_cache.get(cache_key)
-            if indices is None:
-                indices = np.linspace(0, x.size - 1, max_points, dtype=int)
-                self._sample_index_cache[cache_key] = indices
-            x, y = x[indices], y[indices]
-        px = rect.left() + (x - view[0]) / (view[1] - view[0]) * rect.width()
-        py = rect.bottom() - (y - view[2]) / (view[3] - view[2]) * rect.height()
-        polygon = QtGui.QPolygonF(
-            [
-                QtCore.QPointF(float(x_point), float(y_point))
-                for x_point, y_point in zip(px, py)
-            ]
+        segments = visible_finite_segments(
+            curve.x, curve.y, view[0], view[1]
         )
+        if not segments:
+            return
         painter.save(); painter.setClipRect(rect)
         antialias = getattr(QtGui.QPainter, "Antialiasing", None)
         if antialias is None:
             antialias = QtGui.QPainter.RenderHint.Antialiasing
         painter.setRenderHint(antialias, False)
         painter.setPen(QtGui.QPen(curve.color, self.line_width))
-        painter.drawPolyline(polygon); painter.restore()
-
-    @staticmethod
-    def _curve_point_limit(plot_width):
-        return max(400, int(plot_width))
+        for x, y in segments:
+            px = (
+                rect.left()
+                + (x - view[0]) / (view[1] - view[0]) * rect.width()
+            )
+            py = (
+                rect.bottom()
+                - (y - view[2]) / (view[3] - view[2]) * rect.height()
+            )
+            polygon = QtGui.QPolygonF(
+                [
+                    QtCore.QPointF(float(x_point), float(y_point))
+                    for x_point, y_point in zip(px, py)
+                ]
+            )
+            painter.drawPolyline(polygon)
+        painter.restore()
 
     def _draw_legend(self, painter, rect):
         items = [curve for curve in self._all_curves() if curve.visible][:12]
@@ -486,7 +495,7 @@ class SpectrumPlotWidget(QtWidgets.QWidget):
             event.button() == QtCore.Qt.LeftButton
             and self._plot_rect().contains(_event_position(event))
         ):
-            self.reset_initial_view()
+            self.restore_initial_view()
 
     def wheelEvent(self, event):
         event.accept()
