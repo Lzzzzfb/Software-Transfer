@@ -120,3 +120,26 @@ def test_connected_square_wave_port_is_excluded_from_motor_discovery(tmp_path):
     assert "/dev/ttyACM0" in window._motor_excluded_ports()
     window.close()
     app.processEvents()
+
+
+def test_square_wave_diagnostics_are_kept_in_session_log_for_bundle_export(
+    tmp_path,
+):
+    app = application()
+    square_wave = FakeSquareWaveController()
+    window = MainWindow(
+        simulation=True,
+        auto_start_simulation=False,
+        settings_path=tmp_path / "settings.json",
+        square_wave_controller=square_wave,
+    )
+    run_dir = window.diagnostic_recorder.run_dir
+
+    square_wave.diagnostic_event.emit(
+        "op=apply result=ok freq=10 width=5 elapsed_ms=12"
+    )
+    window.close()
+    app.processEvents()
+
+    timeline = (run_dir / "timeline.jsonl").read_text(encoding="utf-8")
+    assert "方波：op=apply result=ok freq=10 width=5 elapsed_ms=12" in timeline

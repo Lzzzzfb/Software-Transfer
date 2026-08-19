@@ -304,3 +304,30 @@ def test_update_host_settings_does_not_persist_scan_linkage_and_shutdown_reclaim
 
     controller.shutdown()
     assert transport.shutdown_called
+
+
+def test_shutdown_waits_for_stop_and_status_confirmation_when_output_runs():
+    _app = (
+        QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
+    )
+    controller, transport, _store = make_controller()
+    connect_successfully(controller, transport)
+    controller.start_output()
+    transport.complete_last(object())
+    transport.complete_last(DeviceStatus(True, SquareWaveParameters()))
+
+    def complete_stop_ack():
+        assert transport.sent[-1][0] == b"STOP\r\n"
+        transport.complete_last(object())
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: transport.complete_last(
+                DeviceStatus(False, SquareWaveParameters())
+            ),
+        )
+
+    QtCore.QTimer.singleShot(0, complete_stop_ack)
+    controller.shutdown()
+
+    assert controller.output_state is OutputState.STOPPED
+    assert transport.shutdown_called

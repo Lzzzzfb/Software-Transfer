@@ -739,19 +739,59 @@ class SquareWaveController(QtCore.QObject):
         self.diagnostic_event.emit(f"方波操作拒绝：{reason}")
 
     def shutdown(self):
-        if self._connected and self._output_state is not OutputState.STOPPED:
+        if self._connected and (
+            self._output_state is not OutputState.STOPPED or self.busy
+        ):
             self.diagnostic_event.emit(
-                "应用关闭时方波输出未确认停止，尝试发送 STOP；"
-                "若未收到确认则输出状态未知"
+                "应用关闭：等待当前方波事务结束并尝试确认 STOP"
             )
-            self._send(
-                stop_command(),
-                expected="ok",
-                tag=("shutdown", "stop"),
-                action=True,
-                timeout_ms=300,
-            )
-            self._output_state = OutputState.UNKNOWN
+            loop = QtCore.QEventLoop()
+            timer = QtCore.QTimer()
+            timer.setSingleShot(True)
+            stop_requested = [self._operation in {
+                "manual_stop",
+                "scan_stop",
+                "disconnect_stop",
+                "connect_reconcile",
+            }]
+
+            def continue_shutdown(_state=None):
+                if not self._connected:
+                    loop.quit()
+                    return
+                if (
+                    self._output_state is OutputState.STOPPED
+                    and not self.busy
+                ):
+                    loop.quit()
+                    return
+                if not self.busy and not stop_requested[0]:
+                    stop_requested[0] = True
+                    if self._owner is OutputOwner.SCAN:
+                        self.finish_scan_round()
+                    else:
+                        self.stop_output()
+
+            self.status_changed.connect(continue_shutdown)
+            timer.timeout.connect(loop.quit)
+            timer.start(1500)
+            continue_shutdown()
+            if timer.isActive() and (
+                self.busy
+                or self._output_state is not OutputState.STOPPED
+            ):
+                loop.exec()
+            timer.stop()
+            try:
+                self.status_changed.disconnect(continue_shutdown)
+            except (RuntimeError, TypeError):
+                pass
+            if self._output_state is not OutputState.STOPPED:
+                self._output_state = OutputState.UNKNOWN
+                self.diagnostic_event.emit(
+                    "应用关闭：未在 1.5 秒内确认 STOP，输出状态未知；"
+                    "请重新连接确认或切断 STM32 电源"
+                )
         self._connected = False
         self._owner = OutputOwner.NONE
         self.transport.shutdown()
