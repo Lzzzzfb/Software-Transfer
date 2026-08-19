@@ -151,6 +151,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_controller = scan_controller or ScanController(
             self.motor_controller,
             self.control,
+            square_wave_controller=self.square_wave_controller,
             manifest_directory=(
                 Path(self.settings["storage_path"]) / "scan-manifests"
             ),
@@ -837,6 +838,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             batch_size=int(self.settings["batch_size"]),
             allow_uncalibrated=not calibrated,
+            square_wave_enabled=(
+                self.motor_panel.square_wave_panel.scan_link_enabled
+            ),
+            square_wave_parameters=(
+                self.motor_panel.square_wave_panel.parameters()
+            ),
         )
 
     def _set_scan_ui_locked(self, locked):
@@ -855,6 +862,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if state is ScanState.STOPPING_ACQUISITION:
             self.status_panel.state_label.setText(
                 "扫描轮次完成，正在停止光谱仪并封存本轮数据…"
+            )
+        elif state is ScanState.STARTING_SIGNAL:
+            self.status_panel.state_label.setText(
+                "正在应用方波参数并确认输出开启…"
+            )
+        elif state is ScanState.STOPPING_SIGNAL:
+            self.status_panel.state_label.setText(
+                "光谱数据已封存，正在确认方波输出关闭…"
             )
         elif state is ScanState.RETURNING:
             if self.scan_controller.acquisition_enabled:

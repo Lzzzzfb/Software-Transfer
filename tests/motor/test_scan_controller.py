@@ -15,6 +15,11 @@ from spectrometer.motor.models import (
 from spectrometer.motor.scan import ScanParameters
 from spectrometer.motor.scan_controller import ScanController, ScanState
 from spectrometer.qt import QtCore, QtWidgets, Signal
+from spectrometer.square_wave.models import (
+    OutputOwner,
+    OutputState,
+    SquareWaveParameters,
+)
 
 
 _APPLICATION = None
@@ -259,6 +264,55 @@ class DeferredScanAcquisitionController(FakeAcquisitionController):
 
     def finish_export(self, task_id, files=(), failed=False):
         self.task_finished.emit(str(task_id), list(files), bool(failed))
+
+
+class FakeSquareWaveController(QtCore.QObject):
+    scan_round_prepared = Signal(bool, str)
+    scan_round_finished = Signal(bool, str)
+    connection_changed = Signal(bool, str)
+
+    def __init__(self):
+        super().__init__()
+        self.connected = True
+        self.output_state = OutputState.STOPPED
+        self.owner = OutputOwner.NONE
+        self.prepare_calls = []
+        self.finish_calls = 0
+
+    def prepare_scan_round(self, parameters):
+        if not self.connected:
+            return False
+        self.prepare_calls.append(parameters)
+        return True
+
+    def complete_prepare(self, success=True, reason="signal_started"):
+        if success:
+            self.output_state = OutputState.RUNNING
+            self.owner = OutputOwner.SCAN
+        self.scan_round_prepared.emit(bool(success), str(reason))
+
+    def finish_scan_round(self):
+        self.finish_calls += 1
+        return bool(self.connected)
+
+    def complete_finish(self, success=True, reason="signal_stopped"):
+        if success:
+            self.output_state = OutputState.STOPPED
+            self.owner = OutputOwner.NONE
+        else:
+            self.output_state = OutputState.UNKNOWN
+        self.scan_round_finished.emit(bool(success), str(reason))
+
+    def lose_connection(self):
+        self.connected = False
+        self.output_state = OutputState.UNKNOWN
+        self.owner = OutputOwner.NONE
+        self.connection_changed.emit(False, "square-wave disconnected")
+
+
+class RejectingScanAcquisitionController(FakeAcquisitionController):
+    def start_scan_global(self, *args, **kwargs):
+        return False
 
 
 def _controller(tmp_path, parameters=None):
@@ -798,3 +852,247 @@ def test_deferred_export_failure_finishes_scan_as_faulted(tmp_path):
     assert manifest["status"] == "faulted"
     assert manifest["rounds"][0]["completed"] is False
     assert manifest["rounds"][0]["files"] == ["round-1.zgs"]
+
+
+def test_linked_round_starts_signal_before_acquisition_and_stops_after_capture(
+    tmp_path,
+):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    square_wave = FakeSquareWaveController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        square_wave_controller=square_wave,
+        manifest_directory=tmp_path,
+    )
+    events = []
+    controller.scan_event.connect(
+        lambda event, _payload: events.append(str(event))
+    )
+
+    parameters = SquareWaveParameters(7, 25)
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(0,),
+        square_wave_enabled=True,
+        square_wave_parameters=parameters,
+    )
+    assert controller.state is ScanState.STARTING_SIGNAL
+    assert square_wave.prepare_calls == [parameters]
+    assert acquisition.starts == []
+    assert motor.moves == []
+
+    square_wave.complete_prepare()
+    assert controller.state is ScanState.STARTING_ACQUISITION
+    assert len(acquisition.starts) == 1
+    acquisition.start_task()
+    assert controller.state is ScanState.SCANNING
+    assert len(motor.moves) == 1
+
+    for _ in range(3):
+        motor.finish_motion()
+    assert controller.state is ScanState.STOPPING_ACQUISITION
+    assert square_wave.finish_calls == 0
+    acquisition.finish_task(files=["round-1.csv"])
+    assert controller.state is ScanState.STOPPING_SIGNAL
+    assert square_wave.finish_calls == 1
+    assert len(motor.moves) == 3
+
+    square_wave.complete_finish()
+    assert controller.state is ScanState.RETURNING
+    assert motor.moves[-1] == (Axis.Y, 1.0, Direction.NEGATIVE)
+    motor.finish_motion()
+    manifest = json.loads(
+        controller.manifest_path.read_text(encoding="utf-8")
+    )
+    assert manifest["square_wave"]["enabled"] is True
+    assert manifest["square_wave"]["parameters"] == {
+        "frequency_hz": 7,
+        "pulse_width_us": 25,
+    }
+    assert manifest["rounds"][0]["square_wave_output_started"] is True
+    assert manifest["rounds"][0]["square_wave_output_stopped"] is True
+    assert events.index("motor_scan_square_wave_started") < events.index(
+        "motor_scan_acquisition_link"
+    ) < events.index("motor_scan_segment_started")
+    assert events.index("motor_scan_round_verified") < events.index(
+        "motor_scan_square_wave_stopped"
+    ) < events.index("motor_scan_round_completed")
+
+
+def test_linked_motor_only_round_is_signal_scan_stop_return(tmp_path):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    square_wave = FakeSquareWaveController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        square_wave_controller=square_wave,
+        manifest_directory=tmp_path,
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(),
+        square_wave_enabled=True,
+        square_wave_parameters=SquareWaveParameters(),
+    )
+    square_wave.complete_prepare()
+    assert controller.state is ScanState.SCANNING
+    for _ in range(3):
+        motor.finish_motion()
+
+    assert controller.state is ScanState.STOPPING_SIGNAL
+    assert acquisition.starts == []
+    assert square_wave.finish_calls == 1
+    assert len(motor.moves) == 3
+    square_wave.complete_finish()
+    assert controller.state is ScanState.RETURNING
+    assert len(motor.moves) == 4
+
+
+def test_linked_scan_precheck_rejects_disconnected_manual_or_unknown_signal(
+    tmp_path,
+):
+    application()
+    for connected, owner, output, expected in (
+        (False, OutputOwner.NONE, OutputState.STOPPED, "未连接"),
+        (True, OutputOwner.MANUAL, OutputState.RUNNING, "手动"),
+        (True, OutputOwner.NONE, OutputState.UNKNOWN, "未知"),
+    ):
+        motor = FakeMotorController()
+        acquisition = FakeAcquisitionController()
+        square_wave = FakeSquareWaveController()
+        square_wave.connected = connected
+        square_wave.owner = owner
+        square_wave.output_state = output
+        controller = ScanController(
+            motor,
+            acquisition,
+            square_wave_controller=square_wave,
+            manifest_directory=tmp_path,
+        )
+        failures = []
+        controller.operation_failed.connect(failures.append)
+
+        assert not controller.start(
+            ScanParameters(1, 1, 1, 1),
+            device_ids=(),
+            square_wave_enabled=True,
+            square_wave_parameters=SquareWaveParameters(),
+        )
+        assert expected in failures[-1]
+        assert not motor.scan_active
+
+
+def test_signal_start_failure_never_starts_acquisition_or_motion(tmp_path):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    square_wave = FakeSquareWaveController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        square_wave_controller=square_wave,
+        manifest_directory=tmp_path,
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(0,),
+        square_wave_enabled=True,
+        square_wave_parameters=SquareWaveParameters(),
+    )
+    square_wave.complete_prepare(False, "signal_start_failed")
+
+    assert controller.state is ScanState.FAULTED
+    assert acquisition.starts == []
+    assert motor.moves == []
+
+
+def test_acquisition_start_rejection_stops_started_signal_before_fault(
+    tmp_path,
+):
+    application()
+    motor = FakeMotorController()
+    acquisition = RejectingScanAcquisitionController()
+    square_wave = FakeSquareWaveController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        square_wave_controller=square_wave,
+        manifest_directory=tmp_path,
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(0,),
+        square_wave_enabled=True,
+        square_wave_parameters=SquareWaveParameters(),
+    )
+    square_wave.complete_prepare()
+    assert controller.state is ScanState.STOPPING_SIGNAL
+    assert square_wave.finish_calls == 1
+    assert motor.moves == []
+    square_wave.complete_finish()
+    assert controller.state is ScanState.FAULTED
+
+
+def test_square_wave_disconnect_stops_motor_and_acquisition_without_return(
+    tmp_path,
+):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    square_wave = FakeSquareWaveController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        square_wave_controller=square_wave,
+        manifest_directory=tmp_path,
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(0,),
+        square_wave_enabled=True,
+        square_wave_parameters=SquareWaveParameters(),
+    )
+    square_wave.complete_prepare()
+    acquisition.start_task()
+    square_wave.lose_connection()
+
+    assert motor.stop_count == 1
+    assert acquisition.stop_count == 1
+    acquisition.finish_task(files=["partial.csv"], failed=True)
+    assert controller.state is ScanState.FAULTED
+    assert len(motor.moves) == 1
+
+
+def test_user_stop_waits_for_linked_signal_stop_confirmation(tmp_path):
+    application()
+    motor = FakeMotorController()
+    acquisition = FakeAcquisitionController()
+    square_wave = FakeSquareWaveController()
+    controller = ScanController(
+        motor,
+        acquisition,
+        square_wave_controller=square_wave,
+        manifest_directory=tmp_path,
+    )
+
+    assert controller.start(
+        ScanParameters(1, 1, 1, 1),
+        device_ids=(),
+        square_wave_enabled=True,
+        square_wave_parameters=SquareWaveParameters(),
+    )
+    square_wave.complete_prepare()
+    assert controller.stop()
+    assert controller.state is ScanState.STOPPING_SIGNAL
+    assert square_wave.finish_calls == 1
+    square_wave.complete_finish()
+    assert controller.state is ScanState.IDLE

@@ -426,6 +426,7 @@ class MotorPanel(QtWidgets.QWidget):
         labels = {
             ScanState.IDLE: "等待开始",
             ScanState.PRECHECK: "正在检查参数",
+            ScanState.STARTING_SIGNAL: "正在启动方波",
             ScanState.STARTING_ACQUISITION: "正在启动光谱仪",
             ScanState.SCANNING: (
                 "扫描采集中"
@@ -434,6 +435,7 @@ class MotorPanel(QtWidgets.QWidget):
             ),
             ScanState.DWELLING: "步进等待",
             ScanState.STOPPING_ACQUISITION: "正在停止并保存",
+            ScanState.STOPPING_SIGNAL: "正在停止方波",
             ScanState.RETURNING: "正在返回扫描起点",
             ScanState.EXPORTING: "运动完成，正在导出光谱",
             ScanState.STOPPING: "正在安全停止",

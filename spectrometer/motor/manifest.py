@@ -11,7 +11,7 @@ import uuid
 from .scan import ScanPlan
 
 
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 
 def _now() -> str:
@@ -30,6 +30,7 @@ class ScanManifestWriter:
         *,
         motor_device_id: str,
         spectrometer_device_ids: tuple[int, ...],
+        square_wave=None,
     ) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
         scan_id = uuid.uuid4().hex
@@ -48,6 +49,7 @@ class ScanManifestWriter:
             "pulses_per_mm": 320,
             "motor_device_id": str(motor_device_id),
             "spectrometer_device_ids": list(spectrometer_device_ids),
+            "square_wave": dict(square_wave or {"enabled": False}),
             "rounds": [
                 {
                     "index": round_plan.index,
@@ -61,6 +63,10 @@ class ScanManifestWriter:
                     "reason": "",
                     "recovery_files": [],
                     "files": [],
+                    "square_wave_output_started": False,
+                    "square_wave_output_stopped": False,
+                    "square_wave_start_reason": "",
+                    "square_wave_stop_reason": "",
                 }
                 for round_plan in plan.rounds
             ],
@@ -77,6 +83,30 @@ class ScanManifestWriter:
         record = self._round(index)
         record["task_id"] = str(task_id)
         record["acquisition_started"] = True
+        self._write()
+
+    def square_wave_started(
+        self, index: int, *, parameters, reason: str = ""
+    ):
+        record = self._round(index)
+        record["square_wave_output_started"] = True
+        record["square_wave_parameters"] = dict(parameters)
+        record["square_wave_start_reason"] = str(reason)
+        self._write()
+
+    def square_wave_stopped(
+        self,
+        index: int,
+        *,
+        success: bool,
+        reason: str = "",
+    ):
+        record = self._round(index)
+        record["square_wave_output_stopped"] = bool(success)
+        record["square_wave_stop_reason"] = str(reason)
+        if not success:
+            record["failed"] = True
+            record["reason"] = str(reason)
         self._write()
 
     def acquisition_finished(

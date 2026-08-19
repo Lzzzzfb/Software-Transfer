@@ -14,6 +14,11 @@ from ..domain.enums import (
     SyncMode,
 )
 from ..qt import QtCore, Signal, Slot
+from ..square_wave.models import (
+    OutputOwner,
+    OutputState,
+    SquareWaveParameters,
+)
 from .manifest import ScanManifestWriter
 from .models import Position
 from .scan import ScanMove, ScanParameters, ScanPlan, build_scan_plan
@@ -22,10 +27,12 @@ from .scan import ScanMove, ScanParameters, ScanPlan, build_scan_plan
 class ScanState(str, Enum):
     IDLE = "idle"
     PRECHECK = "precheck"
+    STARTING_SIGNAL = "starting_signal"
     STARTING_ACQUISITION = "starting_acquisition"
     SCANNING = "scanning"
     DWELLING = "dwelling"
     STOPPING_ACQUISITION = "stopping_acquisition"
+    STOPPING_SIGNAL = "stopping_signal"
     RETURNING = "returning"
     EXPORTING = "exporting"
     STOPPING = "stopping"
@@ -58,12 +65,14 @@ class ScanController(QtCore.QObject):
         motor_controller,
         acquisition_controller,
         *,
+        square_wave_controller=None,
         manifest_directory,
         parent=None,
     ):
         super().__init__(parent)
         self.motor = motor_controller
         self.acquisition = acquisition_controller
+        self.square_wave = square_wave_controller
         self._manifest = ScanManifestWriter(manifest_directory)
         self._manifest_active = False
         self._state = ScanState.IDLE
@@ -87,6 +96,10 @@ class ScanController(QtCore.QObject):
         self._pending_export_task_ids: set[str] = set()
         self._finish_after_exports = ""
         self._export_failure_reason = ""
+        self._square_wave_enabled = False
+        self._square_wave_parameters: SquareWaveParameters | None = None
+        self._square_wave_active = False
+        self._after_square_wave_stop = ""
 
         self._dwell_timer = QtCore.QTimer(self)
         self._dwell_timer.setSingleShot(True)
@@ -124,6 +137,17 @@ class ScanController(QtCore.QObject):
         self.acquisition.operation_rejected.connect(
             self._on_acquisition_rejected
         )
+        if self.square_wave is not None:
+            self.square_wave.scan_round_prepared.connect(
+                self._on_square_wave_prepared
+            )
+            self.square_wave.scan_round_finished.connect(
+                self._on_square_wave_finished
+            )
+            if hasattr(self.square_wave, "connection_changed"):
+                self.square_wave.connection_changed.connect(
+                    self._on_square_wave_connection_changed
+                )
 
     @property
     def state(self) -> ScanState:
@@ -190,6 +214,8 @@ class ScanController(QtCore.QObject):
         storage_format=StorageFormat.CSV_EXCEL,
         batch_size: int = 500,
         allow_uncalibrated: bool = False,
+        square_wave_enabled: bool = False,
+        square_wave_parameters: SquareWaveParameters | None = None,
     ) -> bool:
         if self.active:
             self.operation_failed.emit("扫描任务正在运行")
@@ -200,6 +226,28 @@ class ScanController(QtCore.QObject):
                 raise ValueError("电机控制器未连接")
             if self.motor.motion_active:
                 raise ValueError("电机正在执行其他运动")
+            square_wave_enabled = bool(square_wave_enabled)
+            if square_wave_enabled:
+                if self.square_wave is None:
+                    raise ValueError("未配置方波控制器")
+                if not isinstance(
+                    square_wave_parameters, SquareWaveParameters
+                ):
+                    raise ValueError("方波扫描参数无效")
+                if not self.square_wave.connected:
+                    raise ValueError("方波发生器未连接")
+                if self.square_wave.owner is OutputOwner.MANUAL:
+                    raise ValueError("方波正由手动操作占用")
+                if self.square_wave.owner is not OutputOwner.NONE:
+                    raise ValueError("方波已被其他扫描任务占用")
+                if self.square_wave.output_state is OutputState.UNKNOWN:
+                    raise ValueError(
+                        "方波输出状态未知，请重新连接并完成停止确认"
+                    )
+                if self.square_wave.output_state is not OutputState.STOPPED:
+                    raise ValueError("方波输出未确认关闭")
+                if getattr(self.square_wave, "busy", False):
+                    raise ValueError("方波控制器正在执行其他操作")
             if not getattr(self.motor, "mechanics_valid", True):
                 raise ValueError(
                     "驱动板机械参数与 15 mm / 4800 pulse 换算不一致"
@@ -255,6 +303,12 @@ class ScanController(QtCore.QObject):
         self._pending_export_task_ids = set()
         self._finish_after_exports = ""
         self._export_failure_reason = ""
+        self._square_wave_enabled = square_wave_enabled
+        self._square_wave_parameters = (
+            square_wave_parameters if square_wave_enabled else None
+        )
+        self._square_wave_active = False
+        self._after_square_wave_stop = ""
         self._manifest_active = config.enabled
         if hasattr(self.motor, "set_scan_active"):
             if self.motor.set_scan_active(True) is False:
@@ -262,10 +316,25 @@ class ScanController(QtCore.QObject):
                 self.operation_failed.emit("电机扫描任务锁定失败")
                 return False
         if self._manifest_active:
+            square_wave_manifest = {"enabled": False}
+            if self._square_wave_enabled:
+                identity = getattr(self.square_wave, "identity", None)
+                square_wave_manifest = {
+                    "enabled": True,
+                    "port": str(getattr(self.square_wave, "port_name", "")),
+                    "serial_number": str(
+                        getattr(self.square_wave, "serial_number", "")
+                    ),
+                    "identity": (
+                        asdict(identity) if identity is not None else None
+                    ),
+                    "parameters": asdict(self._square_wave_parameters),
+                }
             self._manifest.start(
                 plan,
                 motor_device_id=self.motor.device_id,
                 spectrometer_device_ids=config.device_ids,
+                square_wave=square_wave_manifest,
             )
         self._emit_scan_event(
             "motor_scan_started",
@@ -274,6 +343,12 @@ class ScanController(QtCore.QObject):
             calibrated_start=bool(plan.calibrated_start),
             round_total=len(plan.rounds),
             spectrometer_device_ids=list(config.device_ids),
+            square_wave_enabled=bool(self._square_wave_enabled),
+            square_wave_parameters=(
+                asdict(self._square_wave_parameters)
+                if self._square_wave_parameters is not None
+                else None
+            ),
         )
         self._start_round()
         return True
@@ -319,6 +394,52 @@ class ScanController(QtCore.QObject):
         self._begin_round_after_motor_prepared()
 
     def _begin_round_after_motor_prepared(self):
+        if self._square_wave_enabled:
+            self._set_state(ScanState.STARTING_SIGNAL)
+            if not self.square_wave.prepare_scan_round(
+                self._square_wave_parameters
+            ):
+                self._begin_fault("方波扫描轮次启动请求被拒绝")
+            return
+        self._begin_round_after_square_wave_started()
+
+    @Slot(bool, str)
+    def _on_square_wave_prepared(self, success: bool, reason: str):
+        if (
+            not self.active
+            or not self._square_wave_enabled
+            or self._state is not ScanState.STARTING_SIGNAL
+        ):
+            return
+        if not success:
+            if self._user_stopping:
+                self._finish_stopped("user_stop")
+            else:
+                self._set_state(ScanState.STOPPING)
+                self._begin_fault(str(reason) or "方波输出启动失败")
+            return
+        self._square_wave_active = True
+        self._emit_scan_event(
+            "motor_scan_square_wave_started",
+            round_number=self._round_index + 1,
+            parameters=asdict(self._square_wave_parameters),
+            reason=str(reason),
+        )
+        if self._manifest_active:
+            self._manifest.square_wave_started(
+                self._current_round().index,
+                parameters=asdict(self._square_wave_parameters),
+                reason=str(reason),
+            )
+        if self._user_stopping:
+            self._request_square_wave_stop("stopped")
+            return
+        if self._failure_reason:
+            self._request_square_wave_stop("faulted")
+            return
+        self._begin_round_after_square_wave_started()
+
+    def _begin_round_after_square_wave_started(self):
         if not self.acquisition_enabled:
             self._set_state(ScanState.SCANNING)
             self._start_scan_motion()
@@ -570,7 +691,94 @@ class ScanController(QtCore.QObject):
         if self.acquisition_enabled:
             self._stop_round_acquisition()
         else:
+            self._request_square_wave_stop("return")
+
+    @staticmethod
+    def _stop_action_priority(action: str) -> int:
+        return {"": 0, "return": 1, "stopped": 2, "faulted": 3}.get(
+            str(action),
+            3,
+        )
+
+    def _request_square_wave_stop(self, next_action: str):
+        next_action = str(next_action)
+        if not self._square_wave_enabled or not self._square_wave_active:
+            self._continue_after_square_wave_stop(next_action)
+            return
+        if self._state is ScanState.STOPPING_SIGNAL:
+            if self._stop_action_priority(next_action) > self._stop_action_priority(
+                self._after_square_wave_stop
+            ):
+                self._after_square_wave_stop = next_action
+            return
+        self._after_square_wave_stop = next_action
+        self._set_state(ScanState.STOPPING_SIGNAL)
+        accepted = self.square_wave.finish_scan_round()
+        if not accepted and self._state is ScanState.STOPPING_SIGNAL:
+            self._square_wave_active = False
+            self._failure_reason = (
+                self._failure_reason
+                or "方波停止请求被拒绝，输出状态未知"
+            )
+            self._emit_scan_event(
+                "motor_scan_square_wave_stopped",
+                round_number=self._round_index + 1,
+                success=False,
+                reason=self._failure_reason,
+            )
+            if self._manifest_active:
+                self._manifest.square_wave_stopped(
+                    self._current_round().index,
+                    success=False,
+                    reason=self._failure_reason,
+                )
+            self._continue_after_square_wave_stop("faulted")
+
+    @Slot(bool, str)
+    def _on_square_wave_finished(self, success: bool, reason: str):
+        if (
+            not self.active
+            or not self._square_wave_enabled
+            or self._state is not ScanState.STOPPING_SIGNAL
+        ):
+            return
+        next_action = self._after_square_wave_stop
+        self._after_square_wave_stop = ""
+        self._square_wave_active = False
+        self._emit_scan_event(
+            "motor_scan_square_wave_stopped",
+            round_number=self._round_index + 1,
+            success=bool(success),
+            reason=str(reason),
+        )
+        if self._manifest_active:
+            self._manifest.square_wave_stopped(
+                self._current_round().index,
+                success=bool(success),
+                reason=str(reason),
+            )
+        if not success:
+            self._failure_reason = (
+                self._failure_reason
+                or str(reason)
+                or "方波停止确认失败，输出状态未知"
+            )
+            next_action = "faulted"
+        self._continue_after_square_wave_stop(next_action)
+
+    def _continue_after_square_wave_stop(self, action: str):
+        if action == "return":
             self._begin_return()
+        elif action == "stopped":
+            if self._deferred_export_task_ids:
+                self._start_deferred_exports("stopped")
+            else:
+                self._finish_stopped("user_stop")
+        else:
+            if self._deferred_export_task_ids:
+                self._start_deferred_exports("faulted")
+            else:
+                self._finish_fault()
 
     def _begin_return(self):
         self._move_index = 0
@@ -685,19 +893,19 @@ class ScanController(QtCore.QObject):
             failed=bool(failed),
         )
         if self._user_stopping:
-            self._start_deferred_exports("stopped")
+            self._request_square_wave_stop("stopped")
             return
         if failed or self._failure_reason:
             if failed and not self._failure_reason:
                 self._failure_reason = reason
             if getattr(self.motor, "motion_active", False):
                 self.motor.stop()
-            self._start_deferred_exports("faulted")
+            self._request_square_wave_stop("faulted")
             return
         if self._state is not ScanState.STOPPING_ACQUISITION:
             self._begin_fault("光谱仪任务在非预期状态完成封存")
             return
-        self._begin_return()
+        self._request_square_wave_stop("return")
 
     def _start_deferred_exports(self, finish_mode: str):
         if self._state is ScanState.EXPORTING:
@@ -781,17 +989,17 @@ class ScanController(QtCore.QObject):
         self._current_task_id = ""
 
         if self._user_stopping:
-            self._finish_stopped("user_stop")
+            self._request_square_wave_stop("stopped")
             return
         if acquisition_failed:
             if not self._failure_reason:
                 self._failure_reason = reason
-            self._finish_fault()
+            self._request_square_wave_stop("faulted")
             return
         if self._state is not ScanState.STOPPING_ACQUISITION:
             self._begin_fault("光谱仪任务提前结束")
             return
-        self._begin_return()
+        self._request_square_wave_stop("return")
 
     @Slot(str)
     def _on_acquisition_rejected(self, message: str):
@@ -805,6 +1013,15 @@ class ScanController(QtCore.QObject):
                 str(detail) or "扫描过程中电机连接断开"
             )
 
+    @Slot(bool, str)
+    def _on_square_wave_connection_changed(
+        self, connected: bool, detail: str
+    ):
+        if self.active and self._square_wave_enabled and not connected:
+            self._begin_fault(
+                str(detail) or "扫描过程中方波发生器连接断开"
+            )
+
     def stop(self):
         if not self.active:
             return False
@@ -813,7 +1030,12 @@ class ScanController(QtCore.QObject):
             self._finish_after_exports = "stopped"
             return True
         self._dwell_timer.stop()
-        self._set_state(ScanState.STOPPING)
+        waiting_for_signal_start = (
+            self._state is ScanState.STARTING_SIGNAL
+            and not self._square_wave_active
+        )
+        if not waiting_for_signal_start and self._state is not ScanState.STOPPING_SIGNAL:
+            self._set_state(ScanState.STOPPING)
         self._current_operation_id = ""
         self._current_move = None
         self._waiting_round_verification = False
@@ -822,7 +1044,11 @@ class ScanController(QtCore.QObject):
         self.motor.stop()
         if self._current_task_id:
             if not self.acquisition.stop_global():
-                self._finish_stopped("user_stop")
+                self._request_square_wave_stop("stopped")
+        elif waiting_for_signal_start:
+            return True
+        elif self._square_wave_active:
+            self._request_square_wave_stop("stopped")
         elif self._deferred_export_task_ids:
             self._start_deferred_exports("stopped")
         else:
@@ -837,7 +1063,12 @@ class ScanController(QtCore.QObject):
             self._finish_after_exports = "faulted"
             return
         self._dwell_timer.stop()
-        self._set_state(ScanState.STOPPING)
+        waiting_for_signal_start = (
+            self._state is ScanState.STARTING_SIGNAL
+            and not self._square_wave_active
+        )
+        if not waiting_for_signal_start and self._state is not ScanState.STOPPING_SIGNAL:
+            self._set_state(ScanState.STOPPING)
         self._current_operation_id = ""
         self._current_move = None
         self._waiting_round_verification = False
@@ -851,6 +1082,11 @@ class ScanController(QtCore.QObject):
         if self._current_task_id:
             if self.acquisition.stop_global():
                 return
+        if waiting_for_signal_start:
+            return
+        if self._square_wave_active:
+            self._request_square_wave_stop("faulted")
+            return
         if self._deferred_export_task_ids:
             self._start_deferred_exports("faulted")
             return
